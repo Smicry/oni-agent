@@ -518,7 +518,21 @@ pub fn preflight_build_in(
     // 支撑必须覆盖**整个底边**：2 格宽的建筑要 2 格都有地板。
     //   只查锚点那一格 → 会挑中"悬空一半"的落点 → 游戏报 missing_support。
     let supports: Vec<(i32, i32)> = (0..size.0.max(1)).map(|dx| (anchor.0 + dx, anchor.1 - 1)).collect();
-    let unsupported: Vec<(i32, i32)> = supports.iter().copied().filter(|c| !grid.is_support(*c)).collect();
+    // ★ 支撑判定**用实时 cell**：渲染网格是陈旧快照 —— 刚挖开/刚铺的格还没进网格
+    //   → 用网格判支撑会把"其实已经实心了"的落点判成悬空（或反过来）。
+    //   实测踩坑：预检说 (116,193),(117,193) 不实心，其实那两格是气体，
+    //   而第 1 座旱厕就建在天然砂岩上 —— 支撑到底成不成立**要问游戏**。
+    let live_support = |c: (i32, i32)| -> Option<bool> {
+        live.and_then(|m| m.get(&c)).map(|cd| cd.is_solid() || cd.has_building())
+    };
+    let unsupported: Vec<(i32, i32)> = supports
+        .iter()
+        .copied()
+        .filter(|c| match live_support(*c) {
+            Some(ok) => !ok,
+            None => !grid.is_support(*c),
+        })
+        .collect();
     let supported = unsupported.is_empty();
     if !supported {
         reasons.push(format!("支撑格 {unsupported:?} 不实心 → 会报 missing_support"));
@@ -536,6 +550,9 @@ pub fn preflight_build_in(
     //   要铺砖得先有砖 → 代理永远铺不上砖 → 厕所/发电机/研究站的底边永远准备不出来。
     //   正解：只有**非 Tile 的 OnFloor 建筑**才要求支撑是地板砖；
     //     Tile 只要支撑是实心（岩/砖都行）即可。
+    // ⚠ 这里只作**排序提示**（has_tile 优先），不作硬判据：
+    //   实测 mod 允许天然岩石作 OnFloor 支撑（第1座旱厕就建在砂岩上），
+    //   若强求地板砖 → 开局无砖时厕所永远建不成。
     if !no_tile_supports.is_empty() && prefab_id != "Tile" {
         reasons.push(format!("支撑格 {no_tile_supports:?} 没有地板砖 → OnFloor 建筑可能报 missing_support"));
     }
@@ -580,6 +597,15 @@ pub struct SitePolicy {
     pub strict_prefabs: Vec<String>,
     /// 连续失败多少次后自动放宽判据（0 = 不自动放宽）。
     pub relax_after_fail: usize,
+    /// 选址搜索半径的额外扩大量（格）。
+    ///
+    /// ★ 快系统自动放宽**只动这个**，绝不动 CO₂ 阈值：
+    ///   CO₂ 上限是**保命判据**（人要在那儿待着）。
+    ///   实测把上限自动放宽到 8kg/格 → 厕所建在 CO₂ 里 →
+    ///   复制人如厕时呼吸掉到 66 → 触发一串假紧急态 → 慢系统反复暂停游戏。
+    ///   "放宽"应该是**扩大候选集**（多找几块地方），不是**放宽安全线**。
+    #[serde(default)]
+    pub site_radius_boost: i32,
 }
 
 impl Default for SitePolicy {
@@ -588,6 +614,7 @@ impl Default for SitePolicy {
             co2_max_kg: 2.0,
             strict_prefabs: vec!["Bed".into(), "Generator".into(), "Electrolyzer".into()],
             relax_after_fail: 2,
+            site_radius_boost: 0,
         }
     }
 }
@@ -736,7 +763,14 @@ pub fn find_build_site_all(
         for x in x1.min(x2)..=x1.max(x2) {
             let pf = preflight_build_in(r, (x, y), size, None, material_ok, prefab_id, live);
             if !pf.ok {
-                continue;
+                // ★ 放行"占格空 + 复制人走得到、**只差支撑**"的候选：
+                //   执行层会**先铺地板砖**把这格支撑补齐，下一轮再建造。
+                //   旧逻辑一刀切跳过 → 永远选不到落点 → 厕所/发电机永远建不成
+                //   （实测第 2 座旱厕：候选全被"支撑不实心"否掉 → 反复挖同一格）。
+                let preparable = pf.empty_cells && pf.work_position.is_some();
+                if !preparable {
+                    continue;
+                }
             }
             let dist: i64 = dupes
                 .iter()
@@ -774,7 +808,14 @@ pub fn column_base(reach: &Reach, x: i32, y: i32) -> Option<i32> {
     let mut base: Option<i32> = None;
     for yy in (y - 24..y).rev() {
         match reach.grid.kind((x, yy)) {
-            Kind::Ladder => continue,
+            // ★ 梯子格本身就是**可站立的基座**。
+            //   旧写法 "Kind::Ladder => continue" 把梯子格直接跳过 →
+            //   第一段梯子铺好后，列基座找不到任何有支撑的空格 → 返回 None
+            //   → ladder_step 交不出候选 → 梯子链**铺一格就断**
+            //   → 竖井永远只够到第一格。
+            Kind::Ladder => {
+                base = Some(yy);
+            }
             Kind::Gas | Kind::Liquid | Kind::Dupe => {
                 let below = (x, yy - 1);
                 if reach.grid.is_support(below) || reach.grid.kind(below) == Kind::Ladder {
@@ -820,8 +861,21 @@ pub fn ladder_step(reach: &Reach, x: i32, y: i32) -> Option<(i32, i32)> {
     // 从站得到的那一格开始，连续往上铺。
     // 链要**自下而上连续** —— 找出基座往上的第一处「缺梯子」的格，
     //     补上它；全都有梯子时，补目标正下方那一格。
+    //
+    // ★ 基座之上**第一格**才轮到铺梯子（base + 1），不是基座本身：
+    //   基座是复制人**已经站得到**的那格（脚下有地板）；
+    //   在基座上铺梯子等于把复制人埋在自己脚下 → mod 落地失败 / 白铺一格。
+    //   正确节奏：基座(194) → 铺 195 → 复制人爬上去 → 铺 196 → 爬 → 铺 197
+    //   → 复制人站上 197 → 挖 198 的头顶。
     let base = column_base(reach, x, y)?;
-    for yy in base..(y - 1) {
+    // 基座必须复制人**真的走得到**（否则梯子链铺在够不到的列上，纯浪费）。
+    let base_reachable = reach.set.contains(&(x, base))
+        || reach.climbable.contains(&(x, base))
+        || reach.dupes.iter().any(|d| *d == (x, base));
+    if !base_reachable {
+        return None;
+    }
+    for yy in (base + 1)..(y - 1) {
         if reach.grid.kind((x, yy)) != Kind::Ladder {
             return Some((x, yy)); // 最下面缺梯子的那格 → 先补它
         }
@@ -850,4 +904,73 @@ fn element_name(k: Kind) -> String {
 
 pub fn format_cell(c: &(i32, i32)) -> String {
     format!("({},{})", c.0, c.1)
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+    use crate::grid::Grid;
+
+    fn reach_with(cells: Vec<((i32, i32), Kind)>, dupes: Vec<(i32, i32)>) -> Reach {
+        let mut map = HashMap::new();
+        for (c, k) in cells {
+            map.insert(c, k);
+        }
+        let grid = Grid { cells: map, floor_tiles: HashSet::new(), phantom: HashSet::new() };
+        let set: HashSet<(i32, i32)> = dupes.iter().copied().collect();
+        Reach {
+            grid,
+            set: set.clone(),
+            climbable: set,
+            official: HashSet::new(),
+            bbox: HashSet::new(),
+            dupes,
+            dupe_hood: HashSet::new(),
+        }
+    }
+
+    /// 竖井梯子链：自下而上连续，每轮只补**最低**缺的那一格。
+    #[test]
+    fn ladder_step_fills_chain_bottom_up() {
+        // 列 10：y=10 岩石地板，y=11 复制人站位，y=12/13 空，y=14 要挖的顶
+        let r = reach_with(
+            vec![
+                ((10, 10), Kind::Solid),
+                ((10, 11), Kind::Gas),
+                ((10, 12), Kind::Gas),
+                ((10, 13), Kind::Gas),
+                ((10, 14), Kind::Solid),
+            ],
+            vec![(10, 11)],
+        );
+        // 第一格梯子铺在基座**上面**（不是基座本身）
+        assert_eq!(ladder_step(&r, 10, 14), Some((10, 12)));
+        // 已有 y=12 的梯子 → 链要接着往上补 y=13
+        let r2 = reach_with(
+            vec![
+                ((10, 10), Kind::Solid),
+                ((10, 11), Kind::Gas),
+                ((10, 12), Kind::Ladder),
+                ((10, 13), Kind::Gas),
+                ((10, 14), Kind::Solid),
+            ],
+            vec![(10, 11)],
+        );
+        assert_eq!(ladder_step(&r2, 10, 14), Some((10, 13)));
+    }
+
+    /// 基座走不到（复制人在别的列）→ 不该铺梯子（铺了也没人爬得到）。
+    #[test]
+    fn ladder_step_requires_reachable_base() {
+        let r = reach_with(
+            vec![
+                ((10, 10), Kind::Solid),
+                ((10, 11), Kind::Gas),
+                ((10, 13), Kind::Gas),
+                ((10, 14), Kind::Solid),
+            ],
+            vec![(30, 30)],
+        );
+        assert_eq!(ladder_step(&r, 10, 14), None);
+    }
 }

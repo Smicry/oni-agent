@@ -406,6 +406,37 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         detail: format!("预检未通过，未执行: {detail}") });
                     return ExecOutcome { results, ok: false };
                 }
+                // ★ 死工单自愈：撤销**模型判定没人能执行**的旧挖掘工单。
+                //   症状链（实测）：模型比游戏宽松 → 把工单下到悬空岩层
+                //   → 游戏里每个复制人都被 precondition 拒绝
+                //     （oni://dupes/todos 的 counts.blocked = 单数 × 人数，实测 18 = 6×3）
+                //   → 全员闲 + 工单积压 = "看游戏没进展"。
+                //   这些死单会一直占着差事队列、掩盖真实进展 → 必须撤掉，
+                //   否则引擎会继续把复制人往够不到的地方派。
+                //   判据是**确定性的事实**（落脚点走不到 + 这一列也铺不出梯子链），
+                //   所以由快系统直接撤销，不必等慢系统决策。
+                if let Some(r) = oni_world::preflight::load_reach(session, Some(catalog)) {
+                    let dead: Vec<(i32, i32)> = pf
+                        .targets
+                        .iter()
+                        .filter(|t| t.has_marker)
+                        .filter(|t| {
+                            t.work_position.is_none()
+                                && oni_world::preflight::ladder_step(&r, t.x, t.y).is_none()
+                        })
+                        .map(|t| (t.x, t.y))
+                        .take(2)
+                        .collect();
+                    for c in dead {
+                        let cmd = format!("消 @({},{})", c.0, c.1);
+                        match run_order_raw(session, &cmd, false) {
+                            Ok(_) => results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok: true,
+                                detail: format!("撤销死工单 @({},{})：无落脚点且这一列铺不出梯子链", c.0, c.1) }),
+                            Err(e) => results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok: false,
+                                detail: format!("撤销死工单 @({},{}) 失败: {}", c.0, c.1, e) }),
+                        }
+                    }
+                }
                 // 自动梯子列：目标是"挖头顶"但正下方不可达 → 先在可达的那一格铺梯子，
                 //   复制人爬上去才能继续往上挖。没有这一步就永远挖不到头顶的矿层。
                 // 缺梯子材料时的降级说明（不阻断横向挖掘）
@@ -724,14 +755,18 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 } else {
                     String::new()
                 };
-                let detail = if pick.is_some() {
-                    format!("{}{}前沿 {} 格（新 {} / 已有标记 {}），本轮挖 1 格：新标记 {}，已在位 {}",
-                        note_prefix, out_note, ready.len(), fresh.len(), marked.len(), issued, already)
+                // ★ "无可下单曲" = **零进展**（没挖任何东西）→ 必须记为失败。
+                //   旧逻辑两种情况都 ok:true → 循环检测/熔断都抓不到它 →
+                //   慢系统收到"已执行"以为在推进，实际目标永远不动（实测 open_chamber 空转）。
+                //   记为失败后：动作级循环检测能识别"同一目标反复零进展" → 上报慢系统换方案。
+                let (ok, detail) = if pick.is_some() {
+                    (true, format!("{}{}前沿 {} 格（新 {} / 已有标记 {}），本轮挖 1 格：新标记 {}，已在位 {}",
+                        note_prefix, out_note, ready.len(), fresh.len(), marked.len(), issued, already))
                 } else {
-                    format!("{}{}前沿 {} 格无可下单曲（全部需梯子或已有标记）→ 等梯子/复制人消化，本轮不下新单",
-                        note_prefix, out_note, ready.len())
+                    (false, format!("{}{}前沿 {} 格无可下单曲（全部需梯子或已有标记）→ 零进展，等梯子/复制人消化；该目标当前推不动",
+                        note_prefix, out_note, ready.len()))
                 };
-                results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok: true, detail });
+                results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok, detail });
             }
             Action::Build { anchor, prefab, size, material, why } => {
                 let def = match catalog.find(prefab) {
@@ -931,6 +966,84 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         detail: format!("{region} 内找不到能放 {} 的落点（占格/支撑/落脚点都不满足）", def.prefab_id) });
                     return ExecOutcome { results, ok: false };
                 };
+                // ★ 支撑缺失 → **先铺地板砖**，下一轮再建造。
+                //   为什么必须有这一步：OnFloor 建筑（旱厕/发电机/洗手盆）要求底边是地板砖；
+                //   旧逻辑只在"连落点都找不到"时才去挖空间，挖完依然没有地板砖
+                //   → 厕所永远建不成（实测第 2 座旱厕连续失败 10+ 次，每轮报
+                //   "落地失败"）。铺砖是**确定性的机械子步骤**，不属于慢系统的策略权衡，
+                //   所以放快系统做，慢系统不必为此决策。
+                if !pf.supported {
+                    let supports: Vec<(i32, i32)> =
+                        (0..w.max(1)).map(|dx| (anchor.0 + dx, anchor.1 - 1)).collect();
+                    let mut probe = supports.clone();
+                    for c in &supports {
+                        probe.push((c.0, c.1 - 1));
+                    }
+                    let livec = oni_world::cell::fetch_many(session, &probe);
+                    let solid = |c: (i32, i32)| -> bool {
+                        livec.get(&c).map(|cd| cd.is_solid() || cd.has_building()).unwrap_or(false)
+                    };
+                    let missing: Vec<(i32, i32)> =
+                        supports.iter().copied().filter(|c| !solid(*c)).collect();
+                    // 砖块自己脚下也得实心，否则铺不上去 → 只铺铺得成的第一格
+                    let placeable = missing
+                        .iter()
+                        .copied()
+                        .find(|c| solid((c.0, c.1 - 1)));
+                    let Some(tile_cell) = placeable else {
+                        results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false,
+                            detail: format!(
+                                "{} 缺支撑格 {:?}，且这些格脚下也不实心 → 铺不上砖；需要先挖开下方一格",
+                                def.prefab_id, missing
+                            ) });
+                        return ExecOutcome { results, ok: false };
+                    };
+                    let tile_mat = match buildability(session, "Tile") {
+                        Buildability::Ready(m) => m,
+                        Buildability::ResearchLocked(w) | Buildability::MissingMaterial(w) => {
+                            results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false,
+                                detail: format!("铺地板砖不可用（{}）→ 先采建材", w) });
+                            return ExecOutcome { results, ok: false };
+                        }
+                    };
+                    let tile_token = crate::mapedit::build_token("Tile", &tile_mat);
+                    let mut tile_placements = BTreeMap::new();
+                    tile_placements.insert(tile_cell, tile_token);
+                    let dry = crate::mapedit::apply_build(session, &tile_placements, true);
+                    let ok_dry = matches!(dry, Ok((true, _)));
+                    if !ok_dry {
+                        let detail = match dry {
+                            Ok((false, d)) => format!("dry-run 未通过: {}", first_line(&d).unwrap_or_default()),
+                            Err(e) => e,
+                            Ok((true, _)) => String::new(),
+                        };
+                        results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false,
+                            detail: format!("铺地板砖 @({},{}) 失败: {}", tile_cell.0, tile_cell.1, detail) });
+                        return ExecOutcome { results, ok: false };
+                    }
+                    match crate::mapedit::apply_build(session, &tile_placements, false) {
+                        Ok((true, out)) => {
+                            results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: true,
+                                detail: format!(
+                                    "{} 缺支撑 → 先在 ({},{}) 铺地板砖（材料 {}），下一轮建造 {}",
+                                    def.prefab_id, tile_cell.0, tile_cell.1, tile_mat, def.prefab_id
+                                ) });
+                            let _ = out;
+                            return ExecOutcome { results, ok: true };
+                        }
+                        Ok((false, out)) => {
+                            results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false,
+                                detail: format!("铺地板砖落地失败 @({},{}): {}",
+                                    tile_cell.0, tile_cell.1, first_line(&out).unwrap_or_default()) });
+                            return ExecOutcome { results, ok: false };
+                        }
+                        Err(e) => {
+                            results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false,
+                                detail: format!("铺地板砖失败 @({},{}): {}", tile_cell.0, tile_cell.1, e) });
+                            return ExecOutcome { results, ok: false };
+                        }
+                    }
+                }
                 let token = crate::mapedit::build_token(&def.prefab_id, &mat);
                 let mut placements = BTreeMap::new();
                 placements.insert(anchor, token.clone());
@@ -1112,8 +1225,10 @@ fn auto_region(
     if x0 > x1 {
         return None;
     }
-    // 往外扩 8 格，给建筑留落点空间
-    Some((x0 - 8, y0 - 4, x1 + 8, y1 + 4))
+    // 往外扩 8 格，给建筑留落点空间；
+    // 选址连续失败时快系统会把 boost 调大 → 搜索范围变大（**安全**的放宽）。
+    let boost = oni_world::preflight::site_policy().site_radius_boost.max(0);
+    Some((x0 - 8 - boost, y0 - 4 - boost, x1 + 8 + boost, y1 + 4 + boost))
 }
 fn bounds(cells: &[(i32, i32)]) -> (i32, i32, i32, i32) {
     let xs: Vec<i32> = cells.iter().map(|c| c.0).collect();
@@ -1758,6 +1873,99 @@ pub fn run_order(session: &McpSession, cmd: &str, dry_run: bool) -> Result<Strin
 }
 
 /// 返回完整原始输出（调试用）。
+/// 列出当前**待执行的挖掘工单**（坐标 + 实例 id）。
+///
+/// 解析 mod 的表格输出：
+///   priorities[N]{id,name,prefabId,position{x,y},...}:
+///     3207,挖掘,DigPlacer,118,198,0,true,basic,7,false
+/// 末尾 7 个字段是固定的（x,y + 5 个属性），所以从**尾部**数最稳。
+fn list_dig_orders(session: &McpSession) -> Vec<(i32, i32)> {
+    let Ok(text) = session.call_text(
+        "orders_control",
+        serde_json::json!({
+            "domain": "priority", "action": "list",
+            "query": "挖掘", "limit": 200,
+            "task": "循环: 列出待执行的挖掘工单（查死工单）"
+        }),
+    ) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !line.contains("DigPlacer") {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if f.len() < 8 {
+            continue;
+        }
+        let n = f.len();
+        let (Ok(x), Ok(y)) = (f[n - 7].parse::<i32>(), f[n - 6].parse::<i32>()) else {
+            continue;
+        };
+        if !out.contains(&(x, y)) {
+            out.push((x, y));
+        }
+    }
+    out
+}
+
+/// **死工单清扫**：撤销"复制人根本走不到"的挖掘工单。
+///
+/// 为什么需要：模型比游戏宽松时（旧的 phantom 建筑 / 宽松的地板判据），
+///   代理会把工单下到没人能站的地方 → 游戏里每个复制人都被拒绝
+///   → 全员闲 + 工单积压 = "看游戏没进展"。
+///   这些单子会一直占着差事队列，掩盖真实进展 → 必须撤。
+///
+/// 判据用**模型 + 官方可达集**（事实），不需要慢系统决策：
+///   目标格周围没有任何"复制人走得到的落脚点"，且这一列也铺不出梯子链
+///   ⇒ 永远没人能执行 ⇒ 死单。
+pub fn sweep_dead_dig_orders(
+    session: &McpSession,
+    catalog: Option<&Catalog>,
+) -> Vec<(i32, i32)> {
+    let orders = list_dig_orders(session);
+    if orders.is_empty() {
+        return Vec::new();
+    }
+    let Some(reach) = oni_world::preflight::load_reach(session, catalog) else {
+        return Vec::new();
+    };
+    let mut dead = Vec::new();
+    for (x, y) in orders {
+        if dig_executable(&reach, (x, y)) {
+            continue;
+        }
+        dead.push((x, y));
+    }
+    let mut cancelled = Vec::new();
+    for c in dead.into_iter().take(3) {
+        let cmd = format!("消 @({},{})", c.0, c.1);
+        if run_order_raw(session, &cmd, false).is_ok() {
+            cancelled.push(c);
+        }
+    }
+    cancelled
+}
+
+/// 这一格的挖掘工单**现在**有没有复制人能执行。
+fn dig_executable(reach: &oni_world::preflight::Reach, target: (i32, i32)) -> bool {
+    use oni_world::rules::neighbors;
+    for n in neighbors(target.0, target.1) {
+        if !reach.grid.walkable(n) {
+            continue;
+        }
+        if reach.set.contains(&n)
+            || reach.climbable.contains(&n)
+            || reach.dupes.iter().any(|d| *d == n)
+        {
+            return true;
+        }
+    }
+    // 没有落脚点，但这一列能铺出梯子链 → 铺完就能挖，不算死单
+    oni_world::preflight::ladder_step(reach, target.0, target.1).is_some()
+}
+
 pub fn run_order_raw(session: &McpSession, cmd: &str, dry_run: bool) -> Result<String, String> {
     let path = "/active/ops/orders.md";
     let text = session

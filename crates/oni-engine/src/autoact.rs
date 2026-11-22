@@ -190,6 +190,18 @@ fn clean_vertical_path(
             }
             // 这列干净 → 作为竖井路径（从锚点上方一直到顶）
             let path: Vec<(i32, i32)> = (anchor.1 + 1..anchor.1 + 40).map(|y| (x, y)).collect();
+            // ★ 这一列还必须**真的挖得动**：第一块实心格的落脚点
+            //   要么现在就走得到，要么能铺出梯子链。
+            //   只查「干净」会选到被建筑压住的列（实测：锁定列压着代理自己建的旱厕）
+            //   → 梯子起点不可达 → 永远「锁定列走不通」→ 竖井零进展。
+            let first_solid = path
+                .iter()
+                .copied()
+                .find(|c| reach.grid.kind(*c) == oni_world::grid::Kind::Solid);
+            let Some(first_solid) = first_solid else { continue; };
+            if !column_viable(reach, first_solid) {
+                continue;
+            }
             // 优先选**梯子链可爬**的列。
             //   旧逻辑只查"干净"，选了几何干净但梯子链断裂的列
             //   代理每轮报"锁定列走不通"→ 整轮空转 → 竖井永远不动。
@@ -205,6 +217,33 @@ fn clean_vertical_path(
         }
     }
     fallback
+}
+
+/// 这一列**现在还能不能挖**：目标格的落脚点要么复制人现在就走得到，
+/// 要么能沿梯子链爬上去。
+///
+/// 为什么必须有这个判据（实测）：目标锁选中的列可能**被建筑占着**
+///   —— 本存档锁定列 120 正好压着代理自己建的旱厕（119..120 × 194..196）
+///   → 梯子起点 (120,197) 复制人走不到 → 梯子链永远起不来
+///   → 每轮报「锁定列走不通」→ 整轮空转 → 竖井零进展。
+/// 判不到就当不可行 → 让上层重选列（重选时会跳过本列）。
+fn column_viable(reach: &oni_world::preflight::Reach, target: (i32, i32)) -> bool {
+    let below = (target.0, target.1 - 1);
+    let standable = reach.set.contains(&below)
+        || reach.climbable.contains(&below)
+        || reach.dupes.iter().any(|d| *d == below);
+    if standable {
+        return true;
+    }
+    // 需要梯子：梯子的**第一格必须空着**（不能压在建筑上，也不能是实心岩）
+    //   —— 否则"这一列能挖"是假的（梯子铺不下去 → 每轮走不通）。
+    match oni_world::preflight::ladder_step(reach, target.0, target.1) {
+        Some(cell) => !matches!(
+            reach.grid.kind(cell),
+            oni_world::grid::Kind::Building | oni_world::grid::Kind::Solid
+        ),
+        None => false,
+    }
 }
 
 /// 找一个**干净可呼吸**的格子。
@@ -496,12 +535,16 @@ fn surface_target_locked(
                 if !not_dug {
                     continue; // 已挖开 → 推进到下一格
                 }
-                // 目标 = 路径上**第一个还没挖开的实心格**，
-                //   **不管它当前能不能爬**。
-                //   旧逻辑跳过"不可爬"的格 → focus 在路径的不同格之间跳 → 列漂移
-                //   。
+                // 目标 = 路径上**第一个还没挖开的实心格**。
                 //   能不能爬交给执行层的"同列硬锁"处理：那一列走不通就**本轮不下单**，
                 //   等梯子/复制人消化 —— 绝不换列。
+                //
+                // ★ 但"这一列已经**彻底废了**"（落脚点走不到、梯子链也起不来，
+                //   例如锁定列被自己建的建筑压住）必须**立刻重算**：
+                //   否则每轮都报"锁定列走不通" → 永远空转。
+                if !column_viable(reach, *c) {
+                    break; // 落到下面的清锁分支 → 下一轮重选列
+                }
                 return Some((*c, l.path.len() - i));
             }
             // 整条路径都挖开/不可爬 → 清锁，下一轮重算
@@ -1477,6 +1520,17 @@ fn find_floor_ready_spot(
 ///   ，不随复制人走动而变；复制人位置会变，用它做基准
 ///   必然导致目标漂移。官方集为空时退回复制人质心，再退回包围盒中心。
 pub fn base_anchor(reach: &oni_world::preflight::Reach) -> (i32, i32) {
+    // ★ 锚点 = **复制人自己站的地方**（中位数），不是官方可达集的质心。
+    //   官方可达集是「窗口内所有有地板的格」，质心会被基地边缘的远端格子拉走：
+    //   本存档实测锚点落在 (107,193)，而三人实际站在 (119..121,194)
+    //   → 竖井候选列全在基地西侧的空气里 → 梯子永远铺不到人头上 → 空转。
+    if !reach.dupes.is_empty() {
+        let mut xs: Vec<i32> = reach.dupes.iter().map(|d| d.0).collect();
+        let mut ys: Vec<i32> = reach.dupes.iter().map(|d| d.1).collect();
+        xs.sort_unstable();
+        ys.sort_unstable();
+        return (xs[xs.len() / 2], ys[ys.len() / 2]);
+    }
     if !reach.official.is_empty() {
         let sx: i32 = reach.official.iter().map(|d| d.0).sum();
         let sy: i32 = reach.official.iter().map(|d| d.1).sum();

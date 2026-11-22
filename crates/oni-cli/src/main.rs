@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "observe" => cmd_observe(&rest),
         "doctor" => cmd_doctor(),
         "preflight" => cmd_preflight(&rest),
+        "cells" => cmd_reach_cells(&rest),
         "plan" => cmd_plan(),
         "plan-reset" => cmd_plan_reset(),
         "plan-auto" => cmd_plan_auto(&rest),
@@ -85,6 +86,7 @@ fn main() -> ExitCode {
 const HELP: &str = r#"oni <子命令>
   observe            采全局面（多源并行），输出全局态势卡 + 账本 + 趋势
   doctor             连通性 / 建造目录 / 协议自检
+  cells <x1,y1,x2,y2>            世界模型逐格诊断（可站/支撑/可达集 vs 实时元素）
   preflight dig  <x1,y1,x2,y2>   挖掘预检：目标可挖? 有落脚点?
   preflight build <x,y> <Prefab>    建造预检：占格空? 支撑实心? 材料合法?
   plan               按依赖图选本轮唯一目标
@@ -1270,6 +1272,59 @@ fn cmd_map(args: &[String]) -> anyhow::Result<()> {
     if rows == 0 {
         println!("(无表格行；原始响应前 600 字)\n{}", &text[..text.len().min(600)]);
     }
+    Ok(())
+}
+
+/// **世界模型逐格诊断**：把「模型认为的」和「游戏里的」并排打出来。
+///
+/// 为什么需要：模型比游戏宽松时，代理会下没人能执行的工单，
+///   而日志只显示"预检通过"——看不出模型到底哪一格判错了。
+///   本命令打印每格的：网格类型 / 是否可站 / 脚下是不是地板 /
+///   在不在自算可达集 / 在不在官方可达集 / 实时元素。
+/// 用法：oni reach x1,y1,x2,y2
+fn cmd_reach_cells(args: &[String]) -> anyhow::Result<()> {
+    let s = connect()?;
+    let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rect = args.get(0).ok_or_else(|| anyhow::anyhow!("用法: oni reach x1,y1,x2,y2"))?;
+    let pts = parse_points(rect).map_err(|e| anyhow::anyhow!(e))?;
+    let r = oni_world::preflight::load_reach(&s, Some(&cat))
+        .ok_or_else(|| anyhow::anyhow!("读不到世界模型"))?;
+    let live = oni_world::cell::fetch_many(&s, &pts);
+    println!(
+        "(x,y)  kind      可站 脚下实心 自算集 爬梯集 官方集 幻影 | 实时元素 [建筑锚点]"
+    );
+    for c in &pts {
+        let kind = r.grid.kind(*c);
+        let walk = r.grid.walkable(*c);
+        let below = (c.0, c.1 - 1);
+        let below_ok = r.grid.is_support(below);
+        let l = live.get(c);
+        let bl = l.map(|cd| {
+            cd.buildings
+                .iter()
+                .map(|b| format!("{}@({},{})", b.prefab_id, b.anchor_x, b.anchor_y))
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        println!(
+            "({},{}) {:<9} {:<4} {:<8} {:<6} {:<6} {:<6} {} | {} [{}]",
+            c.0, c.1,
+            format!("{kind:?}"),
+            walk,
+            below_ok,
+            r.set.contains(c),
+            r.climbable.contains(c),
+            r.official.contains(c),
+            if r.grid.phantom.contains(c) { "幻影" } else { "    " },
+            l.map(|cd| format!("{} solid={}", cd.element, cd.is_solid()))
+                .unwrap_or_else(|| "?".into()),
+            bl.unwrap_or_default(),
+        );
+    }
+    println!(
+        "→ 自算可达集 {} 格 / 爬梯集 {} 格 / 官方集 {} 格",
+        r.set.len(), r.climbable.len(), r.official.len()
+    );
     Ok(())
 }
 

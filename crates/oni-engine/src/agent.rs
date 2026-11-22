@@ -325,6 +325,19 @@ impl Agent {
             self.idle_streak_unworked = 0;
         }
         if backlog && everyone_unproductive && self.idle_streak_unworked >= 2 {
+            // ★ 确定性自救 0：先撤掉**没人能执行**的挖掘工单。
+            //   游戏的差事队列里，全员被拒的单子会一直占着位置，
+            //   让"工单积压 + 全员闲"永远自愈不了 —— 这就是死工单自愈的第一环。
+            //   判据是事实（模型 + 官方可达集），不需要慢系统决策。
+            let dead = crate::exec::sweep_dead_dig_orders(&self.session, Some(&self.catalog));
+            if !dead.is_empty() {
+                self.idle_streak_unworked = 0;
+                report.notes.push(format!(
+                    "[自救] 撤销 {} 条没人能执行的挖掘工单 {:?}（复制人走不到 → 游戏会拒收）",
+                    dead.len(), dead
+                ));
+                return;
+            }
             // B: 确定性自救 —— 卡住的目标锁（surface/open_chamber）先清掉换列，
             //    只有换列也救不回来（第二次达阈值）才上报 AI。
             let cleared = self.clear_stuck_goal_locks();
@@ -1610,20 +1623,24 @@ impl Agent {
         } else {
             self.action_failures = 0;
         }
-        // ★ 自动放宽选址判据：连续失败（多半是"落点判据太严"）→ 放宽 CO₂ 阈值。
+        // ★ 自动放宽选址判据：连续失败 → **扩大搜索范围**（多找几块地方）。
         //   这是"策略在代码里可调"的最小闭环：慢系统不必每次都出手，
         //   快系统先按策略自己放宽一档；仍不行再上报慢系统。
+        //   ★ 绝不自动放宽 **CO₂ 阈值**：那是保命判据（人要待在那儿）。
+        //     实测自动把 CO₂ 上限从 2.5 放宽到 8kg/格 → 厕所建在 CO₂ 里 →
+        //     复制人如厕时呼吸掉到 66 → 触发一串假紧急态 → 慢系统反复暂停游戏。
+        //     "放宽"应该是扩大候选集，不是放松安全线；安全线只能由慢系统显式调。
         {
             let mut pol = oni_world::preflight::site_policy();
             if pol.relax_after_fail > 0 && self.action_failures >= pol.relax_after_fail {
-                let old = pol.co2_max_kg;
-                pol.co2_max_kg = (pol.co2_max_kg * 2.0).min(8.0);
-                if pol.co2_max_kg > old {
+                let old = pol.site_radius_boost;
+                pol.site_radius_boost = (old + 4).min(16);
+                if pol.site_radius_boost > old {
                     oni_world::preflight::set_site_policy(pol.clone());
                     self.action_failures = 0;
                     report.notes.push(format!(
-                        "🔧 选址判据自动放宽：CO₂ 上限 {}kg → {}kg（连续失败 {} 次）",
-                        old, pol.co2_max_kg, pol.relax_after_fail
+                        "🔧 选址范围自动放宽：搜索半径 +{} → +{} 格（连续失败 {} 次；CO₂ 上限 {}kg 不动）",
+                        old, pol.site_radius_boost, pol.relax_after_fail, pol.co2_max_kg
                     ));
                 }
             }

@@ -37,6 +37,19 @@ pub struct Grid {
     ///
     /// 见 `is_floor_tile()` 的注释：这是 2026-11-21 踩的坑。
     pub floor_tiles: HashSet<(i32, i32)>,
+    /// **幻影建筑格**：锚点容错时多标出来、但其实并不存在的建筑占格。
+    ///
+    /// 为什么必须单独记一份（实测踩过的最深的坑）：
+    ///   建筑索引里的 Position 是**判定点**，不一定等于实际占格锚点，
+    ///   所以老代码把 (x,y)、(x-1,y)、(x,y-1) 三种锚点的占格全部标成建筑。
+    ///   结果：一栋 2x3 的旱厕会在旁边多出 3 列幻影墙，
+    ///   其中 (118,196) 这种**气体格**被标成建筑 →
+    ///   is_support 判定它是地板 → 它的正上方 (118,197) 有地板、能站
+    ///   → 挖掘预检给悬空岩层选出这个落脚点 → 工单下下去
+    ///   → 游戏里根本没有那栋建筑，复制人站不住 → precondition 拒绝
+    ///   → 全员闲 + 工单积压 = 看游戏没进展。
+    ///   幻影格的作用只是别往这儿盖东西，**不能承重**。
+    pub phantom: HashSet<(i32, i32)>,
 }
 
 /// 官方字形表里所有"建筑类"单字符（从 `/active/symbols/glyphs.md` 读）。
@@ -182,6 +195,41 @@ mod tests {
         assert_eq!(expand_row_tokens("Tile@(126,193) 子").len(), 2);
     }
 
+    /// ★ 可站性判据：脚下必须**紧邻**实心（与游戏 navmesh 对齐）。
+    ///
+    /// 实证：官方可达集 = 「可通行 ∧ 紧邻下一格实心」。
+    /// 旧的"向下 8 格内有地板"会把悬空格也算成能站 → 死工单。
+    #[test]
+    fn walkable_requires_immediate_floor() {
+        let mut cells = HashMap::new();
+        cells.insert((5, 10), Kind::Solid);
+        cells.insert((5, 11), Kind::Gas);
+        cells.insert((5, 12), Kind::Gas);
+        cells.insert((5, 20), Kind::Ladder);
+        cells.insert((5, 21), Kind::Gas);
+        let g = Grid { cells, floor_tiles: HashSet::new(), phantom: HashSet::new() };
+        assert!(g.walkable((5, 11)), "脚下就是岩石 → 可站");
+        assert!(!g.walkable((5, 12)), "脚下悬空 → 不可站（游戏也不认）");
+        assert!(g.walkable((5, 20)), "梯子格永远可站");
+        assert!(g.walkable((5, 21)), "脚下是梯子 → 承重");
+    }
+
+    /// ★ 幻影建筑格**不能当地板**。
+    ///
+    /// 建筑索引的 Position 是判定点，锚点容错会在气体格里标出幻影建筑；
+    /// 当成地板 → 悬空格看起来能站 → 派工过去游戏拒收 → 死工单。
+    #[test]
+    fn phantom_building_is_not_a_floor() {
+        let mut cells = HashMap::new();
+        cells.insert((5, 10), Kind::Building);
+        cells.insert((5, 11), Kind::Gas);
+        let mut phantom = HashSet::new();
+        phantom.insert((5, 10));
+        let g = Grid { cells, floor_tiles: HashSet::new(), phantom };
+        assert!(!g.is_support((5, 10)), "幻影建筑格不能承重");
+        assert!(!g.walkable((5, 11)), "悬在幻影墙上的格子不能站");
+    }
+
     /// 坐标对齐：X 由表头决定，RLE 展开后必须一格对一格。
     /// 用 6 列的小表头验证：X = 0,1,2,3,4,5。
     #[test]
@@ -219,7 +267,7 @@ impl Grid {
             )
             .map_err(|e| e.to_string())?;
         let cells = parse_map_text(&text, &building_glyphs);
-        let mut grid = Grid { cells, floor_tiles: HashSet::new() };
+        let mut grid = Grid { cells, floor_tiles: HashSet::new(), phantom: HashSet::new() };
         grid.mark_protected(session);
         // 必须同时标记**全部**建筑的占格：
         //   旧代码只调 mark_protected（关键建筑保护区），没调 mark_official_buildings
@@ -281,7 +329,7 @@ impl Grid {
         if !read_any {
             return Err(format!("读不到全图分层: {last_err}"));
         }
-        let mut grid = Grid { cells, floor_tiles: HashSet::new() };
+        let mut grid = Grid { cells, floor_tiles: HashSet::new(), phantom: HashSet::new() };
         grid.mark_protected(session);
         // 修正：全图加载路径**也要**标记全部建筑占格与地板砖，
         //   否则同一张图在全图模式下预检认为「空地」、在视野模式下认为是「建筑」
@@ -350,6 +398,8 @@ impl Grid {
         ) else {
             return;
         };
+        // 先把索引里的建筑解析出来。
+        let mut entries: Vec<(String, i32, i32)> = Vec::new();
         for line in text.lines() {
             let cols: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
             if cols.len() < 5 {
@@ -367,25 +417,64 @@ impl Grid {
             let (Ok(x), Ok(y)) = (xs.trim().parse::<i32>(), ys.trim().trim_end_matches(')').parse::<i32>()) else {
                 continue;
             };
+            entries.push((prefab.to_string(), x, y));
+        }
+        if entries.is_empty() {
+            return;
+        }
+        // 取真实锚点：实时 cell 里每栋建筑都带 anchorX/anchorY（真值）。
+        //   索引里的 Position 是判定点，与真实底边锚点可能差 1（打印舱实测差 1）。
+        //   老代码图省事把三种候选锚点的占格全标成建筑 →
+        //   在气体格里造出幻影墙 → 幻影墙被当成地板 →
+        //   悬空格看起来能站 → 派工过去游戏拒收 → 死工单（实测根因）。
+        let probes: Vec<(i32, i32)> = entries.iter().map(|e| (e.1, e.2)).collect();
+        let live = crate::cell::fetch_many(session, &probes);
+        for (prefab, x, y) in entries {
             let (w, h) = catalog
-                .and_then(|c| c.find(prefab))
+                .and_then(|c| c.find(&prefab))
                 .map(|d| (d.width.max(1) as i32, d.height.max(1) as i32))
                 .unwrap_or((1, 1));
-            // 记录**地板砖**（Tile）占格：OnFloor 建筑只认它当支撑。
+            let mut real: Vec<(i32, i32)> = Vec::new();
+            if let Some(cd) = live.get(&(x, y)) {
+                for b in &cd.buildings {
+                    if b.prefab_id == prefab && !real.contains(&(b.anchor_x, b.anchor_y)) {
+                        real.push((b.anchor_x, b.anchor_y));
+                    }
+                }
+            }
+            if !real.is_empty() {
+                // 有真锚点 → 只标真占格，不造幻影。
+                for (ax, ay) in &real {
+                    for dy in 0..h {
+                        for dx in 0..w {
+                            self.cells.insert((ax + dx, ay + dy), Kind::Building);
+                        }
+                    }
+                    if prefab == "Tile" {
+                        self.floor_tiles.insert((*ax, *ay));
+                    }
+                }
+                continue;
+            }
+            // 读不到实时数据 → 退回容错锚点，
+            //   但多标出来的格子记成幻影：保护，但不承重。
             if prefab == "Tile" {
                 self.floor_tiles.insert((x, y));
                 self.floor_tiles.insert((x - 1, y));
             }
-            // 锚点容错：index.md 的 Position 是**建筑判定点**，
-            //   而 mod 的实际占格锚点是 cell_X_Y.md 里的 **bottomLeft**。
-            //   打印舱：index 说 (126,189)，但 mod 报的 anchorX 是 125
-            //   按 index 铺的占格整体偏移 → (127,189) 被当成空地
-            //   预检选中那里 → 落地报 occupied_by_building → 发电机/烤箱永远造不成。
-            //   正解：三种可能锚点都铺（宁可多保护，不可漏保护）。
             for (ax, ay) in [(x, y), (x - 1, y), (x, y - 1)] {
                 for dy in 0..h {
                     for dx in 0..w {
-                        self.cells.insert((ax + dx, ay + dy), Kind::Building);
+                        let c = (ax + dx, ay + dy);
+                        if c == (x, y) {
+                            self.cells.insert(c, Kind::Building);
+                        } else if self.cells.get(&c) == Some(&Kind::Solid) {
+                            // 底下本来就是岩石 → 保持岩石，别被幻影覆盖
+                            continue;
+                        } else {
+                            self.cells.insert(c, Kind::Building);
+                            self.phantom.insert(c);
+                        }
                     }
                 }
             }
@@ -396,8 +485,14 @@ impl Grid {
         self.cells.get(&c).copied().unwrap_or(Kind::Unknown)
     }
 
-    /// 能否当"地板"（实心岩或梯子）
+    /// 能否当地板（实心岩 / 建筑顶 / 梯子）
+    ///
+    /// 幻影建筑格**不算地板**：它只是别盖这儿的占位，
+    ///   当成地板会让悬空格看起来能站 → 死工单（见 phantom 字段注释）。
     pub fn is_support(&self, c: (i32, i32)) -> bool {
+        if self.phantom.contains(&c) {
+            return false;
+        }
         matches!(self.kind(c), Kind::Solid | Kind::Building | Kind::Ladder)
     }
 
@@ -417,18 +512,29 @@ impl Grid {
         self.floor_tiles.contains(&c)
     }
 
-    /// 某格能否站人：不是实心/建筑，且**下方能找到地板**。
+    /// 某格能否站人：不是实心/建筑，且**正下方就是地板**。
     ///
-    /// 为什么是"向下扫 8 格"而不是只看 y-1：
-    ///   复制人会往下掉，掉完必须站得住。开局打印舱东侧有个 3 层高的空腔，
-    ///   只看 y-1 会把整个空腔判成不可站 → 可达区少一大块 → 预检。
+    /// ★ 与游戏 navmesh 对齐（实测实证，别再改回「向下扫 8 格」）：
+    ///   官方可达集（/active/dupes/reachability.md 的 samples，radius=16）
+    ///   在本存档给出 22 格，**逐格核对下来完全等于**
+    ///   「可通行 ∧ 紧邻下一格实心」这一个判据：
+    ///     - 悬空格（脚下方是气体）→ **不可站**，官方集里没有；
+    ///     - 脚下就是岩石/砖块的格 → 可站，官方集里有；
+    ///     - 梯子格 → 永远可站。
+    ///   旧实现用 floor_within(c, 8)（向下 8 格内找到地板就算能站）
+    ///   → 把「悬空几层、脚下没地板」的格子也算成能站
+    ///   → 挖掘预检给悬空的 (x,y-1) 选出落脚点
+    ///   → 工单下到悬空岩层 → **游戏里没人能执行**
+    ///   → 每人每次尝试都被 precondition 拒绝（实测 blocked=18 = 6 单 × 3 人）
+    ///   → 全员闲 + 工单积压 = 看起来「没进展」。
+    ///   这就是「看游戏没进展」的真正根因：**模型比游戏宽松 → 下了没人能干的活**。
     pub fn walkable(&self, c: (i32, i32)) -> bool {
         match self.kind(c) {
             Kind::Ladder => return true,
             Kind::Gas | Kind::Dupe | Kind::Liquid => {}
             _ => return false,
         }
-        self.floor_within(c, 8)
+        self.floor_within(c, 1)
     }
 
     /// 下方 8 格内能否找到地板（实心岩 / 建筑 / 梯子）。
@@ -467,8 +573,9 @@ impl Grid {
         if self.kind(c) == Kind::Ladder {
             return true;
         }
-        // 脚下 8 格内要有地板：复制人会掉下去，但掉完得站得住
-        self.floor_within(c, 8)
+        // 脚下**紧邻**一格就要有地板（与游戏 navmesh 对齐，见 walkable 的实证说明）：
+        //   悬空格的复制人站不住 → 派工过去也是死工单。
+        self.floor_within(c, 1)
     }
 
     /// 从种子出发做 BFS：4 邻接 + 可走对角（两个正交格都可走时）
