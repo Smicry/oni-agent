@@ -67,6 +67,11 @@ cargo build --release
 
 ## 8. 依赖图（plan.json）
 
+**AI 拥有战略决策**：plan.json 带 `author=ai` + `locked=true` 时，机械规划器**永不覆盖**，
+只能把重规划建议写入 `suggestions.jsonl` 等 AI 审阅；`oni plan-auto` 默认只出草稿，
+`--apply` 也会被 locked 拒绝。AI 不在时宁可停摆，也不让 if-else 规则越权做战略判断。
+慢系统决策用 `oni decision add/list/resolve` 留痕（依据+证据+预期+回填）。
+
 - 节点有 requires / unlocks / actions / success_check / status / priority。
 - decide() 先比 priority 再比 unlocks，平局取文件靠前（文件顺序=优先级）。
 - status: todo / in_progress / done / blocked / deferred；熔断只用于有替代方案的节点，保命节点永不熔断。

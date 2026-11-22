@@ -55,6 +55,16 @@ pub fn stamp_plan(plan_path: &str, fp: &str) -> bool {
 ///
 /// 重规划与人工编辑都走这一条路径 → 指纹永远正确 → 换局不会误重置。
 pub fn write_plan(plan_path: &str, plan: &crate::decide::Plan, fp: Option<&str>) -> bool {
+    // AI-authored plans are locked: never let the mechanical planner overwrite them.
+    if let Ok(old) = std::fs::read_to_string(plan_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&old) {
+            if v.get("locked").and_then(|x| x.as_bool()).unwrap_or(false)
+                && plan.author.as_deref() != Some("ai") {
+                eprintln!("⛔ plan.json is AI-authored (locked); mechanical write refused");
+                return false;
+            }
+        }
+    }
     let Ok(mut v) = serde_json::to_value(plan) else {
         return false;
     };

@@ -386,6 +386,8 @@ pub fn build_plan(f: &WorldFacts) -> (Plan, Strategy) {
     let plan = Plan {
         nodes,
         survival_node: Some("A4".to_string()),
+        author: Some("auto".to_string()),
+        locked: false,
     };
     let mut plan = plan;
 

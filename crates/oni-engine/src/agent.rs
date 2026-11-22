@@ -346,16 +346,16 @@ impl Agent {
                     if let Ok(old) = load_plan(std::path::Path::new(&self.cfg.plan_path)) {
                         crate::planner::merge_done(&mut new_plan, &old);
                     }
-                    let fp = oni_mcp::save::current().map(|s| s.fingerprint);
-                    if crate::saveswitch::write_plan(&self.cfg.plan_path, &new_plan, fp.as_deref()) {
-                        self.replan_cooldown = 60;
+                    // Slow system owns strategy; mechanical replan only suggests.
+                    self.replan_cooldown = 60;
+                    let plan_json = serde_json::to_string(&new_plan).unwrap_or_default();
+                    crate::decisions::suggest(&reason, strategy.label(), &plan_json);
                         report.notes.push(format!(
-                            "🔄 事件驱动重规划（{}）→ 新策略族：{}（{} 个节点）",
+                            "🔄 重规划建议（{}）→ {}（{} 节点）已写入 suggestions.jsonl，等 AI 审阅（不覆盖 plan.json）",
                             reason,
                             strategy.label(),
                             new_plan.nodes.len()
                         ));
-                    }
                 }
             } else if self.replan_cooldown > 0 {
                 self.replan_cooldown -= 1;

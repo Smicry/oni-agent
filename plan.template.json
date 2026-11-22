@@ -352,5 +352,7 @@
       "success": "发射火箭",
       "note": "本局最终目标。"
     }
-  ]
+  ],
+  "author": "ai",
+  "locked": true
 }

@@ -158,6 +158,43 @@ pub fn list(limit: usize) -> Vec<Decision> {
     items
 }
 
+/// A mechanical replan suggestion. Never applied automatically; the slow system reviews it.
+pub fn suggest(reason: &str, strategy: &str, plan_json: &str) {
+    let p = match oni_mcp::save::last_seen() {
+        Some(id) => oni_mcp::save::save_dir(&id.fingerprint).join("suggestions.jsonl"),
+        None => oni_mcp::state_dir().join("suggestions.jsonl"),
+    };
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let rec = serde_json::json!({"ts": now(), "reason": reason, "strategy": strategy, "plan": plan_json});
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "{}", rec);
+    }
+    let _ = crate::bus::publish(
+        crate::bus::Kind::AuditFinding,
+        crate::bus::Priority::Warn,
+        "replan",
+        reason,
+        serde_json::json!({"strategy": strategy}),
+        600,
+    );
+}
+
+/// Pending suggestions (for the slow system to review).
+pub fn pending_suggestions() -> Vec<serde_json::Value> {
+    let p = match oni_mcp::save::last_seen() {
+        Some(id) => oni_mcp::save::save_dir(&id.fingerprint).join("suggestions.jsonl"),
+        None => oni_mcp::state_dir().join("suggestions.jsonl"),
+    };
+    std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
 pub fn summary() -> String {
     summary_for(10)
 }

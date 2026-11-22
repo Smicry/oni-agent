@@ -92,6 +92,12 @@ pub struct Plan {
     /// **保命节点**：空气告急 / 有人倒下时强制执行这个节点（通常是产氧/换气）
     #[serde(default)]
     pub survival_node: Option<String>,
+    /// Who authored this plan: "ai" (slow system) or "auto" (mechanical planner).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// AI-authored plans are locked: mechanical replanning must never overwrite them.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +225,8 @@ mod tests {
                 mk("B", &["A"], false),  // 依赖被暂缓的 A
             ],
             survival_node: None,
+            author: None,
+            locked: false,
         };
         let (chosen, ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(chosen.map(|n| n.id), Some("B".to_string()),
@@ -232,6 +240,8 @@ mod tests {
         let plan = Plan {
             nodes: vec![mk("A", &[], true)],
             survival_node: None,
+            author: None,
+            locked: false,
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert!(chosen.is_none(), "暂缓节点本轮不应被选中");
@@ -248,6 +258,8 @@ mod tests {
         let plan = Plan {
             nodes: vec![normal, urgent],
             survival_node: None,
+            author: None,
+            locked: false,
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(chosen.map(|n| n.id), Some("food".to_string()),

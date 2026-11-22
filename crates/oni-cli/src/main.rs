@@ -106,7 +106,7 @@ const HELP: &str = r#"oni <子命令>
   area <y0> <y1>         一次读图层摘要（水体/气室/建筑/植物/危险点）
   bus [timeline|ack N|resolve N]  协同总线：快慢系统的统一事件时间线（QoS 过滤/可回放）
   command [add <指令>|list|done <id>]  用户指令队列（下发指令给慢系统）
-  decision add <json>|list [n]|resolve <id> <实际结果>
+  decision add <json>|list [n]|suggestions|resolve <id> <实际结果>
                                   慢系统决策记录（依据/预期/回填）
   state                 存档身份 / 指纹 / 局内缓存目录（跨局隔离检查）
   note <文本>            写进本存档的 notes.md（局内笔记，不进通用记忆）
@@ -287,12 +287,19 @@ fn cmd_plan_auto(args: &[String]) -> anyhow::Result<()> {
             oni_engine::planner::merge_done(&mut plan, &old);
         }
     }
-    let id = current_save();
-    let fp = id.as_ref().map(|i| i.fingerprint.clone());
-    if !oni_engine::saveswitch::write_plan(PLAN, &plan, fp.as_deref()) {
-        anyhow::bail!("写 plan.json 失败");
+    // Draft by default: the slow system (AI) owns plan.json. Mechanical planner may
+    // only write when explicitly asked with --apply, and the result is marked author=auto.
+    let apply = args.iter().any(|a| a == "--apply");
+    if apply {
+        let id = current_save();
+        let fp = id.as_ref().map(|i| i.fingerprint.clone());
+        if !oni_engine::saveswitch::write_plan(PLAN, &plan, fp.as_deref()) {
+            anyhow::bail!("写 plan.json 失败（可能被 AI 锁定）");
+        }
+        println!("✅ 已落盘机械草稿 plan.json（{} 个节点）", plan.nodes.len());
+    } else {
+        println!("📋 机械草稿（未落盘，{} 个节点）—— AI 审阅后决定采纳", plan.nodes.len());
     }
-    println!("✅ 已按策略族自动生成 plan.json（{} 个节点）", plan.nodes.len());
     println!("   策略族: {}", strategy.label());
     println!("   保命节点: {}", plan.survival_node.clone().unwrap_or_default());
     for n in &plan.nodes {
@@ -598,6 +605,19 @@ fn cmd_decision(args: &[String]) -> anyhow::Result<()> {
         "list" => {
             let n = args.get(1).and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
             println!("{}", oni_engine::decisions::summary_for(n));
+        }
+        "suggestions" => {
+            let items = oni_engine::decisions::pending_suggestions();
+            if items.is_empty() {
+                println!("（暂无机械重规划建议）");
+            } else {
+                for s in items.iter().rev().take(10) {
+                    println!("[{}] {} → {}",
+                        s.get("ts").and_then(|x| x.as_i64()).unwrap_or(0),
+                        s.get("reason").and_then(|x| x.as_str()).unwrap_or(""),
+                        s.get("strategy").and_then(|x| x.as_str()).unwrap_or(""));
+                }
+            }
         }
         other => anyhow::bail!("用法: oni decision add <json> | list [n] | resolve <id> <实际结果>（未知: {other}）"),
     }
