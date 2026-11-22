@@ -255,6 +255,25 @@ pub fn extract_json(text: &str) -> Option<&str> {
 ///   - 判据重复 → 一个 done 会连带"证明"另一个（实测 E1/AIR 同判据）；
 ///   - 产氧节点无供电前置 → 造出来不产氧（实测：制氧1 但净 -120W）；
 ///   - 缺生命线 → 代理不会去建厕所/床/产氧（实测：床位 0/3 无人建）。
+/// **判据自愈**：LLM 发明的判据 kind → 降级为 manual（可执行但永不自动完成）。
+///
+/// 为什么不直接拒绝整份计划：一个未知判据只影响**一个节点**的验收，
+///   拒绝整份计划会让其它 10 个正确节点陪葬（实测首跑：T1 被发明 material_min，
+///   整份计划被拒 → 代理继续跑旧 playbook）。降级 + 告警 = 可用且可见。
+/// 返回告警清单。
+pub fn repair_plan_checks(plan: &mut Plan) -> Vec<String> {
+    let mut warns = Vec::new();
+    for node in &mut plan.nodes {
+        let Some(v) = node.success_check.as_mut() else { continue };
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        if !CHECK_KINDS.contains(&kind.as_str()) {
+            warns.push(format!("{} 的判据 kind {:?} 不在白名单 → 降级为 manual", node.id, kind));
+            *v = serde_json::json!({"kind": "manual"});
+        }
+    }
+    warns
+}
+
 pub fn validate_plan(plan: &Plan) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
     let n = plan.nodes.len();
@@ -433,9 +452,14 @@ fn build_prompts(brief_text: &str) -> (String, String) {
 地表近优先打通换气口，深埋优先竖井+梯子）。\
 只输出 JSON，不要任何其它文字、不要 markdown 栅栏。".to_string();
 
+    let kinds_line = format!(
+        "判据 kind 全集（只能从中选）: {}",
+        CHECK_KINDS.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ")
+    );
     let user = format!(
         "== 本局世界事实 ==\n{brief_text}\n\n== 跨局通用原则（任何地图都适用）==\n{}\n\n== 硬性约束 ==\n\
-1. 产氧设备（氧气扩散器/电解器）需要电力 → 供电节点的 id 必须出现在产氧节点的 requires 里；\n2. 若走研究路线（电解器/藻类箱被研究锁时），必须有建研究站的节点；\n3. 判据用终局量：产氧 = {{kind:oxygen_producing}}；换气 = {{kind:surface_open,minY:<地表Y>}}；\n   卫生 = {{kind:building_min,key:toilets,n:<人数>}}；床位 = {{kind:building_min,key:beds,n:<人数>}}；\n   供电 = {{kind:power_operational}}；食物 = {{kind:food_cycles_min,cycles:<N>}}；\n4. 不得写死坐标：AutoBuild 的 region 一律 \"auto\"；禁止 build/dig/order/auto_connect 动作；\n5. 语义 goal 只能取：scout/material/surface/oxygen/expand/open_chamber/power/research/forage/mop_dirty/element:<元素名>；\n6. 节点数 6~14；requires/unlocks 引用必须存在且构成 DAG；每个节点 1~3 个动作；\n7. 必须覆盖五条生命线：卫生、氧气、食物、居住(床)、电力；survival_node 指向换气/产氧节点。\n\n== 输出 schema（字段名必须完全一致）==\n{{\n\
+1. 产氧设备（氧气扩散器/电解器）需要电力 → 供电节点的 id 必须出现在产氧节点的 requires 里；\n2. 若走研究路线（电解器/藻类箱被研究锁时），必须有建研究站的节点；\n3. 判据用终局量：产氧 = {{kind:oxygen_producing}}；换气 = {{kind:surface_open,minY:<地表Y>}}；\n   卫生 = {{kind:building_min,key:toilets,n:<人数>}}；床位 = {{kind:building_min,key:beds,n:<人数>}}；\n   供电 = {{kind:power_operational}}；食物 = {{kind:food_cycles_min,cycles:<N>}}；\n4. 不得写死坐标：AutoBuild 的 region 一律 \"auto\"；禁止 build/dig/order/auto_connect 动作；\n5. 语义 goal 只能取：scout/material/surface/oxygen/expand/open_chamber/power/research/forage/mop_dirty/element:<元素名>；\n6. 节点数 6~14；requires/unlocks 引用必须存在且构成 DAG；每个节点 1~3 个动作；\n7. 必须覆盖五条生命线：卫生、氧气、食物、居住(床)、电力；survival_node 指向换气/产氧节点；\n
+8. {kinds_line}。\n\n== 输出 schema（字段名必须完全一致）==\n{{\n\
   \"objective\": \"一句话\", \"survival_node\": \"<id>\", \"author\": \"ai\", \"locked\": true,\n\
   \"nodes\": [{{\"id\": \"T1\", \"name\": \"...\", \"status\": \"todo\", \"requires\": [], \"unlocks\": [],\n\
     \"actions\": [{{\"kind\": \"auto\", \"goal\": \"...\", \"why\": \"...\"]}},\n\
@@ -457,10 +481,22 @@ pub fn author_opening_plan(
     let raw = crate::slow::call_llm(cfg, &system, &user)?;
     let json_text = extract_json(&raw).ok_or("LLM 输出里没有 JSON")?;
     let mut raw_v: Value = serde_json::from_str(json_text).map_err(|e| format!("计划 JSON 解析失败: {e}"))?;
-    let plan: Plan = serde_json::from_value(raw_v.clone()).map_err(|e| format!("计划 schema 不合法: {e}"))?;
+    let mut plan: Plan = serde_json::from_value(raw_v.clone()).map_err(|e| format!("计划 schema 不合法: {e}"))?;
+    let repairs = repair_plan_checks(&mut plan);
     let errs = validate_plan(&plan);
     if !errs.is_empty() {
-        return Err(format!("计划校验未通过（{} 条）：{}", errs.len(), errs.join("；")));
+        // 失败也要可见：带上生成的节点清单（诊断 LLM 到底规划了什么）
+        let nodes_brief: Vec<String> = plan.nodes.iter().map(|n| {
+            let c = n.success_check.as_ref()
+                .and_then(|c| c.get("kind").and_then(|k| k.as_str()))
+                .unwrap_or("无判据");
+            format!("{}({}:{})", n.id, n.name.chars().take(12).collect::<String>(), c)
+        }).collect();
+        return Err(format!(
+            "计划校验未通过（{} 条）：{}；生成的节点：{}{}",
+            errs.len(), errs.join("；"), nodes_brief.join("、"),
+            if repairs.is_empty() { String::new() } else { format!("（已自愈 {} 条未知判据）", repairs.len()) }
+        ));
     }
     // 名副其实：这份计划才是 AI 生的 → author=ai / locked=true
     if let Some(obj) = raw_v.as_object_mut() {
@@ -470,38 +506,13 @@ pub fn author_opening_plan(
             obj.insert("save_fingerprint".into(), Value::from(f.to_string()));
         }
     }
-    // 保留旧计划里 done 且判据仍成立的节点进度（同 id 同判据才算）
-    if let (Ok(old_text), Some(nodes)) = (
-        std::fs::read_to_string(plan_path),
-        raw_v.get_mut("nodes").and_then(|n| n.as_array_mut()),
-    ) {
-        if let Ok(old) = serde_json::from_str::<Value>(&old_text) {
-            for n in nodes.iter_mut() {
-                let (id, check) = (
-                    n.get("id").cloned(),
-                    n.get("success_check").cloned(),
-                );
-                let (Some(id), Some(check)) = (id, check) else { continue };
-                let still = old.get("nodes").and_then(|o| o.as_array()).and_then(|arr| {
-                    arr.iter().find(|m| {
-                        m.get("id").and_then(|i| i.as_str()) == id.as_str()
-                            && m.get("status").and_then(|s| s.as_str()) == Some("done")
-                            && serde_json::to_string(m.get("success_check").unwrap_or(&Value::Null)).ok()
-                                == serde_json::to_string(&check).ok()
-                    })
-                });
-                if let Some(m) = still {
-                    if let Some(o) = n.as_object_mut() {
-                        o.insert("status".into(), Value::from("done"));
-                        let _ = o.insert("success".into(), m.get("success").cloned().unwrap_or(Value::Null));
-                    }
-                }
-            }
-        }
-    }
     std::fs::write(plan_path, serde_json::to_string_pretty(&raw_v).unwrap_or_default())
         .map_err(|e| format!("写盘失败: {e}"))?;
-    Ok(format!("LLM 开局规划已生成（{} 节点，判据校验通过）", plan.nodes.len()))
+    let mut msg = format!("LLM 开局规划已生成（{} 节点，校验通过）", plan.nodes.len());
+    if !repairs.is_empty() {
+        msg.push_str(&format!("；⚠ {} 条判据被降级为 manual：{}", repairs.len(), repairs.join("；")));
+    }
+    Ok(msg)
 }
 
 

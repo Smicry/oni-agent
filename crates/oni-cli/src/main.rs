@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         "doctor" => cmd_doctor(),
         "preflight" => cmd_preflight(&rest),
         "plan-check" => cmd_plan_check(&rest),
+        "plan-llm" => cmd_plan_llm(),
         "cells" => cmd_reach_cells(&rest),
         "plan" => cmd_plan(),
         "plan-reset" => cmd_plan_reset(),
@@ -88,6 +89,7 @@ const HELP: &str = r#"oni <子命令>
   doctor             连通性 / 建造目录 / 协议自检
   cells <x1,y1,x2,y2>            世界模型逐格诊断（可站/支撑/可达集 vs 实时元素）
   plan-check                    依赖图体检：节点 status / 判据 / 假 done 清单
+  plan-llm                      手动触发 LLM 开局规划（采事实→生成→校验→落盘）
   preflight dig  <x1,y1,x2,y2>   挖掘预检：目标可挖? 有落脚点?
   preflight build <x,y> <Prefab>    建造预检：占格空? 支撑实心? 材料合法?
   plan               按依赖图选本轮唯一目标
@@ -1294,6 +1296,35 @@ fn cmd_reach_cells(args: &[String]) -> anyhow::Result<()> {
 ///   → 再没有任何节点要求产氧 → 基地慢慢耗尽。
 /// 用法：oni plan-check [fix]
 ///       oni plan-check             （只打印，不改）
+/// **手动触发 LLM 开局规划**：采集本局世界事实 → LLM 生成计划 → 强校验 → 落盘。
+///
+/// 用途：换局/回滚后想立刻重新规划，不用等慢系统自动触发。
+fn cmd_plan_llm() -> anyhow::Result<()> {
+    let s = connect()?;
+    let snap = oni_engine::sense::sense(&s);
+    let facts = oni_engine::opening::collect_facts(&s, &snap);
+    let scout_report = oni_engine::autoact::scout_resources(&s, None);
+    let rec = serde_json::json!({
+        "facts": serde_json::to_value(&facts).unwrap_or_default(),
+        "scout": scout_report,
+        "cycle": snap.cycle,
+        "population": snap.dupes.len(),
+    });
+    let brief = serde_json::to_string_pretty(&rec).unwrap_or_default();
+    println!("📋 世界事实已采集（{} 字节）→ 调用 LLM 规划…", brief.len());
+    let cfg = oni_engine::slow::SlowConfig::default();
+    // 打上**当前存档指纹**：计划自证出身（换局检测靠它）
+    let fp = current_save().as_ref().map(|i| i.fingerprint.clone());
+    match oni_engine::opening::author_opening_plan(&cfg, &brief, "plan.json", fp.as_deref()) {
+        Ok(msg) => println!("✅ {}", msg),
+        Err(reason) => {
+            println!("❌ LLM 规划失败：{reason}");
+            anyhow::bail!(reason);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_plan_check(args: &[String]) -> anyhow::Result<()> {
     let path = "plan.json";
     // 用法：oni plan-check        （只体检）
