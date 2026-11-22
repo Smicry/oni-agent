@@ -53,14 +53,10 @@ button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
     <div class="card">
       <div class="panel-title">操作</div>
       <div class="ctrl" id="controls">
-        <button onclick="ctl('pause')">暂停</button>
-        <button onclick="ctl('resume')">继续</button>
-        <button onclick="ctl('speed',1)">1x</button>
-        <button onclick="ctl('speed',2)">2x</button>
-        <button onclick="ctl('speed',3)">3x</button>
-        <button onclick="ctl('window')">开120s窗口</button>
+        <button id="aiToggle" onclick="toggleAI()" style="min-width:110px;font-weight:bold">⏸ 停止 AI</button>
       </div>
       <div class="small" id="worldState" style="margin-top:8px"></div>
+      <div class="small" style="margin-top:6px">速度 <button onclick="ctl('speed',1)">1x</button> <button onclick="ctl('speed',2)">2x</button> <button onclick="ctl('speed',3)">3x</button></div>
     </div>
     <div class="card"><div class="grid" id="stats"></div></div>
     <h2>复制人</h2><div class="card" id="dupes" style="margin-top:0"></div>
@@ -73,6 +69,12 @@ async function refresh(){
   var r=await fetch('/api/state'); if(!r.ok) return; var s=await r.json();
   document.getElementById('mode').textContent='['+s.mode+'] '+time(s.updated_at);
   document.getElementById('worldState').textContent=s.paused?'世界:已暂停':'世界:运行中';
+  var tog=document.getElementById('aiToggle');
+  if(s.ai_enabled===false){
+    tog.textContent='▶ 启动 AI'; tog.style.background='#a3be8c'; tog.style.color='#2e3440';
+  }else{
+    tog.textContent='⏸ 停止 AI'; tog.style.background='#5e81ac'; tog.style.color='#d8dee9';
+  }
   document.getElementById('stats').innerHTML=
     '<div class="kv"><b>周期</b><br>'+s.cycle+'</div>'+
     '<div class="kv"><b>世界</b><br>'+(s.paused?'暂停':'运行')+'</div>'+
@@ -97,6 +99,12 @@ async function refresh(){
 async function ctl(op,val){
   var body=op==='speed'?JSON.stringify({speed:val}):'';
   await fetch('/api/ctl/'+op,{method:'POST',body:body}); refresh();
+}
+async function toggleAI(){
+  var tog=document.getElementById('aiToggle');
+  var stopping=tog.textContent.indexOf('停止')>=0;
+  await fetch('/api/ctl/'+(stopping?'stop':'start'),{method:'POST'});
+  refresh();
 }
 async function sendCmd(){var el=document.getElementById('cmd');var t=el.value.trim();if(!t)return;
   await fetch('/api/command',{method:'POST',body:t});el.value='';refresh();}

@@ -81,6 +81,21 @@ pub fn hold_active() -> bool {
     hold_path().exists()
 }
 
+/// ★ 结构化失败原因分类：把 exec 的自由文本 detail 归为稳定的类别。
+/// 慢系统据此诊断「为什么失败」，而不是盲目换目标名字
+/// （实测 oxygen 连续 8 次失败 = "语义目标找不到"，却一直被重试）。
+pub fn classify_fail(detail: &str) -> String {
+    let d = detail;
+    if d.contains("找不到") && (d.contains("语义目标") || d.contains("地图")) { "no_target".into() }
+    else if d.contains("研究锁") { "research_locked".into() }
+    else if d.contains("缺建材") || d.contains("材料") && d.contains("不可用") { "no_material".into() }
+    else if d.contains("预检未通过") { "preflight".into() }
+    else if d.contains("落地失败") || d.contains("dry-run 未通过") { "rejected".into() }
+    else if d.contains("落点") || d.contains("建造区域") { "no_placement".into() }
+    else if d.contains("无法解析") { "bad_goal".into() }
+    else { "unknown".into() }
+}
+
 /// 读取并消费一次施工窗口请求。
 pub fn read_window_request() -> Option<u64> {
     let path = window_request_path();
@@ -336,7 +351,7 @@ impl Agent {
                 crate::escalate::Kind::NoProgress, "", detail.clone(),
                 "AI: pick a candidate — dig access / cancel dead orders / switch goal".into(),
                 crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
                 context,
             );
             report.notes.push(format!("[上报AI] 工单积压+全员闲(带结构化候选)：{detail}"));
@@ -711,6 +726,13 @@ impl Agent {
                 self.last_danger.clear();
                 can_execute = true;
                 report.notes.push("▶ 危急已解除 → 开施工窗口".into());
+            } else if ctl.owner == crate::control::Owner::Agent {
+                // ★ 死锁修复：世界是代理自己冻的（needs_ai / 窗口到期），不是用户暂停。
+                //   绝不标成 user_paused，否则下面「慢系统已处理 → 解冻」会被
+                //   「绝不越权恢复用户暂停」挡死 → 慢系统 ack 后世界永久冻住。
+                report.notes.push(
+                    "⏸ 代理冻结中（owner=agent）→ 等慢系统/看门狗解冻，不标用户暂停".into(),
+                );
             } else {
                 self.user_paused = true;
                 report.notes.push(
@@ -764,6 +786,46 @@ impl Agent {
 
         // A: 观测前移 —— 空闲看门在闸门之前跑，hook 暂冻世界时也能发现"有活没人干"。
         self.watch_backlog_idle(&snap, &mut report);
+
+        // =====================================================================
+        // 2.6) 慢系统交接收尾：pending 清空后自动解冻 + 看门狗兜底
+        //   ★ 死锁修复：这段必须在执行闸门(3)之前！
+        //     旧代码把它放在闸门之后，世界暂停时闸门提前 return →
+        //     慢系统 ack 后无人解冻（owner=agent 又被误判成用户暂停）→
+        //     慢系统无事件 → idle → 循环彻底停摆。
+        // =====================================================================
+        {
+            let pending_esc = crate::escalate::has_pending();
+            let pending_cmd = !crate::commands::pending().is_empty();
+            let agent_owner = ctl.owner == crate::control::Owner::Agent;
+            if self.escalation_hold && !pending_esc && !pending_cmd {
+                // 慢系统已处理（pending 清空）→ 解冻
+                self.escalation_hold = false;
+                self.escalation_since = None;
+                report.notes.push("✅ 慢系统已处理 → 解除冻结，快系统继续自主运行".into());
+                if agent_owner && !observed_running {
+                    self.resume("慢系统已处理，恢复施工");
+                    self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
+                    self.window_owned_by_us = true;
+                }
+            } else if self.escalation_hold {
+                let since = *self.escalation_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(Self::ESCALATION_WATCHDOG_SECS) {
+                    self.escalation_hold = false;
+                    self.escalation_since = None;
+                    crate::escalate::note_unhandled("看门狗超时，慢系统未处理");
+                    report.notes.push(format!(
+                        "⏱ 等慢系统已 {}s 无人处理 → 看门狗降级：解除冻结，继续自主运行",
+                        since.elapsed().as_secs()
+                    ));
+                    if agent_owner && !observed_running {
+                        self.resume("看门狗超时，恢复施工");
+                        self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
+                        self.window_owned_by_us = true;
+                    }
+                }
+            }
+        }
 
         // =====================================================================
         // 3) 执行闸门：世界不跑 ⇒ 只观察
@@ -831,17 +893,16 @@ impl Agent {
             }
         }
 
-        // ---- 执行慢系统的语义目标（B方案：慢系统定 goal，快系统 autoact 翻译成工单）----
-        //   慢系统把决策 goal 写成 source=ai_goal 的 command；这里消费并执行。
+        // ---- 执行慢系统的语义目标（慢系统定 goal，快系统 autoact 翻译成工单）----
+        //   慢系统把决策 goal 写进独立 ai_goals.jsonl；这里消费并执行。
         //   必须在 wait_slow 停手逻辑**之前**完成，否则 pending_cmd 会因为这条而停手。
         {
-            let ai_goals: Vec<_> = crate::commands::pending().into_iter()
-                .filter(|c| c.source == "ai_goal")
-                .collect();
+            // ★ 从独立 ai_goals.jsonl 读（不再从 commands.jsonl 过滤 source）
+            let ai_goals: Vec<_> = crate::commands::ai_goals_pending();
             for c in ai_goals {
                 let goal = c.text.trim();
                 if crate::autoact::parse_goal(goal).is_none() {
-                    crate::commands::complete(c.id, &format!("无效语义目标: {}", goal));
+                    crate::commands::complete_ai_goal(c.id, &format!("无效语义目标: {}", goal));
                     continue;
                 }
                 if !can_execute {
@@ -864,15 +925,17 @@ impl Agent {
                     let _ = std::fs::create_dir_all(&sd);
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
                         .open(sd.join("goal_outcomes.jsonl")) {
+                        // ★ 结构化失败原因：从 detail 归类，供慢系统诊断「为什么失败」而非盲目换名字。
+                        let fail_kind = if ok { "none".to_string() } else { classify_fail(&detail) };
                         let rec = serde_json::json!({
-                            "goal": goal, "ok": ok, "detail": detail,
+                            "goal": goal, "ok": ok, "detail": detail, "fail_kind": fail_kind,
                             "ts": std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
                         });
                         let _ = writeln!(f, "{}", rec);
                     }
                 }
-                crate::commands::complete(c.id, &format!("ai_goal[{}] {}：{}", goal,
+                crate::commands::complete_ai_goal(c.id, &format!("ai_goal[{}] {}：{}", goal,
                     if ok { "已执行" } else { "未成功" }, detail));
                 report.notes.push(format!("🎯 慢系统目标[{}]：{} → {}", goal,
                     if ok { "已执行" } else { "未成功" }, detail));
@@ -1004,13 +1067,21 @@ impl Agent {
         if directive.needs_ai {
             let first_time = !self.escalation_hold;
             if first_time {
-                let esc_id = crate::escalate::raise(
+                // ★ 语义指纹去重：category = 建议动作的 Debug 名（Rescue/BuildToilet/
+                //   ProduceOxygen…），呼吸低与膀胱告急是不同问题，互不压制；
+                //   Ctx 带上 breath/bladder 基线，真恶化时提前打破静默。
+                let category = format!("{:?}", directive.action);
+                let esc_id = crate::escalate::raise_categorized(
                     crate::escalate::Kind::StrategyMismatch,
                     "",
                     format!("AI decision required: {}", directive.reason),
                     "Slow system: review situation and decide; world is frozen".into(),
                     crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(),
+                        breath: snap.min_breath().unwrap_or(0.0),
+                        bladder: snap.max_bladder(), },
+                    &category,
+                    crate::escalate::EscContext::default(),
                 );
                 if esc_id == 0 {
                     // 放行冷静期内：当 Watch 处理，记日志继续自主运行，不打扰 AI。
@@ -1147,7 +1218,7 @@ impl Agent {
                     directive.action, directive.reason),
                 "请检查 plan 是否覆盖该紧急场景（节点名/动作标签）".into(),
                 crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
             );
         }
         // 修正：**Urgent 抢占必须尊重依赖图**。
@@ -1230,6 +1301,7 @@ impl Agent {
                     dupes: snap.dupes.len(),
                     oxygen_kg: snap.oxygen_kg(),
                     food_kcal: snap.food_kcal(),
+                    ..Default::default()
                 };
                 crate::escalate::raise(
                     crate::escalate::Kind::Deadlock,
@@ -1363,6 +1435,7 @@ impl Agent {
                         dupes: snap.dupes.len(),
                         oxygen_kg: snap.oxygen_kg(),
                         food_kcal: snap.food_kcal(),
+                        ..Default::default()
                     };
                     for s in &confirmed {
                     let kind = match s.kind {
@@ -1618,6 +1691,7 @@ impl Agent {
                     dupes: snap.dupes.len(),
                     oxygen_kg: snap.oxygen_kg(),
                     food_kcal: snap.food_kcal(),
+                    ..Default::default()
                 };
                 crate::escalate::raise(
                     crate::escalate::Kind::NodeFailing,
@@ -1734,7 +1808,7 @@ impl Agent {
                     crate::escalate::Kind::NoProgress, "", detail.clone(),
                     "AI: assign work to idle dupes or replan".into(),
                     crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
                 );
                 self.per_dupe_idle.clear();
                 report.notes.push(format!("⏸ 个体持续空闲 → 冻结并上报 AI：{detail}"));
@@ -1764,7 +1838,9 @@ impl Agent {
             // A: 暂停期保留账本（hook 暂冻世界不清零，避免观测窗口错配）
             self.idle_streak = 0;
         }
-        if self.idle_streak >= 2 && !snap.paused && self.window_owned_by_us {
+        // ★ 去掉 window_owned_by_us 门槛：用户恢复的世界里全员空跑同样要上报，
+        //   否则"用户按空格开局后代理一直闲置"永远不触发 AI 规划（实测卡住感）。
+        if self.idle_streak >= 2 && !snap.paused {
             // Idle may mean "plan done" or "goals exist but nobody executes".
             // The fast system cannot judge which - freeze and escalate to AI.
             self.pause("all dupes idle → freeze for AI judgment");
@@ -1784,7 +1860,7 @@ impl Agent {
                 crate::escalate::Kind::NoProgress, "", detail.clone(),
                 "AI: add goals, unblock a node, or let the colony rest".into(),
                 crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
             );
             report.notes.push(format!("⏸ 全员空闲 → 冻结并上报 AI：{detail}"));
 
@@ -2033,6 +2109,19 @@ pub fn mark_node_done(plan_path: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// 结构化失败分类：把自由文本 detail 归为稳定类别，供慢系统诊断根因。
+    #[test]
+    fn classify_fail_maps_common_failure_modes() {
+        assert_eq!(super::classify_fail("语义目标在当前地图上找不到（oxygen）→ 换方案"), "no_target");
+        assert_eq!(super::classify_fail("✖ 造 Electrolyzer 缺建材（mod: missing）→ 先采建材"), "no_material");
+        assert_eq!(super::classify_fail("预检未通过，未执行: 材料不足"), "preflight");
+        assert_eq!(super::classify_fail("落地失败: ok: false"), "rejected");
+        assert_eq!(super::classify_fail("build 被研究锁（需要先研究）"), "research_locked");
+        assert_eq!(super::classify_fail("区域内找不到能放 的落点"), "no_placement");
+        assert_eq!(super::classify_fail("无法解析的 goal: xxx"), "bad_goal");
+        assert_eq!(super::classify_fail("某种全新错误"), "unknown");
+    }
+
     /// B 自救：清锁必须只删 surface/open_chamber，保留其它锁（防误伤）。
     #[test]
     fn strip_stuck_locks_keeps_other_goals() {

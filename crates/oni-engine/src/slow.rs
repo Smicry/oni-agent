@@ -152,6 +152,8 @@ pub struct SlowView {
     /// 对话流：用户指令 + 慢系统决策 + 执行结果（按时间）
     pub conversation: Vec<Value>,
     pub last_decision: String,
+    /// AI 助手是否启用（false = hold 停止状态）
+    pub ai_enabled: bool,
     pub updated_at: i64,
 }
 impl Default for SlowView {
@@ -160,7 +162,8 @@ impl Default for SlowView {
             mode: "mock".into(), cycle: 0, paused: true,
             food_kcal: 0.0, oxygen_kg: 0.0, breathable_cells: 0,
             dupes: vec![], escalations: vec![], commands: vec![],
-            recent_decisions: vec![], conversation: vec![], last_decision: String::new(), updated_at: 0,
+            recent_decisions: vec![], conversation: vec![], last_decision: String::new(),
+            ai_enabled: true, updated_at: 0,
         }
     }
 }
@@ -253,7 +256,7 @@ fn parse_decision(text: &str) -> Result<LlmDecision, String> {
     serde_json::from_str(js).map_err(|e| format!("parse failed: {} | {}", e, js))
 }
 
-fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool) -> LlmDecision {
+fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool, proactive: bool) -> LlmDecision {
     if has_command {
         LlmDecision { choice: "custom".into(), action: "command".into(),
             reason: "mock: 用户指令优先，已记录并恢复自主".into(),
@@ -262,6 +265,11 @@ fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool) -> LlmDe
         let c = if prompt.contains("食物") && prompt.contains("switch_goal") { "switch_goal" } else { "dig_access" };
         LlmDecision { choice: c.into(), action: "resolve".into(),
             reason: "mock: 选合理候选，验证闭环".into(), priority: "P1".into(), goal: String::new(), commands: vec![] }
+    } else if proactive {
+        // 主动规划模式：mock 也要产出一个可推进目标，不能 wait（那是失职）
+        LlmDecision { choice: "proactive".into(), action: "command".into(),
+            reason: "mock: 主动规划，依据战略进度推进自给".into(),
+            priority: "P2".into(), goal: "material".into(), commands: vec![] }
     } else {
         LlmDecision { choice: "none".into(), action: "wait".into(),
             reason: "mock: 无待处理事项".into(), priority: "P0".into(), goal: String::new(), commands: vec![] }
@@ -294,8 +302,38 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
 
 /// 失败熔断阈值：同一 goal 连续失败达到此次数 → 禁止再选，强制换策略。
 const FAIL_CIRCUIT_THRESHOLD: usize = 3;
-/// 熔断冷却：最近一次失败后多少秒内不再允许该 goal（超时后允许重试一次）。
+/// 熔断冷却：曾成功过的 goal，失败后多少秒内不再允许（超时后可重试）。
+/// ★ 从未成功过的 goal（total_ok==0）连续失败≥阈值 → 永久熔断，不靠冷却放行
+///   （实测 oxygen 0/8 却冷却到期后被反复重试，拖垮整局）。
 const FAIL_CIRCUIT_COOLDOWN_SECS: i64 = 1800;
+
+/// ★ 主动规划心跳周期（秒）：即使无 escalation/用户指令，慢系统也周期性唤起 LLM，
+/// 依据战略进度（plan.json）主动选下一个 goal 推进，而不是干等卡点。
+/// 60s = 12 轮慢系统循环（每轮 5s），够快又不会把 LLM 打爆。
+const PROACTIVE_PLAN_INTERVAL_SECS: i64 = 60;
+
+fn proactive_state_path() -> std::path::PathBuf {
+    save_dir().join("last_proactive.json")
+}
+
+/// 是否到了主动规划时刻（距上次 ≥ 周期）。文件不存在 = 立即规划。
+fn should_proactive() -> bool {
+    let now_ts = now();
+    match std::fs::read_to_string(proactive_state_path())
+        .ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("ts").and_then(|x| x.as_i64()))
+    {
+        Some(last) => now_ts - last >= PROACTIVE_PLAN_INTERVAL_SECS,
+        None => true,
+    }
+}
+
+fn mark_proactive() {
+    let sd = save_dir();
+    let _ = std::fs::create_dir_all(&sd);
+    let rec = serde_json::json!({"ts": now()});
+    let _ = std::fs::write(proactive_state_path(), serde_json::to_string(&rec).unwrap_or_default());
+}
 
 /// 单个 goal 的整局成败统计。
 #[derive(Debug, Clone)]
@@ -307,6 +345,8 @@ struct GoalStatus {
     total_ok: usize,
     last_fail_ts: i64,
     last_detail: String,
+    /// 最近一次失败的结构化原因（no_target/no_material/...）
+    last_fail_kind: String,
 }
 
 /// 纯函数：从 goal_outcomes 的 jsonl 行计算每个 goal 的状态。
@@ -323,11 +363,12 @@ fn compute_goal_status(lines: &[&str]) -> Vec<GoalStatus> {
         let ts = o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
         let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("")
             .chars().take(60).collect();
+        let fail_kind: String = o.get("fail_kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if !m.contains_key(&goal) {
             order.push(goal.clone());
             m.insert(goal.clone(), GoalStatus {
                 goal: goal.clone(), fails_since_success: 0, total_fail: 0, total_ok: 0,
-                last_fail_ts: 0, last_detail: String::new(),
+                last_fail_ts: 0, last_detail: String::new(), last_fail_kind: String::new(),
             });
         }
         let e = m.get_mut(&goal).unwrap();
@@ -339,6 +380,7 @@ fn compute_goal_status(lines: &[&str]) -> Vec<GoalStatus> {
             e.fails_since_success += 1;
             e.last_fail_ts = ts;
             e.last_detail = detail;
+            if !fail_kind.is_empty() { e.last_fail_kind = fail_kind; }
         }
     }
     order.into_iter().filter_map(|g| m.remove(&g)).collect()
@@ -353,10 +395,13 @@ fn goal_status_snapshot() -> Vec<GoalStatus> {
     compute_goal_status(&lines)
 }
 
-/// 该 goal 当前是否处于熔断状态（连续失败≥阈值 且 未过冷却）。
+/// 该 goal 当前是否处于熔断状态。
+/// 从未成功过 + 连续失败≥阈值 → 永久熔断（已证明此地图/配置下走不通，别再重试）；
+/// 曾成功过 + 连续失败≥阈值 → 冷却期内熔断，到期后可重试一次。
 fn is_circuit_broken(s: &GoalStatus, now_ts: i64) -> bool {
-    s.fails_since_success >= FAIL_CIRCUIT_THRESHOLD
-        && (now_ts - s.last_fail_ts) < FAIL_CIRCUIT_COOLDOWN_SECS
+    if s.fails_since_success < FAIL_CIRCUIT_THRESHOLD { return false; }
+    if s.total_ok == 0 { return true; } // 整局从未成功 → 永久禁止，直到有人改地图/代码
+    (now_ts - s.last_fail_ts) < FAIL_CIRCUIT_COOLDOWN_SECS
 }
 
 /// 读取最近的 ai_goal 决策及其执行回执，生成紧凑的"决策→结果"历史，
@@ -369,6 +414,7 @@ fn recent_decision_history() -> String {
     let mut seen = std::collections::HashSet::new();
     let mut window: Vec<String> = Vec::new();
     let mut stats: std::collections::HashMap<String, (u32,u32)> = std::collections::HashMap::new();
+    let mut fail_kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut all: Vec<&str> = text.lines().collect();
     all.reverse();
     for line in &all {
@@ -377,7 +423,11 @@ fn recent_decision_history() -> String {
         if goal.is_empty() { continue; }
         let ok = o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         let e = stats.entry(goal.clone()).or_insert((0,0));
-        if ok { e.1 += 1 } else { e.0 += 1 }
+        if ok { e.1 += 1 } else {
+            e.0 += 1;
+            let fk = o.get("fail_kind").and_then(|v| v.as_str()).unwrap_or("");
+            if !fk.is_empty() { fail_kinds.insert(goal.clone(), fk.to_string()); }
+        }
         if seen.insert(goal.clone()) && window.len() < 6 {
             let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(50).collect();
             let ts = o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -390,8 +440,10 @@ fn recent_decision_history() -> String {
     let mut out = String::from("\n== 整局记忆 ==\n");
     out.push_str("\n最近决策(滑动窗口6):\n");
     for i in window { out.push_str(&i); out.push('\n'); }
+    // ★ 教训带具体失败原因类型：让 LLM 知道「为什么失败」而非只看到次数。
     let mut lessons: Vec<String> = stats.iter().filter(|(_, (f, _))| *f >= 2)
-        .map(|(g, (f, sc))| format!("  - goal={} 失败{}次/成功{}次 → 换策略或解释为何坚持", g, f, sc)).collect();
+        .map(|(g, (f, sc))| format!("  - goal={} 失败{}次/成功{}次 原因={} → 诊断根因再换策略（别只换名字）",
+            g, f, sc, fail_kinds.get(g).map(|x| x.as_str()).unwrap_or("unknown"))).collect();
     lessons.sort();
     if !lessons.is_empty() {
         out.push_str("\n持久教训(整局统计):\n");
@@ -400,8 +452,119 @@ fn recent_decision_history() -> String {
     out.push_str("\n失败历史是开头「失败熔断」的硬依据：连续失败≥3次的目标本轮禁止再选。\n");
     out
 }
-fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
+/// ★ 幂等决策节流：检测最近连续 N 次决策都是同一个 goal。
+/// 慢系统以前会连续十几轮选 material/oxygen 却没实质推进（决策/执行比 17:1）。
+/// 这里把"连续重复"显式告警注入 prompt，逼迫 LLM 换策略或升级诊断。
+fn recent_goal_streak() -> (String, usize, String) {
+    let sd = save_dir();
+    let Ok(text) = std::fs::read_to_string(sd.join("decisions.jsonl")) else {
+        return (String::new(), 0, String::new());
+    };
+    let mut goals: Vec<String> = text.lines().rev().filter_map(|l| {
+        let d: Value = serde_json::from_str(l).ok()?;
+        let g = d.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if g.is_empty() { None } else { Some(g) }
+    }).take(20).collect();
+    goals.reverse(); // 恢复时间正序
+    let mut streak = 0usize;
+    if let Some(last) = goals.last() {
+        for g in goals.iter().rev() {
+            if g == last { streak += 1; } else { break; }
+        }
+    }
+    let recent: Vec<String> = goals.iter().rev().take(6).cloned().collect();
+    let summary = if recent.is_empty() { String::new() }
+        else { format!("最近决策 goal 序列(新→旧): {}\n", recent.join(" → ")) };
+    let current = goals.last().cloned().unwrap_or_default();
+    (summary, streak, current)
+}
+
+/// 纯函数：从 plan 节点里挑出"requires 全部 done"的下一个可推进节点名。
+/// 供 strategy_progress 使用，也便于单测（不依赖文件）。
+fn next_actionable_names(nodes: &[Value], done_ids: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for n in nodes {
+        let status = n.get("status").and_then(|v| v.as_str()).unwrap_or("todo");
+        if status == "done" { continue; }
+        let reqs: Vec<String> = n.get("requires").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        if reqs.iter().all(|r| done_ids.contains(r)) {
+            out.push(n.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string());
+        }
+    }
+    out
+}
+
+/// ★ 战略状态机：读 plan.json（AI 拥有的 locked plan），生成"我在哪、该往哪走"摘要。
+/// 慢系统以前完全不读 plan.json，只看当前快照 → 纯应激式决策，没有全局推进感。
+/// 现在每轮 prompt 开头注入战略进度，让 LLM 知道已完成里程碑与下一个可推进节点。
+fn strategy_progress() -> String {
+    let sd = save_dir();
+    let Ok(text) = std::fs::read_to_string(sd.join("plan.json")) else {
+        return String::new();
+    };
+    let Ok(plan) = serde_json::from_str::<Value>(&text) else { return String::new(); };
+    let Some(nodes) = plan.get("nodes").and_then(|v| v.as_array()) else { return String::new(); };
+
+    let mut done = Vec::new();
+    let mut todo = Vec::new();
+    let mut done_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for n in nodes {
+        let id = n.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = n.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let status = n.get("status").and_then(|v| v.as_str()).unwrap_or("todo");
+        if status == "done" {
+            done_ids.insert(id);
+            done.push(name.to_string());
+        } else {
+            todo.push(n.clone());
+        }
+    }
+    // 下一个可推进节点：requires 全部 done 的 todo 节点
+    let mut next = Vec::new();
+    for n in &todo {
+        let reqs: Vec<String> = n.get("requires").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        if reqs.iter().all(|r| done_ids.contains(r)) {
+            let name = n.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let succ = n.get("success").and_then(|v| v.as_str()).unwrap_or("");
+            let goal = n.get("actions").and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|x| x.get("goal").or_else(|| x.get("prefab")).and_then(|g| g.as_str()))
+                .unwrap_or("");
+            next.push(format!("  - {} [判据: {}][建议goal: {}]", name, succ, goal));
+        }
+    }
+
+    let mut out = String::from("== 🗺 战略进度（plan.json，AI拥有·locked）==\n");
+    out.push_str(&format!("已完成里程碑 {}/{}：{}\n", done.len(), nodes.len(),
+        if done.is_empty() { "无".into() } else { done.iter().take(6).cloned().collect::<Vec<_>>().join(" / ") }));
+    if next.is_empty() {
+        out.push_str("下一个可推进：无（依赖未满足或全部完成）→ 检查是否需要 AI 改 plan\n");
+    } else {
+        out.push_str("下一个可推进（requires 已满足）:\n");
+        for l in next.iter().take(4) { out.push_str(l); out.push('\n'); }
+    }
+    out.push_str("决策纪律：优先推进上述节点的 goal；除非出现 P0 先死因，否则不要跳到无关目标。\n\n");
+    out
+}
+
+fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -> String {
     let mut p = String::new();
+    if proactive {
+        p.push_str("== 🎯 主动规划模式（当前无卡点/无新指令）==\n");
+        p.push_str("没有紧急事件，这正是推进战略的最佳时机。请根据下面的战略进度，主动选择一个可推进的 goal（P2自给/P3扩张优先），让殖民地持续变好。\n");
+        p.push_str("不要输出 wait，不要空等卡点——那等于失职。若战略进度显示所有节点完成，选一个合理的扩张/自给目标（expand/research/power/element:X）。\n\n");
+    }
+    p.push_str(&strategy_progress());
+    let (streak_summary, streak, cur_goal) = recent_goal_streak();
+    if !streak_summary.is_empty() { p.push_str(&streak_summary); }
+    if streak >= 3 {
+        p.push_str(&format!("🔁 幂等节流：goal={} 已连续决策 {} 次却无实质进展 → 本轮禁止再选它，必须换目标/下精确工单/升级诊断。\n\n",
+            cur_goal, streak));
+    }
     // 🔴 失败熔断：最高优先级硬约束（见开头），逼迫换策略而非重复失败目标。
     let statuses = goal_status_snapshot();
     let now_ts = now();
@@ -411,8 +574,11 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
         p.push_str("== 🔴 失败熔断（硬性约束，非建议）==\n");
         p.push_str("以下 goal 连续失败≥3次且未过冷却，本轮严禁再选；重复选会被系统拒绝并记入对话：\n");
         for s in &broken {
-            p.push_str(&format!("  - {}: 连续失败{}次/成功{}次，最近原因「{}」\n",
-                s.goal, s.fails_since_success, s.total_ok, s.last_detail));
+            let permanent = if s.total_ok == 0 { "【从未成功·永久禁止】" } else { "" };
+            p.push_str(&format!("  - {}: 连续失败{}次/成功{}次{}，原因类型={}，最近「{}」\n",
+                s.goal, s.fails_since_success, s.total_ok, permanent,
+                if s.last_fail_kind.is_empty() { "unknown" } else { &s.last_fail_kind },
+                s.last_detail));
         }
         let working: Vec<&str> = statuses.iter()
             .filter(|s| s.total_ok > 0 && !is_circuit_broken(s, now_ts))
@@ -513,20 +679,8 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
     if goal.trim().is_empty() { return false; }
     // 只接受合法语义目标，防止 LLM 输出乱字符串
     if crate::autoact::parse_goal(goal).is_none() { return false; }
-    let sd = save_dir();
-    let ts = now();
-    let cmd = serde_json::json!({
-        "id": ts, "text": goal, "source": "ai_goal",
-        "ts": ts, "done": false, "result": reason,
-    });
-    use std::io::Write;
-    if let Some(d) = sd.parent() { let _ = std::fs::create_dir_all(d); }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-        .open(sd.join("commands.jsonl")) {
-        let _ = writeln!(f, "{}", cmd);
-        return true;
-    }
-    false
+    // ★ 写进独立 ai_goals.jsonl（不再混进 commands.jsonl 伪装成用户指令）
+    crate::commands::push_ai_goal(goal, reason) != 0
 }
 
 fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String {
@@ -553,7 +707,7 @@ fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String
             let _ = writeln!(f, "{}", rec);
         }
     } else if push_ai_goal(&dec.goal, &dec.reason) {
-        // B方案：语义目标写进 commands.jsonl，快系统用 autoact 翻译成工单执行。
+        // 语义目标写进独立 ai_goals.jsonl，快系统用 autoact 翻译成工单执行。
         log.push(format!("ai_goal[{}]:已入队(快系统执行)", dec.goal));
     }
     for c in &dec.commands {
@@ -644,6 +798,28 @@ fn build_conversation() -> Vec<Value> {
     }
 
     // 3) 快系统卡点（escalation history）—— 发现问题
+    //   ★ 执行结果从 bus 读（不改写 history）：
+    //     resolve 时慢系统的决策 note 写进了 bus 的 Escalated→Resolved 事件，
+    //     按 id 建索引，作为 fast 消息的 result 带进对话流。
+    //     这样 UI 能显示「卡点→结论」，慢系统下轮能读到自己上次怎么处理的（反馈闭环）。
+    let mut resolve_notes: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    if let Ok(bus_text) = std::fs::read_to_string(sd.join("bus/events.jsonl")) {
+        for line in bus_text.lines() {
+            if let Ok(ev) = serde_json::from_str::<Value>(line) {
+                // Escalated 类事件被 resolve 后 state=Resolved，note=决策结论
+                let is_escalated = ev.get("kind").and_then(|v| v.as_str()) == Some("Escalated");
+                let is_resolved = ev.get("state").and_then(|v| v.as_str()) == Some("Resolved");
+                if is_escalated && is_resolved {
+                    if let (Some(id), Some(note)) = (
+                        ev.get("id").and_then(|v| v.as_i64()),
+                        ev.get("note").and_then(|v| v.as_str()),
+                    ) {
+                        if !note.is_empty() { resolve_notes.insert(id, note.to_string()); }
+                    }
+                }
+            }
+        }
+    }
     if let Ok(text) = std::fs::read_to_string(sd.join("escalations/history.jsonl")) {
         let elines: Vec<&str> = text.lines().rev().take(10).collect();
         for line in elines.iter().rev() {
@@ -654,13 +830,16 @@ fn build_conversation() -> Vec<Value> {
             let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let detail: String = e.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(90).collect();
             let node = e.get("node").and_then(|v| v.as_str()).unwrap_or("");
-            let acked = e.get("acked").and_then(|v| v.as_bool()).unwrap_or(false);
-            let (status, label) = if acked { ("success", "已处理") } else { ("pending", "待处理") };
+            // ★ 有 resolve note = 慢系统已处理且有结论；否则待处理。
+            //   不再依赖 history.acked（append-only 日志不该被重写）。
+            let result = resolve_notes.get(&ts).cloned().unwrap_or_default();
+            let handled = !result.is_empty();
+            let (status, label) = if handled { ("success", "已处理") } else { ("pending", "待处理") };
             let text = if node.is_empty() { format!("[{}] {}", kind, detail) }
                 else { format!("[{}][{}] {}", kind, node, detail) };
             msgs.push(serde_json::json!({
                 "role": "fast", "text": text, "status": status, "status_label": label,
-                "result": "", "ts": ts,
+                "result": result, "ts": ts,
             }));
         }
     }
@@ -738,6 +917,8 @@ fn collect_state(cfg: &SlowConfig) -> SlowView {
     if let Ok(text) = std::fs::read_to_string(sd.join("commands.jsonl")) {
         for line in text.lines() {
             if let Ok(mut c) = serde_json::from_str::<Value>(line) {
+                // ★ 只读真用户指令：历史遗留的 ai_goal 不算"用户指令"
+                if c.get("source").and_then(|v| v.as_str()) != Some("user") { continue; }
                 if c.get("done").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
                 // text 里是 unicode 转义，解开给人看
                 if let Some(s) = c.get("text").and_then(|v| v.as_str()) {
@@ -759,6 +940,7 @@ fn collect_state(cfg: &SlowConfig) -> SlowView {
     view.recent_decisions = decs;
     view.conversation = build_conversation();
     view.mode = if cfg.is_mock() { "mock".into() } else { cfg.model.clone() };
+    view.ai_enabled = !crate::agent::hold_active();
     view.updated_at = now();
     view
 }
@@ -798,6 +980,8 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         if let Ok(text) = std::fs::read_to_string(sd.join("commands.jsonl")) {
             for line in text.lines() {
                 if let Ok(d) = serde_json::from_str::<Value>(line) {
+                    // ★ 只读真用户指令（ai_goal 已独立到 ai_goals.jsonl）
+                    if d.get("source").and_then(|v| v.as_str()) != Some("user") { continue; }
                     if !d.get("done").and_then(|v| v.as_bool()).unwrap_or(false) { c.push(d); }
                 }
             }
@@ -806,18 +990,66 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         (e.as_array().cloned().unwrap_or_default(), c, s)
     };
 
-    if escs.is_empty() && cmds.is_empty() {
-        return "idle".into();
+    // ★ 元决策（救不回来）：全员倒地/人口0 → 跳过 LLM，直接给出回滚建议。
+    //   快系统已识别并暂停不白烧；慢系统这里必须给出明确的"这局救不回来"信号，
+    //   而不是继续傻选 goal（实测全灭后还在决策"改用OxyRock供氧"）。
+    let alive = snap.get("dupes").and_then(|v| v.as_array()).map(|a| {
+        a.iter().filter(|d| {
+            let chore = d.get("chore").and_then(|v| v.as_str()).unwrap_or("");
+            !(chore.contains("失去行动") || chore.contains("倒地")
+              || chore.contains("Downing") || chore.contains("Unconscious")
+              || chore.contains("死亡"))
+        }).count()
+    }).unwrap_or(0);
+    let no_pop = snap.get("dupes").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+    if no_pop || alive == 0 {
+        let reason = if no_pop {
+            "☠️ 人口为0：殖民地已全员死亡，代理无法自救 → 停止决策，建议回滚存档或新开一局"
+        } else {
+            "☠️ 全员失去行动能力且无法自救（无人能执行工单）→ 停止决策，建议回滚存档或新开一局"
+        };
+        let sd = save_dir();
+        // 节流：终局是稳定状态，首次写完整记录 + bus 告警即可，后续轮次只更新 view，
+        // 避免每 5 秒刷一条 meta_give_up 污染 decisions.jsonl。
+        let already_logged = std::fs::read_to_string(sd.join("decisions.jsonl"))
+            .ok().and_then(|t| t.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.to_string()))
+            .map(|l| l.contains("meta_give_up")).unwrap_or(false);
+        if !already_logged {
+            let rec = serde_json::json!({
+                "id": now(), "ts": now(),
+                "cycle": snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
+                "source": "slow_service", "choice": "meta_give_up", "action": "rollback_advice",
+                "priority": "P0", "reason": reason, "goal": "", "commands": [],
+            });
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                .open(sd.join("decisions.jsonl")) {
+                let _ = writeln!(f, "{}", rec);
+            }
+            let _ = crate::bus::publish(
+                crate::bus::Kind::AuditFinding, crate::bus::Priority::Critical,
+                "meta", reason, serde_json::json!({"alive": alive, "no_pop": no_pop}), 7200,
+            );
+        }
+        let summary = format!("[meta][P0] ☠️ 终局判定：{}", reason);
+        if let Ok(mut v) = view.lock() { v.last_decision = summary.clone(); }
+        return summary;
     }
 
-    let prompt = build_prompt(&escs, &cmds, &snap);
+    // ★ 主动规划心跳：无事件时周期性唤起 LLM 推进战略，而非干等卡点。
+    let proactive = escs.is_empty() && cmds.is_empty();
+    if proactive && !should_proactive() {
+        return "idle".into();
+    }
+    if proactive { mark_proactive(); }
+
+    let prompt = build_prompt(&escs, &cmds, &snap, proactive);
     let decision = if cfg.is_mock() {
-        mock_decision(&prompt, !escs.is_empty(), !cmds.is_empty())
+        mock_decision(&prompt, !escs.is_empty(), !cmds.is_empty(), proactive)
     } else {
         match call_llm(cfg, SYSTEM_PROMPT, &prompt).and_then(|t| parse_decision(&t)) {
             Ok(d) => d,
             Err(e) => {
-                let d = mock_decision(&prompt, !escs.is_empty(), !cmds.is_empty());
+                let d = mock_decision(&prompt, !escs.is_empty(), !cmds.is_empty(), proactive);
                 let mut m = d;
                 m.reason = format!("LLM失败({})→降级mock: {}", e, m.reason);
                 m
@@ -907,6 +1139,18 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
                 let op = &p[9..]; // after "/api/ctl/"
                 let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
                 let out = match op {
+                    // ★ AI 总开关：
+                    //   stop = hold（持久停 agent+游戏）
+                    //   start = release（清 hold）+ window（授权 agent 恢复游戏并接管）
+                    //   只 release 不 window 的话：游戏暂停来源是原生/owner=none，
+                    //   快系统保守判「用户暂停」不越权恢复 → 点了启动却不动（实测 bug）。
+                    "stop" => run_oni(&["hold", "web 停止AI"]),
+                    "start" => {
+                        let r = run_oni(&["release"]);
+                        let w = run_oni(&["window", "120"]);
+                        format!("{} | {}", r, w)
+                    },
+                    // 兼容旧按钮（保留但 UI 不再暴露）
                     "pause" => run_oni(&["pause", "web 暂停"]),
                     "resume" => run_oni(&["resume", "web 继续"]),
                     "window" => run_oni(&["window", "120"]),
@@ -948,6 +1192,23 @@ pub fn run(cfg: SlowConfig, once: bool) {
 mod tests {
     use super::*;
 
+    /// 战略状态机：只挑 requires 全 done 的节点，跳过来满足依赖的。
+    #[test]
+    fn next_actionable_respects_dependencies() {
+        let nodes: Vec<Value> = vec![
+            serde_json::json!({"name":"A","status":"done","requires":[]}),
+            serde_json::json!({"name":"B","status":"todo","requires":["A"]}),
+            serde_json::json!({"name":"C","status":"todo","requires":["A","X"]}),
+            serde_json::json!({"name":"D","status":"todo","requires":[]}),
+        ];
+        let mut done = std::collections::HashSet::new();
+        done.insert("A".to_string());
+        let next = next_actionable_names(&nodes, &done);
+        assert!(next.contains(&"B".to_string()), "A done → B 应可推进");
+        assert!(!next.contains(&"C".to_string()), "X 未 done → C 不可推进");
+        assert!(next.contains(&"D".to_string()), "无依赖节点应可推进");
+    }
+
     #[test]
     fn circuit_breaker_counts_consecutive_failures_and_resets_on_success() {
         let lines = [
@@ -963,10 +1224,10 @@ mod tests {
         assert_eq!(o.fails_since_success, 4);
         assert_eq!(o.total_fail, 4); assert_eq!(o.total_ok, 0);
         assert_eq!(o.last_fail_ts, 104);
-        // 连续失败≥3 且最近失败在冷却内 → 熔断
+        // oxygen 从未成功(total_ok=0) + 连续失败4次 → 永久熔断（冷却过期也不放行）
         assert!(is_circuit_broken(o, 104 + 100));
-        // 冷却过期 → 允许重试
-        assert!(!is_circuit_broken(o, 104 + FAIL_CIRCUIT_COOLDOWN_SECS + 1));
+        assert!(is_circuit_broken(o, 104 + FAIL_CIRCUIT_COOLDOWN_SECS + 1),
+            "从未成功的 goal 应永久熔断，防止 oxygen 0/8 反复重试拖垮整局");
         // material 只有 1 次失败（且此前成功过）→ 不熔断
         let m = st.iter().find(|s| s.goal == "material").unwrap();
         assert_eq!(m.fails_since_success, 1);

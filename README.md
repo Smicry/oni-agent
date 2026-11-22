@@ -29,20 +29,39 @@ cargo build --release
 ./target/release/oni preflight build x,y Prefab
 ./target/release/oni probe x1,y1,x2,y2
 ./target/release/oni graph [--full]  # chamber graph + air budget + route to surface
-./target/release/oni agent --interval 10 --window 120
-./target/release/oni window 300      # request a construction window
-./target/release/oni hold "<reason>" / oni release
+./target/release/oni serve           # start BOTH systems + Web console (:8789)
+# ./target/release/oni agent --interval 10 --window 120   # fast loop only (legacy)
+./target/release/oni window 300      # request a construction window (agent resumes + takes over)
+./target/release/oni hold "<reason>" / oni release        # pause/resume for code changes
 ./target/release/oni escalations / bus timeline / status
 ```
+
+Open **http://localhost:8789/** for the control console. It has a single AI on/off switch
+(`stop` = hold: freeze world + agent stands down; `start` = release + open a work window so the
+agent resumes and takes over game speed) plus speed buttons (1x/2x/3x). Game pause/resume is
+fully delegated to the agent — no separate game-pause button.
 
 ## Two-speed architecture
 
 - **Fast system** (daemon, every 10s): sensing, danger detection, execution, safe degradation.
-- **Slow system** (the AI agent, on demand): strategy, replanning, exception handling, rule updates.
+- **Slow system** (LLM, every 5s): strategy, replanning, exception handling, rule updates.
 
-The fast system publishes escalations and a shared snapshot; the slow system writes `plan.json`
-and precise orders. No duplicate MCP collection: the daemon is the only sampler.
-See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](docs/dual-system.md).
+The fast system publishes escalations and a shared snapshot; the slow system writes semantic
+goals (`ai_goals.jsonl`) and precise orders. No duplicate MCP collection: the daemon is the only
+sampler. See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](docs/dual-system.md).
+
+The slow system is **not purely reactive**: besides escalations / user commands, a 60s
+*proactive-planning heartbeat* makes it re-read the strategic plan and push the next milestone even
+when nothing is wrong — so a safe, idle colony still progresses instead of stalling. It reads
+`plan.json` (AI-owned, `locked:true`) each cycle and injects a progress summary (done milestones +
+next actionable nodes) into the prompt. An endgame meta-decision detects a wiped colony (no living
+dupes) and stops burning LLM calls, advising a rollback instead.
+
+The handoff is **synchronous + throttled**: on a stuck point the fast system freezes the world and
+waits; a silence key of `kind|node|category` (category = semantic problem class) suppresses repeat
+reports of the same issue within 180s while letting a different problem or a real deterioration
+(oxygen/food −20%, breath −15, bladder +15) break through. A 300s watchdog downgrades a stalled
+handoff so the colony never freezes forever.
 
 ## Key mechanisms
 
@@ -52,6 +71,18 @@ See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](d
 - **Preflight before write**: every dig/build goes through preflight + dry-run + apply + re-read.
 - **Pause ownership**: pauses are explicit (`owner`, `reason`, `since`) and survive process restarts; resume is owner-checked.
 - **Decision record**: each slow-system decision is logged with rationale and expected outcome (see `decisions.jsonl`).
+- **Structured failure feedback**: every goal execution writes `goal_outcomes.jsonl` with a
+  `fail_kind` (`no_target`/`no_material`/`research_locked`/`preflight`/`rejected`/`no_placement`/`bad_goal`).
+  The LLM sees *why* a goal failed, not just a count, so it fixes the root cause instead of renaming goals.
+- **Permanent circuit breaker**: a goal that has never succeeded and fails ≥3 times is banned for
+  the whole save (time cooldowns used to let the same dead goal back in; `oxygen` 0/8 once dragged
+  the colony to death). An idempotency streak (`🔁` in the prompt) also forces a switch after 3
+  repeated decisions with no progress.
+- **Two isolated command channels**: `commands.jsonl` holds only real `source=user` instructions;
+  AI-set semantic goals live in `ai_goals.jsonl`. Mixing them made 63% of decisions claim a
+  "user instruction" that never existed — a self-reinforcing hallucination loop.
+- **Result-bearing chat history**: escalation cards in the conversation carry the slow system's
+  resolve note as `result`, so later decisions can see how a prior issue was handled (feedback loop).
 
 ## MCode integration (Hook + Skill)
 
