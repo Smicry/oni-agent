@@ -1505,19 +1505,29 @@ impl Agent {
             self.idle_streak = 0;
         }
         if self.idle_streak >= 2 && !snap.paused && self.window_owned_by_us {
-            self.pause("连续全员空闲 → 空跑，立即停机");
+            // Idle may mean "plan done" or "goals exist but nobody executes".
+            // The fast system cannot judge which - freeze and escalate to AI.
+            self.pause("all dupes idle → freeze for AI judgment");
             self.window_until = None;
             self.window_owned_by_us = false;
             self.idle_streak = 0;
-            self.idle_stopped = true;
-            report.notes.push("🔒 全员空闲（空跑）→ 已立即停机，避免浪费周期".into());
-            report.notes.push(format!(
-                "   [诊断] native_idle={:?} 本地idle={} paused={} streak={}",
-                snap.native_idle,
-                snap.truly_idle_count(),
-                snap.paused,
-                self.idle_streak
-            ));
+            self.escalation_hold = true;
+            self.escalation_since = Some(Instant::now());
+            let todo: Vec<&str> = plan.nodes.iter().filter(|n| n.status == "todo")
+                .map(|n| n.id.as_str()).collect();
+            let detail = if todo.is_empty() {
+                "All dupes idle, plan has no todo nodes: run complete or plan needs new goals?".to_string()
+            } else {
+                format!("All dupes idle but goals [{}] remain: unstuck or replan?", todo.join(", "))
+            };
+            let _ = crate::escalate::raise(
+                crate::escalate::Kind::NoProgress, "", detail.clone(),
+                "AI: add goals, unblock a node, or let the colony rest".into(),
+                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+            );
+            report.notes.push(format!("⏸ 全员空闲 → 冻结并上报 AI：{detail}"));
+
         }
 
         report
