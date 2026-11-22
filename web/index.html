@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>ONI 慢系统控制台</title>
 <style>
-body{font-family:-apple-system,sans-serif;background:#1a1d24;color:#d8dee9;margin:0;padding:16px;font-size:13px}
+body{font-family:-apple-system,sans-serif;background:#1a1d24;color:#d8dee9;margin:0;padding:16px;font-size:13px;max-width:1100px}
 h1{font-size:18px;color:#88c0d0;margin:0 0 4px}h2{font-size:14px;color:#81a1c1;border-bottom:1px solid #3b4252;padding-bottom:4px;margin-top:16px}
 .card{background:#2e3440;border-radius:6px;padding:10px;margin:8px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
@@ -12,15 +12,27 @@ h1{font-size:18px;color:#88c0d0;margin:0 0 4px}h2{font-size:14px;color:#81a1c1;b
 .cand:hover{background:#5e81ac}
 input,button{font-size:13px;padding:6px 10px;border-radius:4px;border:1px solid #4c566a;background:#3b4252;color:#d8dee9}
 button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
-button.danger{background:#bf616a}button.danger:hover{background:#d08770}
-button.on{background:#a3be8c;color:#2e3440}
-#cmd{width:60%}.small{color:#a3be8c;font-size:11px}
+#cmd{flex:1}.small{color:#a3be8c;font-size:11px}
 .ctrl{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.inputrow{display:flex;gap:6px;align-items:center}
+/* 对话流 */
+#conv{max-height:420px;overflow-y:auto;background:#2e3440;border-radius:6px;padding:10px;margin:8px 0}
+.msg{margin:8px 0;padding:8px 10px;border-radius:6px;line-height:1.5}
+.msg-user{background:#3b4252;border-left:3px solid #88c0d0}
+.msg-ai{background:#434c5e;border-left:3px solid #a3be8c}
+.msg .who{font-size:11px;color:#88c0d0;margin-bottom:3px}
+.msg-ai .who{color:#a3be8c}
+.msg .body{white-space:pre-wrap;word-break:break-word}
+.msg .result{margin-top:5px;font-size:11px;color:#ebcb8b;border-top:1px dashed #4c566a;padding-top:4px}
+.badge{font-size:10px;padding:1px 5px;border-radius:3px;margin-left:6px}
+.badge.success{background:#a3be8c;color:#2e3440}
+.badge.fail{background:#bf616a;color:#fff}
+.badge.pending{background:#ebcb8b;color:#2e3440}
 </style></head><body>
 <h1>ONI 慢系统控制台 <span id="mode" class="small"></span></h1>
 <div class="card ctrl" id="controls">
-  <button onclick="ctl('pause')" id="btnPause">暂停</button>
-  <button onclick="ctl('resume')" id="btnResume">继续</button>
+  <button onclick="ctl('pause')">暂停</button>
+  <button onclick="ctl('resume')">继续</button>
   <button onclick="ctl('speed',1)">1x</button>
   <button onclick="ctl('speed',2)">2x</button>
   <button onclick="ctl('speed',3)">3x</button>
@@ -30,15 +42,18 @@ button.on{background:#a3be8c;color:#2e3440}
 <div class="card"><div class="grid" id="stats"></div></div>
 <h2>复制人</h2><div class="card" id="dupes"></div>
 <h2>待决策卡点 <span class="small" id="esccount"></span></h2><div id="escs"></div>
-<h2>用户指令（输入后世界暂停，慢系统处理后恢复自主）</h2>
-<div class="card"><input id="cmd" placeholder="输入指令，如：优先采食物"><button onclick="sendCmd()">下发</button></div>
-<div id="cmds"></div>
-<h2>最近决策</h2><div class="card" id="decisions"></div>
+<h2>对话（用户指令 ↔ 慢系统决策 ↔ 执行结果）</h2>
+<div id="conv"></div>
+<div class="card inputrow">
+  <input id="cmd" placeholder="输入指令后回车发送（世界暂停→慢系统处理→恢复自主）" onkeydown="if(event.key==='Enter')sendCmd()">
+  <button onclick="sendCmd()">下发</button>
+</div>
 <script>
 function esc(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function time(ts){if(!ts)return'';var d=new Date(ts*1000);return d.toLocaleTimeString();}
 async function refresh(){
   var r=await fetch('/api/state'); if(!r.ok) return; var s=await r.json();
-  document.getElementById('mode').textContent='['+s.mode+'] '+new Date(s.updated_at*1000).toLocaleTimeString();
+  document.getElementById('mode').textContent='['+s.mode+'] '+time(s.updated_at);
   document.getElementById('worldState').textContent=s.paused?'世界:已暂停':'世界:运行中';
   document.getElementById('stats').innerHTML=
     '<div class="kv"><b>周期</b><br>'+s.cycle+'</div>'+
@@ -53,18 +68,24 @@ async function refresh(){
     var c=e.context||{}; var cands=(c.candidates||[]).map(function(x){
       return '<span class="cand" onclick="decide('+e.id+','+JSON.stringify(x.id)+')">'+esc(x.id)+': '+esc(x.action)+'</span>';}).join('');
     return '<div class="esc">#'+e.id+' '+esc(e.detail)+'<div class="small">卡点='+esc(c.obstacle||'-')+'</div>'+cands+'</div>';}).join('')||'<div class="small">无待决策卡点</div>';
-  document.getElementById('cmds').innerHTML=(s.commands||[]).map(function(c){
-    return '<div class="small">#'+c.id+' '+esc(c.text)+'</div>';}).join('')||'<div class="small">无待处理指令</div>';
-  document.getElementById('decisions').innerHTML='<div class="small">'+esc(s.last_decision)+'</div>'+
-    (s.recent_decisions||[]).slice(0,5).map(function(d){
-      return '<div class="small">['+esc(d.source||'慢系统')+'] '+esc(d.action||'')+': '+esc(d.reason||'')+'</div>';}).join('');
+  // 对话流
+  var conv=document.getElementById('conv');
+  conv.innerHTML=(s.conversation||[]).map(function(m){
+    var isUser=m.role==='user';
+    var badge=m.status?'<span class="badge '+m.status+'">'+(m.status==='success'?'完成':m.status==='fail'?'失败':'待处理')+'</span>':'';
+    var result=m.result?'<div class="result">→ '+esc(m.result)+'</div>':'';
+    return '<div class="msg '+(isUser?'msg-user':'msg-ai')+'">'+
+      '<div class="who">'+(isUser?'你':'慢系统')+' '+badge+' <span class="small">'+time(m.ts)+'</span></div>'+
+      '<div class="body">'+esc(m.text)+'</div>'+result+'</div>';
+  }).join('')||'<div class="small">暂无对话</div>';
+  conv.scrollTop=conv.scrollHeight;
 }
 async function ctl(op,val){
   var body=op==='speed'?JSON.stringify({speed:val}):'';
   await fetch('/api/ctl/'+op,{method:'POST',body:body}); refresh();
 }
-async function sendCmd(){var t=document.getElementById('cmd').value;if(!t)return;
-  await fetch('/api/command',{method:'POST',body:t});document.getElementById('cmd').value='';refresh();}
+async function sendCmd(){var el=document.getElementById('cmd');var t=el.value.trim();if(!t)return;
+  await fetch('/api/command',{method:'POST',body:t});el.value='';refresh();}
 async function decide(id,choice){await fetch('/api/decide',{method:'POST',body:JSON.stringify({id:id,choice:choice})});refresh();}
 refresh();setInterval(refresh,2000);
 </script></body></html>

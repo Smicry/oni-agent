@@ -149,6 +149,8 @@ pub struct SlowView {
     pub escalations: Vec<Value>,
     pub commands: Vec<Value>,
     pub recent_decisions: Vec<Value>,
+    /// 对话流：用户指令 + 慢系统决策 + 执行结果（按时间）
+    pub conversation: Vec<Value>,
     pub last_decision: String,
     pub updated_at: i64,
 }
@@ -158,7 +160,7 @@ impl Default for SlowView {
             mode: "mock".into(), cycle: 0, paused: true,
             food_kcal: 0.0, oxygen_kg: 0.0, breathable_cells: 0,
             dupes: vec![], escalations: vec![], commands: vec![],
-            recent_decisions: vec![], last_decision: String::new(), updated_at: 0,
+            recent_decisions: vec![], conversation: vec![], last_decision: String::new(), updated_at: 0,
         }
     }
 }
@@ -358,6 +360,28 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
                 c.get("text").unwrap_or(&Value::Null)));
         }
     }
+    // 检查最近一条用户指令完成状态：未完成/失败则提示 LLM 优先推动
+    {
+        let sd = save_dir();
+        if let Ok(text) = std::fs::read_to_string(sd.join("commands.jsonl")) {
+            let mut last_user: Option<Value> = None;
+            for line in text.lines() {
+                if let Ok(c) = serde_json::from_str::<Value>(line) {
+                    if c.get("source").and_then(|v| v.as_str()) == Some("user") { last_user = Some(c); }
+                }
+            }
+            if let Some(c) = last_user {
+                let done = c.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+                let result = c.get("result").and_then(|v| v.as_str()).unwrap_or("");
+                let cmd = decode_unicode_escapes(c.get("text").and_then(|v| v.as_str()).unwrap_or(""));
+                if !done {
+                    p.push_str(&format!("\n!! 上次用户指令「{}」未完成,优先推动它,别开新方向。\n", cmd));
+                } else if result.contains("失败") || result.contains("未成功") {
+                    p.push_str(&format!("\n!! 上次用户指令「{}」执行失败({})→换方案别重复。\n", cmd, result));
+                }
+            }
+        }
+    }
     if !escs.is_empty() {
         p.push_str("\n== 快系统卡点(含候选,选一个) ==\n");
         for e in escs {
@@ -463,6 +487,59 @@ fn save_dir() -> std::path::PathBuf {
     base
 }
 
+/// 组装对话流：用户指令 + 慢系统决策，按时间排序（最近30条）。
+/// 每条用户指令带完成状态（done? 成功/失败/待处理），慢系统决策带 goal 和 reason。
+fn build_conversation() -> Vec<Value> {
+    let sd = save_dir();
+    let mut msgs: Vec<Value> = Vec::new();
+    // 用户指令（source=user）
+    if let Ok(text) = std::fs::read_to_string(sd.join("commands.jsonl")) {
+        for line in text.lines() {
+            let Ok(c) = serde_json::from_str::<Value>(line) else { continue };
+            let source = c.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            if source != "user" { continue; } // ai_goal 不进对话流，避免噪音
+            let text = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let decoded = decode_unicode_escapes(text);
+            let done = c.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+            let result = c.get("result").and_then(|v| v.as_str()).unwrap_or("");
+            let status = if !done { "pending" }
+                else if result.contains("失败") || result.contains("未成功") { "fail" }
+                else { "success" };
+            msgs.push(serde_json::json!({
+                "role": "user", "text": decoded, "status": status,
+                "result": result, "ts": c.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
+            }));
+        }
+    }
+    // 慢系统决策
+    if let Ok(text) = std::fs::read_to_string(sd.join("decisions.jsonl")) {
+        let dlines: Vec<&str> = text.lines().rev().take(12).collect();
+        for line in dlines.iter().rev() {
+            let Ok(d) = serde_json::from_str::<Value>(line) else { continue };
+            if d.get("source").and_then(|v| v.as_str()) != Some("slow_service") { continue; }
+            let reason = d.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let goal = d.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+            let action = d.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            let priority = d.get("priority").and_then(|v| v.as_str()).unwrap_or("");
+            let text = if goal.is_empty() { format!("[{}] {}", priority, reason) }
+                else { format!("[{}] goal={} → {}", priority, goal, reason) };
+            msgs.push(serde_json::json!({
+                "role": "assistant", "text": text, "status": "",
+                "result": action, "ts": d.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
+            }));
+        }
+    }
+    msgs.sort_by_key(|m| m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0));
+    // 配额截断：保留最近15条 user + 最近15条 assistant，保证对话里用户指令不被淹没
+    let mut users: Vec<Value> = msgs.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user")).cloned().collect();
+    let mut ais: Vec<Value> = msgs.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("user")).cloned().collect();
+    if users.len() > 15 { users = users[users.len()-15..].to_vec(); }
+    if ais.len() > 15 { ais = ais[ais.len()-15..].to_vec(); }
+    let mut out = users; out.extend(ais);
+    out.sort_by_key(|m| m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0));
+    out
+}
+
 fn collect_state(cfg: &SlowConfig) -> SlowView {
     let mut view = SlowView::default();
     let sd = save_dir();
@@ -501,6 +578,7 @@ fn collect_state(cfg: &SlowConfig) -> SlowView {
         }
     }
     view.recent_decisions = decs;
+    view.conversation = build_conversation();
     view.mode = if cfg.is_mock() { "mock".into() } else { cfg.model.clone() };
     view.updated_at = now();
     view
