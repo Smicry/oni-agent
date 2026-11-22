@@ -596,11 +596,21 @@ pub fn find_build_site(
         .flat_map(|((x, y), _, _)| footprint(*x, *y, size.0, size.1))
         .collect();
     let cells = fetch_many(session, &probes);
+    // ★ 分级呼吸判据：
+    //   - 人要**长时间待**的（床 Bed / 发电机 Generator 等）→ 严格纯氧 is_safer_for_occupied；
+    //   - 人**短暂使用**的设施（旱厕 Outhouse / 洗手盆 / 医疗）→ 宽松 is_hazardous：
+    //     排除污染水/真空/污染氧/氯气/高浓度CO₂，但允许低浓度 CO₂（0.5~1.5kg 的普通气室）。
+    //   旧逻辑对所有建筑都用严格判据 → 开局氧气稀薄时厕所落点全被否 →
+    //   find_build_site 永远返回 None → 反复走 dig_space_for 挖同一格 → 厕所永远建不成。
+    let strict_occupancy = prefab_id.contains("Bed")
+        || prefab_id.contains("Generator") || prefab_id.contains("Electrolyzer");
     let safe = |a: (i32, i32)| -> bool {
         footprint(a.0, a.1, size.0, size.1)
             .iter()
             // None = 这一格**没读到** -> 保守排除（不能当安全）
-            .all(|c| cells.get(c).map(|cd| !cd.is_safer_for_occupied()).unwrap_or(false))
+            .all(|c| cells.get(c).map(|cd| {
+                if strict_occupancy { !cd.is_safer_for_occupied() } else { !cd.is_hazardous() }
+            }).unwrap_or(false))
     };
     // 区域搜索的候选也必须用**实时**数据复核"占格为空"，
     //   否则网格说空、实际有建筑（刚拆的口粮箱仍显示为 Building）→ 选到坏落点。

@@ -361,7 +361,13 @@ fn dig_space_for(
             }
         }
         solids.sort_by_key(|c| (c.1, c.0));
+        // ★ 用**实时 cell 数据**复核候选格：reach.grid 是缓存网格，可能认为某格还是 Solid，
+        //   但真实世界已经挖成气体（或已下挖掘工单）→ 旧逻辑反复对同一格下工单 → 厕所永远建不成。
+        let live = oni_world::cell::fetch_many(session, &solids);
         for cell in solids {
+            if live.get(&cell).map(|cd| cd.is_solid()).unwrap_or(true) == false {
+                continue; // 实时已是气体/液体，不再挖
+            }
             // 过统一挖掘预检（避人 / 死亡格 / 落脚点）→ 复用统一管线，不自己拼工单
             let pf = preflight_dig(session, &[cell], catalog);
             if !pf.ok || !pf.ready.contains(&cell) {
