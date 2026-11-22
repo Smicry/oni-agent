@@ -801,6 +801,31 @@ impl Agent {
         );
         report.notes.push(format!("📊 调度[{:?}]: {}", directive.level, directive.reason));
 
+        // Semantic decision → freeze + escalate, never act on it locally.
+        // The fast system only watches indicators; judgment belongs to the AI slow system.
+        if directive.needs_ai {
+            let first_time = !self.escalation_hold;
+            if first_time {
+                if observed_running {
+                    self.pause("semantic decision needed → freeze for AI");
+                }
+                self.escalation_hold = true;
+                self.escalation_since = Some(Instant::now());
+                self.window_until = None;
+                self.window_owned_by_us = false;
+                let _ = crate::escalate::raise(
+                    crate::escalate::Kind::StrategyMismatch,
+                    "",
+                    format!("AI decision required: {}", directive.reason),
+                    "Slow system: review situation and decide; world is frozen".into(),
+                    crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                );
+            }
+            report.notes.push("⏸ semantic decision escalated to AI; no local action".into());
+            return report;
+        }
+
         // 救援模式优先于保命模式：有人倒地时，先救倒下的，再谈产氧/换气。
         // 实时调度优先：Level>=2（紧急/救命）时，**抢占**静态计划。
         let picked_by_scheduler = if directive.level >= crate::priority::Level::Urgent {

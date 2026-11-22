@@ -344,3 +344,5 @@ focus 只在**非梯子**的前沿选格里生效；auto_ladder 分支按"哪一
 ### 62. 🔶 「全员空闲」误报：mod 的 workIdleCount 把挖掘中的复制人算成 idle —— 观察层应改用效果判据
       要对比「先水平挖到东侧开阔气室（X=140..156, 37 格, 55kg 氧气）」的成本与收益
 ### 58. 🔶 事件驱动重规划会用通用策略族**覆盖**人工计划 —— 要么保留人工计划的优先级，要么加显式锁定标记
+
+### 59. 🔶 preflight 漏检植物遮挡：preflight build 说通过，mod 落地报 obstructed（BasicSingleHarvestPlant 米虱木占 footprint）。preflight 需查 cell.buildings/植物，不能只看 solid/building。

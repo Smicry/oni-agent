@@ -43,6 +43,8 @@ pub struct Directive {
     /// ：缺氧时挖掘暴露地下 CO₂ 是负收益，会让氧气掉得更快。
     ///   为 true 时 agent 必须跳过换气/地表/挖矿类节点，只做产氧/救援/食物。
     pub forbid_expansion: bool,
+    /// Semantic decision needed: freeze + escalate to the AI slow system instead of acting.
+    pub needs_ai: bool,
 }
 
 /// 建议动作类别。
@@ -119,6 +121,7 @@ pub fn direct(
             ),
             action: Action::Rescue,
             forbid_expansion: false,
+            needs_ai: false,
         };
     }
 
@@ -132,6 +135,7 @@ pub fn direct(
                 ),
                 action: Action::Rescue,
                 forbid_expansion: false,
+                needs_ai: true,
             };
         }
     }
@@ -152,6 +156,7 @@ pub fn direct(
             ),
             action: Action::Ventilate,
             forbid_expansion: false,
+            needs_ai: true,
         };
     }
 
@@ -168,6 +173,7 @@ pub fn direct(
                 reason: "⏸ 氧气完全冻结 + 呼吸/胁迫异常 → 人可能已停止呼吸，立刻检查并救援".into(),
                 action: Action::Rescue,
                 forbid_expansion: false,
+                needs_ai: true,
             };
         }
     }
@@ -180,6 +186,7 @@ pub fn direct(
             reason: "⏸ 氧气几乎不再消耗但人还在 → 人可能已失去行动能力，立刻检查".into(),
             action: Action::Rescue,
             forbid_expansion: false,
+            needs_ai: true,
         };
     }
 
@@ -204,6 +211,7 @@ pub fn direct(
             ),
             action,
             forbid_expansion: action == Action::ProduceOxygen,
+            needs_ai: true,
         };
     }
 
@@ -225,6 +233,7 @@ pub fn direct(
         ),
         action: Action::BuildToilet,
         forbid_expansion: false,
+        needs_ai: true,
     };
     }
 
@@ -265,6 +274,7 @@ pub fn direct(
             ),
             action: Action::Rescue,
             forbid_expansion: false,
+            needs_ai: true,
         };
     }
 
@@ -284,6 +294,7 @@ pub fn direct(
             ),
             action: Action::ProduceOxygen,
             forbid_expansion: true,
+            needs_ai: true,
         };
     }
 
@@ -295,6 +306,7 @@ pub fn direct(
             reason: format!("🍞 食物仅够 {:.1} 周期 → 补给优先", food_cycles_left.unwrap()),
             action: Action::ForageFood,
             forbid_expansion: true,
+            needs_ai: true,
         };
     }
 
@@ -311,6 +323,7 @@ pub fn direct(
             ),
             action: Action::Ventilate,
             forbid_expansion: false,
+            needs_ai: true,
         };
     }
 
@@ -319,6 +332,7 @@ pub fn direct(
         reason: "✓ 无异常 → 按计划依赖图推进".into(),
         action: Action::FollowPlan,
         forbid_expansion: false,
+        needs_ai: false,
     }
 }
 
