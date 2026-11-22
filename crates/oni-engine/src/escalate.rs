@@ -18,6 +18,7 @@
 //!   旧行为是"保命节点失败就重置计数 → 下一轮再试"→ 无限重试、白烧周期；
 //!   现在失败到阈值就**升级上报并停手**，等慢系统改计划。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,37 @@ fn pending_path() -> PathBuf {
     dir().join("pending.json")
 }
 
+/// C: 放行冷静期 —— ack 后同一 kind+node 静默 N 个周期，防止误报无限重生。
+/// 为什么需要：needs_ai 的条件（如膀胱涨）在放行后依然存在，
+/// 下一轮 priority::direct() 又判 needs_ai=true → 又 raise 同一条 →
+/// escalation_hold 永远为 true → 世界反复冻结，其它看门全被压制。
+const SILENCE_CYCLES: i64 = 3;
+
+fn silence_path() -> PathBuf {
+    dir().join("silence.json")
+}
+
+/// silence key 用 Debug 名（稳定）+ node，避免依赖 label 文案。
+fn silence_key(kind: Kind, node: &str) -> String {
+    format!("{kind:?}|{node}")
+}
+
+/// 纯函数：当前 cycle 是否落在该 key 的静默期内。
+fn should_silence(silence: &HashMap<String, i64>, key: &str, cycle: i64) -> bool {
+    cycle < *silence.get(key).unwrap_or(&0)
+}
+
+fn read_silence() -> HashMap<String, i64> {
+    std::fs::read_to_string(silence_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<HashMap<String, i64>>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn write_silence(s: &HashMap<String, i64>) {
+    let _ = std::fs::write(silence_path(), serde_json::to_string_pretty(s).unwrap_or_default());
+}
+
 /// 历史归档（追加写）。
 fn history_path() -> PathBuf {
     dir().join("history.jsonl")
@@ -102,6 +134,10 @@ fn history_path() -> PathBuf {
 
 /// 写一条升级请求（同一 kind+node 的未处理请求会被替换，不刷屏）。
 pub fn raise(kind: Kind, node: &str, detail: String, suggestion: String, ctx: Ctx) -> u64 {
+    // C: 放行冷静期内不再重报（返回 0 = 跳过，调用方一律 let _ = 忽略）。
+    if should_silence(&read_silence(), &silence_key(kind, node), ctx.cycle) {
+        return 0;
+    }
     let id = next_id();
     let esc = Escalation {
         id,
@@ -170,27 +206,25 @@ pub fn read_pending() -> Vec<Escalation> {
 
 /// 标记某条为已处理（慢系统接手后调用）。
 pub fn ack(id: u64) -> bool {
-    let mut list = read_pending();
-    let mut hit = false;
-    for e in list.iter_mut() {
-        if e.id == id {
-            e.acked = true;
-            hit = true;
-        }
-    }
-    let _: Vec<Escalation> = list
-        .into_iter()
-        .filter(|e| !e.acked)
-        .collect();
-    let remaining: Vec<Escalation> = read_pending()
-        .into_iter()
-        .filter(|e| e.id != id)
-        .collect();
+    let list = read_pending();
+    let Some(target) = list.iter().find(|e| e.id == id) else {
+        return false;
+    };
+    // C: 写静默水位 —— 放行后 SILENCE_CYCLES 个周期内同一 kind+node 不再重报。
+    let key = silence_key(target.kind, &target.node);
+    let until = target.cycle + SILENCE_CYCLES;
+    let mut silence = read_silence();
+    // 取 max：多条同 key 放行时静默期不缩短。
+    let entry = silence.entry(key).or_insert(until);
+    *entry = (*entry).max(until);
+    write_silence(&silence);
+
+    let remaining: Vec<Escalation> = list.into_iter().filter(|e| e.id != id).collect();
     let _ = std::fs::write(
         pending_path(),
         serde_json::to_string_pretty(&remaining).unwrap_or_default(),
     );
-    hit
+    true
 }
 
 /// 清空待处理（慢系统接管全部）。
@@ -270,5 +304,21 @@ mod tests {
         assert_eq!(Kind::NodeFailing.label(), "节点反复失败");
         assert_eq!(Kind::Deadlock.label(), "依赖图死锁");
         assert_eq!(Kind::NoFeasibleTarget.label(), "找不到任何可行目标");
+    }
+
+    /// C: 放行冷静期 —— 只有同 kind+node 且在静默水位内才跳过。
+    #[test]
+    fn silence_is_scoped_and_expires() {
+        let mut s = HashMap::new();
+        s.insert(silence_key(Kind::StrategyMismatch, ""), 10);
+        s.insert(silence_key(Kind::NoProgress, ""), 10);
+        // 同 key 在静默期内 → 跳过
+        assert!(should_silence(&s, &silence_key(Kind::StrategyMismatch, ""), 9));
+        // 到期后 → 恢复上报
+        assert!(!should_silence(&s, &silence_key(Kind::StrategyMismatch, ""), 10));
+        // 不同 key 不受影响（工单积压看门不能被膀胱放行压制）
+        assert!(!should_silence(&s, &silence_key(Kind::NoProgress, "node_x"), 9));
+        // 空表 → 不静默
+        assert!(!should_silence(&HashMap::new(), &silence_key(Kind::StrategyMismatch, ""), 9));
     }
 }

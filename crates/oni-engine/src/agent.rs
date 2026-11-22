@@ -174,6 +174,16 @@ pub struct Agent {
     pub cycles: u64,
 }
 
+/// B: 从目标锁表里剔除最容易卡死的两类（surface / open_chamber）。
+/// 抽成纯函数以便单元测试：必须只删这两类，其它锁（食材/元素）一律保留。
+fn strip_stuck_locks(v: &mut Value) -> usize {
+    let Some(obj) = v.as_object_mut() else { return 0; };
+    let before = obj.len();
+    obj.remove("surface");
+    obj.remove("open_chamber");
+    before - obj.len()
+}
+
 impl Agent {
     /// **看门狗**：等慢系统超过这么多秒还没处理 → 降级解除冻结（避免殖民地饿死）。
     ///
@@ -233,6 +243,78 @@ impl Agent {
             .ok()
             .and_then(|v| v.get("isPaused").and_then(|b| b.as_bool()))
             .unwrap_or(false)
+    }
+
+    /// A: 工单积压 + 全员闲看门 —— 在**执行闸门之前**运行。
+    ///
+    /// 为什么要提前：hook 在每次用户消息时暂冻世界，旧代码在闸门之后才观测，
+    /// AI 思考期间世界被冻、账本被清 → 永远看不到"有活没人干"。
+    /// 账本只在世界真跑时累加，暂冻期保留；达阈值先做确定性自救（B），
+    /// 仍无解才冻结 + 上报 AI 慢系统。
+    fn watch_backlog_idle(&mut self, snap: &Snapshot, report: &mut CycleReport) {
+        let backlog = snap.pending_orders.unwrap_or(0) > 0;
+        let everyone_idle = !snap.dupes.is_empty()
+            && snap.truly_idle_count() == snap.dupes.len();
+        if backlog && everyone_idle {
+            // 暂停快照是**冻结的稳定状态**（世界没动），"全员闲+工单积压"
+            // 就是真实死锁信号 → 不需要多轮去抖，直接拉到阈值。
+            // 运行期间才需要 2 轮去抖，避免把"正走向工单"误判空闲。
+            if snap.paused {
+                self.idle_streak_unworked = self.idle_streak_unworked.max(2);
+            } else {
+                self.idle_streak_unworked += 1;
+            }
+        } else if !snap.paused {
+            self.idle_streak_unworked = 0;
+        }
+        if backlog && everyone_idle && self.idle_streak_unworked >= 2
+            && !self.escalation_hold
+        {
+            // B: 确定性自救 —— 卡住的目标锁（surface/open_chamber）先清掉换列，
+            //    只有换列也救不回来（第二次达阈值）才上报 AI。
+            let cleared = self.clear_stuck_goal_locks();
+            if cleared > 0 {
+                self.idle_streak_unworked = 0;
+                report.notes.push(format!(
+                    "[自救] 工单积压+全员闲 → 清除 {} 个卡住的目标锁，下一轮换列重算（不打扰 AI）",
+                    cleared
+                ));
+                return;
+            }
+            let detail = format!(
+                "{} work orders pending but all {} dupes idle — dead orders or unreachable target?",
+                snap.pending_orders.unwrap_or(0), snap.dupes.len());
+            // 世界本就被 hook 冻住时不要越权改 owner；只在运行时主动冻结。
+            if !snap.paused {
+                self.pause("work backlog + all idle → freeze for AI judgment");
+                self.window_until = None;
+                self.window_owned_by_us = false;
+            }
+            self.escalation_hold = true;
+            self.escalation_since = Some(Instant::now());
+            self.idle_streak_unworked = 0;
+            let _ = crate::escalate::raise(
+                crate::escalate::Kind::NoProgress, "", detail.clone(),
+                "AI: dead orders unreachable? dig access path / cancel / replan".into(),
+                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+            );
+            report.notes.push(format!("[上报AI] 工单积压+全员闲：{detail}"));
+        }
+    }
+
+    /// B: 清除卡住的目标锁，让 PLANNER 下一轮换列重算。
+    /// 工单积压 + 全员闲本身就是"当前锁定列走不通"的确定性证据；
+    /// 清掉后若恢复推进则无需上报，若仍卡住第二次达阈值才交 AI。
+    fn clear_stuck_goal_locks(&self) -> usize {
+        let path = oni_mcp::save::save_file("goal_lock.json");
+        let Ok(text) = std::fs::read_to_string(&path) else { return 0; };
+        let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return 0; };
+        let cleared = strip_stuck_locks(&mut v);
+        if cleared > 0 {
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        cleared
     }
 
     fn pause(&mut self, why: &str) {
@@ -625,6 +707,9 @@ impl Agent {
             }
         }
 
+        // A: 观测前移 —— 空闲看门在闸门之前跑，hook 暂冻世界时也能发现"有活没人干"。
+        self.watch_backlog_idle(&snap, &mut report);
+
         // =====================================================================
         // 3) 执行闸门：世界不跑 ⇒ 只观察
         //    （不下工单、不计进展、不熔断 ——  的直接止血点）
@@ -810,17 +895,13 @@ impl Agent {
 
         // Semantic decision → freeze + escalate, never act on it locally.
         // The fast system only watches indicators; judgment belongs to the AI slow system.
+        // C: 先 raise 再决定是否冻结 —— raise 返回 0 表示处于放行冷静期（同一误报
+        //    已被 ack），此时**不冻结、不占 escalation_hold**，否则一条误报会
+        //    无限重生、把世界反复冻住并压制其它看门。
         if directive.needs_ai {
             let first_time = !self.escalation_hold;
             if first_time {
-                if observed_running {
-                    self.pause("semantic decision needed → freeze for AI");
-                }
-                self.escalation_hold = true;
-                self.escalation_since = Some(Instant::now());
-                self.window_until = None;
-                self.window_owned_by_us = false;
-                let _ = crate::escalate::raise(
+                let esc_id = crate::escalate::raise(
                     crate::escalate::Kind::StrategyMismatch,
                     "",
                     format!("AI decision required: {}", directive.reason),
@@ -828,9 +909,26 @@ impl Agent {
                     crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
                         oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
                 );
+                if esc_id == 0 {
+                    // 放行冷静期内：当 Watch 处理，记日志继续自主运行，不打扰 AI。
+                    report.notes.push(
+                        "🔇 semantic 决策处于放行冷静期 → 不冻结、不重报（继续自主运行）".into(),
+                    );
+                } else {
+                    if observed_running {
+                        self.pause("semantic decision needed → freeze for AI");
+                    }
+                    self.escalation_hold = true;
+                    self.escalation_since = Some(Instant::now());
+                    self.window_until = None;
+                    self.window_owned_by_us = false;
+                    report.notes.push("⏸ semantic decision escalated to AI; no local action".into());
+                    return report;
+                }
+            } else {
+                report.notes.push("⏸ semantic decision escalated to AI; no local action".into());
+                return report;
             }
-            report.notes.push("⏸ semantic decision escalated to AI; no local action".into());
-            return report;
         }
 
         // 救援模式优先于保命模式：有人倒地时，先救倒下的，再谈产氧/换气。
@@ -1540,37 +1638,8 @@ impl Agent {
             }
         }
 
-        // ---- Work backlog + everyone idle: dead orders the fast system cannot fix ----
-        // Official pending orders may sit in the queue while nobody executes them
-        // (target unreachable, chore bug, or priority issue). This is a semantic
-        // judgment for the AI: reassign, cancel, or dig an access path.
-        let backlog = snap.pending_orders.unwrap_or(0) > 0;
-        let everyone_idle = !snap.dupes.is_empty()
-            && snap.truly_idle_count() == snap.dupes.len();
-        if backlog && everyone_idle && !snap.paused {
-            self.idle_streak_unworked += 1;
-        } else {
-            self.idle_streak_unworked = 0;
-        }
-        if backlog && everyone_idle && !snap.paused && self.idle_streak_unworked >= 2
-            && !self.escalation_hold
-        {
-            let detail = format!("{} work orders pending but all {} dupes idle for {} cycles: dead orders?",
-                snap.pending_orders.unwrap_or(0), snap.dupes.len(), self.idle_streak_unworked);
-            self.pause("work backlog + all idle → freeze for AI judgment");
-            self.window_until = None;
-            self.window_owned_by_us = false;
-            self.escalation_hold = true;
-            self.escalation_since = Some(Instant::now());
-            self.idle_streak_unworked = 0;
-            let _ = crate::escalate::raise(
-                crate::escalate::Kind::NoProgress, "", detail.clone(),
-                "AI: reassign / cancel dead orders / dig access path".into(),
-                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
-            );
-            report.notes.push(format!("⏸ 工单积压+全员空闲 → 冻结并上报 AI：{detail}"));
-        }
+        // 工单积压+全员闲看门已前移到执行闸门之前（watch_backlog_idle）：
+        // hook 暂冻世界期间也能观测，此处不再重复。
 
         // ---- 空跑即停：没有人干活就立刻冻回，不烧周期 ----
         // 空跑 = 没人干活 **且** 没有待办工单。
@@ -1588,7 +1657,8 @@ impl Agent {
         // 只有**游戏在跑**的时候才累计空跑轮数。
         if all_idle && !snap.paused {
             self.idle_streak += 1;
-        } else {
+        } else if !snap.paused {
+            // A: 暂停期保留账本（hook 暂冻世界不清零，避免观测窗口错配）
             self.idle_streak = 0;
         }
         if self.idle_streak >= 2 && !snap.paused && self.window_owned_by_us {
@@ -1860,6 +1930,23 @@ pub fn mark_node_done(plan_path: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// B 自救：清锁必须只删 surface/open_chamber，保留其它锁（防误伤）。
+    #[test]
+    fn strip_stuck_locks_keeps_other_goals() {
+        let mut v = serde_json::json!({
+            "surface": {"x": 137, "y": 197},
+            "open_chamber": {"x": 140, "y": 192},
+            "element:Algae": {"x": 120, "y": 200},
+            "food": {"x": 118, "y": 202}
+        });
+        assert_eq!(super::strip_stuck_locks(&mut v), 2);
+        assert!(v.get("surface").is_none());
+        assert!(v.get("open_chamber").is_none());
+        assert!(v.get("element:Algae").is_some(), "元素锁不能被误删");
+        assert!(v.get("food").is_some(), "食物锁不能被误删");
+        // 没有卡锁时返回 0
+        assert_eq!(super::strip_stuck_locks(&mut v), 0);
+    }
     use super::*;
 
     /// 空闲即冻结的判据：没有待办工单 **且** 没有施工中建筑 → 应该冻结。
