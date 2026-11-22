@@ -546,7 +546,15 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
                 json_response(&mut stream, "200 OK", &page, "text/html");
             }
             ("GET", "/api/state") => {
-                let v = view.lock().map(|g| serde_json::to_string(&*g).unwrap_or_default()).unwrap_or_default();
+                // 实时读快系统落盘的快照，不返回慢循环缓存的 view ——
+                // 旧实现在 LLM 推理(可能几十秒)期间 view 不刷新，页面看起来卡住。
+                // collect_state 只读文件(<1ms)，每次请求都拿最新真值。
+                // last_decision 是慢系统独有的，从缓存保留；其余字段全部实时。
+                let mut fresh = collect_state(cfg);
+                if let Ok(old) = view.lock() {
+                    fresh.last_decision = old.last_decision.clone();
+                }
+                let v = serde_json::to_string(&fresh).unwrap_or_default();
                 json_response(&mut stream, "200 OK", &v, "application/json");
             }
             ("POST", "/api/command") => {
