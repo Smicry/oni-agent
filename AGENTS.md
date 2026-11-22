@@ -35,6 +35,22 @@ cargo build --release
 - 建筑占格：`/active/buildings/index.md` + cell 文件，不用渲染字形；
 - 元素：看 cell 的 `phase=` / `solid=`，不看字形；`Carbon` 是煤炭。
 
+## 3.5 世界模型必须与游戏对齐（否则下的全是死工单）
+
+**判据：自造模型比游戏宽松 → 派工过去没人能执行 → 全员闲 + 工单积压 = 看起来"没进展"。**
+
+两条硬规则（2026-11-23 实测确证）：
+
+1. **可站性 = 可通行 ∧ 紧邻下一格实心**（不是"下方 N 格内有地板"）。
+   官方可达集（`/active/dupes/reachability.md` 的 samples）与该判据逐格吻合。
+   放宽后 → 悬空格被当成能站 → 挖掘预检给悬空岩层选落脚点 → 死工单。
+2. **建筑占格用实时 cell 的真实 anchor（anchorX/anchorY）**，不要用索引 Position 猜。
+   猜锚点会在气体格里造出"幻影建筑" → 幻影墙被当成地板 → 同样的死工单。
+   幻影格只做占位保护，**不能承重**。
+
+诊断手段：`oni cells x1,y1,x2,y2` 并排打出「模型判定」与「实时元素」；
+`oni reach` 打印模型可达集；两者不一致时**以游戏为准**。
+
 ## 4. 判定占格
 
 1. `/active/map/cell_X_Y.md` → `bottomLeft` + `footprint`
