@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "observe" => cmd_observe(&rest),
         "doctor" => cmd_doctor(),
         "preflight" => cmd_preflight(&rest),
+        "plan-check" => cmd_plan_check(&rest),
         "cells" => cmd_reach_cells(&rest),
         "plan" => cmd_plan(),
         "plan-reset" => cmd_plan_reset(),
@@ -87,6 +88,7 @@ const HELP: &str = r#"oni <子命令>
   observe            采全局面（多源并行），输出全局态势卡 + 账本 + 趋势
   doctor             连通性 / 建造目录 / 协议自检
   cells <x1,y1,x2,y2>            世界模型逐格诊断（可站/支撑/可达集 vs 实时元素）
+  plan-check                    依赖图体检：节点 status / 判据 / 假 done 清单
   preflight dig  <x1,y1,x2,y2>   挖掘预检：目标可挖? 有落脚点?
   preflight build <x,y> <Prefab>    建造预检：占格空? 支撑实心? 材料合法?
   plan               按依赖图选本轮唯一目标
@@ -1325,6 +1327,60 @@ fn cmd_reach_cells(args: &[String]) -> anyhow::Result<()> {
         "→ 自算可达集 {} 格 / 爬梯集 {} 格 / 官方集 {} 格",
         r.set.len(), r.climbable.len(), r.official.len()
     );
+    Ok(())
+}
+
+/// **依赖图体检**：列出每个节点的 status / 判据 / 判据当前是否成立。
+///
+/// 为什么要这个命令（实测本局教训）：
+///   计划里的 status=done 可以**未经任何判据校验**就存在。
+///   实测：E1「地表换气」done 但可达上界只有 194（判据要 216）、
+///   B1「床位」done 但 beds=0 → 依赖图以为这些都完成了
+///   → 再没有任何节点要求产氧 → 基地慢慢耗尽。
+/// 用法：oni plan-check
+///       oni plan-check             （只打印，不改）
+fn cmd_plan_check(args: &[String]) -> anyhow::Result<()> {
+    let path = "plan.json";
+    let fix = args.first().map(|s| s == "check").unwrap_or(false);
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("读不到 {path}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("计划格式错误: {e}"))?;
+    let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+    println!("{:<6} {:<9} {:<8} {:<7} {}", "id", "status", "stall", "判据", "说明");
+    let mut fake_done = Vec::new();
+    for n in &nodes {
+        let id = n.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+        let status = n.get("status").and_then(|s| s.as_str()).unwrap_or("todo");
+        let stall = n.get("stall").and_then(|s| s.as_u64()).unwrap_or(0);
+        let check = n.get("success_check").cloned().unwrap_or(serde_json::Value::Null);
+        let note = match check.as_object() {
+            Some(o) => o.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string(),
+            None => String::new(),
+        };
+        let mut flag = String::new();
+        if status == "done" {
+            // 静态体检：判据字段本身能否被机器判
+            let kind = check.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            if kind.is_empty() {
+                flag = "⚠ 无机器判据（done 无法复核）".into();
+            } else {
+                flag = "判据待运行时复核".into();
+            }
+        }
+        println!("{:<6} {:<9} {:<8} {:<7} {}", id, status, stall, note, flag);
+        if status == "done" {
+            fake_done.push(id.to_string());
+        }
+    }
+    println!("→ 共 {} 个节点，其中 done {} 个", nodes.len(), fake_done.len());
+    if !fake_done.is_empty() {
+        println!("  done 节点：{}（done 必须有证据：运行时每轮复核，不成立就打回 todo）", fake_done.join(", "));
+    }
+    if fix {
+        println!();
+        println!("（体检命令不联网复核判据；真实复核由快系统每轮自动执行）");
+    }
     Ok(())
 }
 
