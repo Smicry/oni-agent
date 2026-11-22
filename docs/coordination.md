@@ -217,3 +217,64 @@ ONI 暂停会冻结倒计时 => 暂停期间人不耗氧、不受毒气伤害 =>
 * **去抖**：同一 kind 连续命中 **2 轮**才升级（瞬时状态不升级、不冻结）。
 * **常态差事不当危险**：「在 CO₂ 格子里」是 ONI 常态（睡觉/擦洗/找安全区/恢复呼吸）
   → 排除这些差事 + 阈值从 95 收紧到 60。
+
+
+---
+
+## 12. 独立慢系统服务（oni slow）—— 从 MCode 会话到常驻服务
+
+### 12.1 动机
+
+前面各节的慢系统默认是主 agent（MCode 会话）：用户发消息 → Hook 暂停 → AI 读状态决策。
+两个结构性缺陷：
+1. 被动：没有用户消息就不介入；cron 唤醒是分钟级、且状态难延续。
+2. 不可观测：决策在会话里，没有常驻界面看"快系统报了什么、慢系统选了什么"。
+
+oni slow 把慢系统做成独立常驻服务 + Web 页面，补齐这两点。
+
+### 12.2 架构（沿用文件总线，不引入新进程间协议）
+
+    快系统 oni agent (10s) --写--> escalations/pending.json (带结构化候选)
+                                    live_snapshot.json / decisions.jsonl
+                                            |
+    慢系统 oni slow (5s)  --读--------------+
+        +- 有 escalation -> 组装 prompt(诊断+候选+态势) -> LLM 选候选 -> resolve + 留痕
+        +- 有用户指令   -> LLM 决策 -> 执行 + command done 回执 + 恢复自主(window)
+        +- 写 SlowView -> 供 Web 页面轮询
+                                            |
+    Web 页面 :8789 --轮询--> /api/state
+                    输入框 -> /api/command (复用 oni command add 的入队+暂停)
+                    候选按钮 -> /api/decide (resolve)
+
+### 12.3 用户输入框 = 已有的 command 通道
+
+"输入后暂停 -> 慢系统完成决策 -> 继续自主"不需要新机制：
+oni command add 已经实现"入队 + 立刻暂停"。慢系统处理完：
+- oni command done <id> <回执> 标记完成
+- oni window 90 恢复自主施工窗口
+
+### 12.4 LLM 可插拔（OpenAI-compatible）
+
+| 环境变量 | 含义 |
+|---|---|
+| ONI_LLM_ENDPOINT | chat/completions 完整 URL（HTTPS 已支持） |
+| ONI_LLM_KEY | bearer token |
+| ONI_LLM_MODEL | 模型名，默认 gpt-4o-mini |
+
+未配置 -> mock 规则模式：用"先死因优先"固定规则选候选，验证闭环、不调真实 LLM。
+LLM 调用失败 -> 自动降级 mock，原因写进决策 reason。
+
+### 12.5 使用
+
+    oni slow --once                 # 跑一轮决策就退出（验证用）
+    oni slow --port=8789            # 常驻服务 + Web 页面
+    oni slow --interval=5 --port=8789
+
+浏览器打开 http://localhost:8789/ ：实时局面卡、复制人状态、待决策卡点（候选按钮）、
+用户指令输入框、最近决策。页面每 2 秒轮询 /api/state。
+
+### 12.6 状态与边界
+
+- 慢系统服务不在快系统关键路径上：它挂了，快系统靠看门狗 300s 降级继续（见 §5）。
+- mock 模式只验证闭环，不做真实决策；生产必须配 ONI_LLM_*。
+- LLM 输出严格 JSON：choice/action/reason/commands；解析失败降级 mock。

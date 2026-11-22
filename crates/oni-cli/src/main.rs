@@ -59,6 +59,7 @@ fn main() -> ExitCode {
         "raw" => cmd_raw(&rest),
         "call" => cmd_call(&rest),
         "agent" => cmd_agent(&rest),
+        "slow" => cmd_slow(&rest),
         "window" => cmd_window(&rest),
         "hold" => cmd_hold(&rest),
         "release" => cmd_release(),
@@ -840,6 +841,23 @@ fn cmd_release() -> anyhow::Result<()> {
     oni_engine::agent::clear_hold();
     oni_engine::control::resume(oni_engine::control::Owner::Hold);
     println!("✅ hold 已解除：代理恢复自主循环（需要时用 `oni window <秒>` 开施工窗口）");
+    Ok(())
+}
+
+/// 慢系统服务：常驻轮询 escalation/用户指令 → LLM 决策 → 执行 + Web 页面。
+fn cmd_slow(args: &[String]) -> anyhow::Result<()> {
+    let once = args.iter().any(|a| a == "--once");
+    let mut cfg = oni_engine::slow::SlowConfig::default();
+    for a in args {
+        if let Some(v) = a.strip_prefix("--port=") {
+            cfg.web_port = v.parse().map_err(|_| anyhow::anyhow!("bad port"))?;
+        }
+        if let Some(v) = a.strip_prefix("--interval=") {
+            cfg.interval_secs = v.parse().map_err(|_| anyhow::anyhow!("bad interval"))?;
+        }
+    }
+    let _ = current_save();
+    oni_engine::slow::run(cfg, once);
     Ok(())
 }
 

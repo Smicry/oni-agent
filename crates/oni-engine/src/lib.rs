@@ -31,6 +31,7 @@ pub mod saveswitch;
 pub mod ledger;
 pub mod mapedit;
 pub mod sense;
+pub mod slow;
 pub mod stuck;
 pub mod trend;
 

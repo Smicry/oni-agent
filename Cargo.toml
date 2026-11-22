@@ -12,7 +12,7 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-ureq = { version = "2.10", default-features = false }   # 只需明文 HTTP（127.0.0.1）
+ureq = { version = "2.10", features = ["tls", "json"] }   # LLM 需 HTTPS+JSON；MCP 本地明文兼容
 rayon = "1.10"
 
 [profile.release]
