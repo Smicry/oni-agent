@@ -1498,50 +1498,100 @@ pub fn verify_moves(session: &McpSession) -> Vec<String> {
 }
 
 pub fn rescue_dupes(session: &McpSession, dupes: &[crate::sense::Dupe]) -> Vec<String> {
-    // 候选落脚点：基地里已建成、有唯一名字的建筑（mod 只能按名字寻址）
-    // 目标顺序按"落点更可能有氧气"排：研究站在高处的新区，
-    //   扩散器在产氧点旁；基地低层是 CO₂ 聚集区，最后才选。
-    // 修正：
-    //   旧顺序把**基地低层**排在前面
-    //   → 倒地的复制人被「救」进 CO₂ 区 → 呼吸归零 → 死亡（救援反而成了杀手）。
-    //   正解：**高处/富氧区的建筑优先**；低层建筑排到最后（宁可不动，也别送进毒气）。
-    let targets = [
-        "研究站",
-        "氧气扩散器",
-        "人力发电机",
-        "煤炭发电机",
-        "电解器",
-        "藻类箱",
-        "医疗床",
-        "床铺",
-        "打印舱",
-        "户外厕所",
-        "口粮箱",
-    ];
+    // 候选落点：**局内所有已建成建筑**，按「它附近有没有富氧格」排序。
+    //
+    // 为什么不再用硬编码名单（旧名单：研究站/发电机/电解器/…）：
+    //   1) 开局这些建筑常常一个都不存在 → 救援静默失败，代理看着人死；
+    //   2) 旧判据只看**锚点那一格**是不是富氧 → 基地被 CO₂ 污染后
+    //      每个候选都被否掉 → **一次救援令都发不出去**（实测三人全部倒地）。
+    // 现在：列出全部建筑，用「锚点 + 邻域」里最富氧的那一格打分，
+    //   选最好的几个当落点；一个都没有就**如实报告**（失败要可见）。
+    let mut cands: Vec<(String, i32, i32)> = Vec::new();
+    if let Ok(text) = session.call_text(
+        "world_editor",
+        serde_json::json!({
+            "command": "read", "path": "/active/buildings/index.md",
+            "confirm": true, "task": "代理救援: 查可用落点建筑"
+        }),
+    ) {
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+            if cols.len() < 5 {
+                continue;
+            }
+            let (name, prefab) = (cols[1], cols[2]);
+            if name.is_empty() || prefab.is_empty() {
+                continue;
+            }
+            let Some((xs, ys)) = cols[4].trim_start_matches('(').split_once(',') else {
+                continue;
+            };
+            let (Ok(x), Ok(y)) =
+                (xs.trim().parse::<i32>(), ys.trim().trim_end_matches(')').parse::<i32>()) else {
+                    continue;
+                };
+            if !cands.iter().any(|c| c.0 == name) {
+                cands.push((name.to_string(), x, y));
+            }
+        }
+    }
+    if cands.is_empty() {
+        return vec!["⛑ 救援失败：局内没有任何已建成建筑可作落点（先建一张床/一个富氧建筑再来）".into()];
+    }
+    // 打分：锚点 + 8 邻域里最"富氧"的那一格（2=富氧, 1=可忍受, 0=有毒）
+    let mut probe: Vec<(i32, i32)> = Vec::new();
+    for (_, x, y) in &cands {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                probe.push((x + dx, y + dy));
+            }
+        }
+    }
+    let cells = oni_world::cell::fetch_many(session, &probe);
+    let mut scored: Vec<(String, f64)> = cands
+        .iter()
+        .map(|(n, x, y)| {
+            let mut best = 0.0f64;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(cd) = cells.get(&(x + dx, y + dy)) {
+                        let s = if cd.is_safer_for_occupied() {
+                            2.0
+                        } else if cd.is_hazardous() {
+                            0.0
+                        } else {
+                            1.0
+                        };
+                        best = best.max(s);
+                    }
+                }
+            }
+            (n.clone(), best)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 只要富氧落点（>=2）。宁可没有，也不要把人送进毒气（旧事故：救援成了杀手）。
+    let targets: Vec<String> = scored
+        .iter()
+        .filter(|(_, s)| *s >= 2.0)
+        .take(4)
+        .map(|(n, _)| n.clone())
+        .collect();
+    if targets.is_empty() {
+        return vec![format!(
+            "⛑ 救援受阻：{} 座建筑附近**没有富氧格** → 发不出救援令；需要先挖出富氧区或产氧",
+            cands.len()
+        )];
+    }
     let mut moved = Vec::new();
     for d in dupes {
-        // （）：不能只救"倒地" ——
-        //   卡塔莉娜当时状态是**为建造挖掘**（没倒地），但人在污染水层里干活，
-        //   呼吸一路归零 → 死亡。旧规则直接 continue → 代理看着她死。
-        //   现在：倒地 **或**都要救。
+        // 不能只救"倒地" —— 卡塔莉娜当时状态是**为建造挖掘**（没倒地），
+        //   但人在污染水层里干活，呼吸一路归零 → 死亡。旧规则直接 continue → 代理看着她死。
         if !dupe_needs_rescue(d) {
             continue;
         }
-        // 移动前先记位置（供下一轮复核「是否真的挪动了」）
         let from_pos = dupe_position_now(session, &d.name);
-        for t in targets {
-            // 落点必须是**富氧格**：先查建筑位置，再看该格是否氧气主导。
-            // 旧逻辑只看"建筑存在就移"→ 把窒息的人从氧气梯子列送进 CO₂ 坑的藻类箱
-            // （2026-11-22 裴/麦克斯呼吸反复掉到16就是这么来的）。读不到气体 → 保守跳过。
-            if let Some((bx, by)) = find_building_pos(session, t) {
-                let cells = oni_world::cell::fetch_many(session, &[(bx, by)]);
-                let safe = cells.get(&(bx, by)).map(|c| c.is_safer_for_occupied()).unwrap_or(false);
-                if !safe {
-                    continue; // 该建筑在 CO₂/污染区 → 不把人往毒气里送
-                }
-            } else {
-                continue; // 建筑不存在 → 跳过（旧逻辑靠 mod 报错来筛，这里提前筛）
-            }
+        for t in &targets {
             let line = format!("移 人@{} -> {} confirm=true", d.name, t);
             let res = session.call_text(
                 "world_editor",
@@ -1556,12 +1606,12 @@ pub fn rescue_dupes(session: &McpSession, dupes: &[crate::sense::Dupe]) -> Vec<S
                     "task": format!("代理救援: 把 {} 移到 {}", d.name, t)
                 }),
             );
-            let ok = res.as_deref().map(|s| s.contains("\"ok\": true") || s.contains("ok: true")).unwrap_or(false);
+            let ok = res
+                .as_deref()
+                .map(|s| s.contains("\"ok\": true") || s.contains("ok: true"))
+                .unwrap_or(false);
             if ok {
                 // mod 返回 ok 只代表**工单已下达**，不代表人真的到了。
-                //   倒地的复制人无法自己寻路 → 移动工单永远不会被执行
-                //   旧日志写「已挪动」是**谎报**，会让人以为救到了而不去建床/清毒气。
-                //   正解：只说「已下令」，并点明倒地的需要一张床（ONI 的抬人 chore）。
                 note_move_attempt(&d.name, from_pos, t);
                 moved.push(format!(
                     "{} → {}（已下令）{}",
