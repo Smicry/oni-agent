@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "ONI: 用户新消息时暂停游戏",
+            "command": "sh -c 'for p in \"${MINIMAX_HOOKS_DIR:-}\" \"$PWD/.minimax\"; do [ -n \"$p\" ] && [ -f \"$p/scripts/pause-on-prompt.mjs\" ] && exec node \"$p/scripts/pause-on-prompt.mjs\"; done; exit 0'",
+            "commandWindows": "node \"${MINIMAX_HOOKS_DIR}\\scripts\\pause-on-prompt.mjs\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

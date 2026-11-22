@@ -43,8 +43,17 @@ cargo build --release
 - 暂停所有权显式记录，跨进程重启保留。
 - 慢系统决策写入 `decisions.jsonl`（依据 + 预期效果 + 下轮回填）。
 
-## 文档
+## MCode 接入（Hook + Skill）
 
+仓库附带项目级 Hook 与 Skill（用于 MCode）：
+
+- `.minimax/hooks.json`：用户新消息时自动 `oni pause` 冻结世界
+- `.minimax/scripts/pause-on-prompt.mjs`：静默执行，失败不阻塞对话
+- `.minimax/skills/oni-colony-ops/SKILL.md`：殖民地接管流程（冻结→观察→重规划→执行→验证）
+
+Hook 需在 MCode 设置 → 钩子 → 项目 里开启；只对本仓库生效。
+
+## 文档
 - [`AGENTS.md`](AGENTS.md) — agent 工程规则
 - [`docs/knowledge-base.md`](docs/knowledge-base.md) — 带出处的游戏机制
 - [`design/graph-model.md`](design/graph-model.md) — 气室图设计

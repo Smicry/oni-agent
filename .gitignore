@@ -21,6 +21,5 @@
 /.cargo/config.toml
 
 # ── 编辑器 / 工具状态 ─────────────────────────
-/.minimax/
 .DS_Store
 *.swp

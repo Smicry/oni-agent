@@ -53,8 +53,22 @@ See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](d
 - **Pause ownership**: pauses are explicit (`owner`, `reason`, `since`) and survive process restarts; resume is owner-checked.
 - **Decision record**: each slow-system decision is logged with rationale and expected outcome (see `decisions.jsonl`).
 
-## Docs
+## MCode integration (Hook + Skill)
 
+This repo ships a project-level Hook and Skill for [MCode](https://www.minimax.io/):
+
+```
+.minimax/
+├── hooks.json                       # UserPromptSubmit → oni pause (freeze world on new message)
+├── scripts/pause-on-prompt.mjs      # silent, fail-open; path resolved relative to the script
+├── scripts/session-id.sh            # stable per-save key from initial save hash
+└── skills/oni-colony-ops/SKILL.md   # colony takeover loop: freeze→observe→replan→execute→verify
+```
+
+The Hook is project-scoped and inactive until enabled in MCode → Settings → Hooks → Project.
+It only affects this repository and never blocks the conversation.
+
+## Docs
 - [`AGENTS.md`](AGENTS.md) — engineering rules for agents working in this repo
 - [`docs/knowledge-base.md`](docs/knowledge-base.md) — sourced ONI mechanics
 - [`docs/coordination.md`](docs/coordination.md) — fast/slow system coordination
