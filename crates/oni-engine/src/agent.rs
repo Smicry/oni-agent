@@ -26,9 +26,6 @@ pub struct AgentConfig {
     pub plan_path: String,
     /// 紧急暂停后的冷却秒数（冷却期内只记录，不重复暂停）
     pub pause_cooldown: u64,
-    /// 已废弃：仅保留兼容 CLI 参数，不再参与逻辑。
-    /// 现在唯一的"用户停止"信号是 hold（AI 总开关），其余暂停代理一律自主恢复。
-    pub auto_resume_manual: bool,
     /// 「施工窗口」秒数：只有在这个窗口里游戏才跑；窗口结束立刻冻回去
     pub work_window_secs: u64,
     /// 单轮最多执行几个目标
@@ -41,7 +38,6 @@ impl Default for AgentConfig {
             interval_secs: 10,
             plan_path: "plan.json".into(),
             pause_cooldown: 600,
-            auto_resume_manual: false,
             work_window_secs: 90,
             max_actions_per_cycle: 1,
         }
@@ -115,8 +111,6 @@ pub struct Agent {
     last_danger: String,
     /// 当前施工窗口的截止时间（None = 不在窗口内，游戏应保持暂停）
     window_until: Option<Instant>,
-    /// 用户手动暂停（已废弃：恒为 false；唯一停止信号是 hold，见 hold_active()）
-    user_paused: bool,
     /// 当前这一段运行是代理自己开的施工窗口（到期由代理冻回）
     window_owned_by_us: bool,
     /// 连续全员空闲的轮数
@@ -149,7 +143,6 @@ pub struct Agent {
     /// **因「等慢系统」而冻结世界**（有 pending escalation / 待处理用户指令）。
     ///
     /// 与其它暂停标志严格区分：
-    ///   - user_paused   = 已废弃（恒 false）；唯一停止信号是 hold；
     ///   - frozen        = 施工窗口正常到期 → 可自持续窗；
     ///   - idle_stopped  = 空跑停机 → 不得自动恢复；
     ///   - escalation_hold = 等慢系统 → 只能由慢系统 ack 或看门狗解除。
@@ -214,7 +207,6 @@ impl Agent {
             pause_until: Instant::now(),
             last_danger: String::new(),
             window_until: None,
-            user_paused: false,
             window_owned_by_us: false,
             idle_streak: 0,
             per_dupe_idle: std::collections::HashMap::new(),
@@ -627,7 +619,6 @@ impl Agent {
             self.danger_cycle = false;
             self.frozen = false;
             self.idle_stopped = false;
-            self.user_paused = false;
             self.paused_by_us = false;
             can_execute = true;
             if self.window_owned_by_us {
@@ -694,7 +685,6 @@ impl Agent {
             if work_pending { self.rhythm_streak = 0; }
             let rhythm_due = self.auto_rhythm
                 && self.frozen
-                && !self.user_paused
                 && !self.idle_stopped
                 && (work_pending || self.rhythm_streak < RHYTHM_MAX)
                 && self
@@ -740,8 +730,7 @@ impl Agent {
                 self.frozen = false;
                 self.auto_rhythm = false;
                 self.idle_stopped = false;
-                self.user_paused = false;
-                self.rhythm_streak = 0;
+                    self.rhythm_streak = 0;
                 self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
                 self.window_owned_by_us = true;
                 let _ = self.session.call_text(
@@ -766,8 +755,7 @@ impl Agent {
                 self.window_until = Some(Instant::now() + Duration::from_secs(secs));
                 self.window_owned_by_us = true;
                 self.paused_by_us = false;
-                self.user_paused = false;
-                self.idle_stopped = false;
+                    self.idle_stopped = false;
                 self.frozen = false;
                 let _ = self.session.call_text(
                     "game_control",
@@ -784,8 +772,7 @@ impl Agent {
                 self.window_until = Some(Instant::now() + Duration::from_secs(rescue));
                 self.window_owned_by_us = true;
                 self.paused_by_us = false;
-                self.user_paused = false;
-                self.idle_stopped = false;
+                    self.idle_stopped = false;
                 self.frozen = false;
                 let _ = self.session.call_text(
                     "game_control",
@@ -912,9 +899,21 @@ impl Agent {
         // ---- 执行慢系统的语义目标（慢系统定 goal，快系统 autoact 翻译成工单）----
         //   慢系统把决策 goal 写进独立 ai_goals.jsonl；这里消费并执行。
         //   必须在 wait_slow 停手逻辑**之前**完成，否则 pending_cmd 会因为这条而停手。
+        // ★ 紧急闸门：生命红线告急时本轮不消费长线 goal，把工单额度让给紧急抢占
+        //   （下方 1063 行的 directive + 1128 行的抢占），避免长线挤占意外处理。
+        let urgent_guard = judgment.verdict == crate::judge::Verdict::Danger
+            || judgment.danger_keys.iter().any(|k| k.starts_with("breath@") || k == "downed")
+            || snap.min_breath().map(|b| b < crate::priority::URGENT_BREATH).unwrap_or(false)
+            || (snap.max_bladder() > crate::priority::BLADDER_CRITICAL
+                && snap.building("toilets") < snap.dupes.len() as i64);
+        if urgent_guard {
+            report.notes.push(
+                "🚨 生命红线告急 → 本轮跳过长线 goal，工单额度让给紧急抢占".into(),
+            );
+        }
         {
             // ★ 从独立 ai_goals.jsonl 读（不再从 commands.jsonl 过滤 source）
-            let ai_goals: Vec<_> = crate::commands::ai_goals_pending();
+            let ai_goals: Vec<_> = if urgent_guard { Vec::new() } else { crate::commands::ai_goals_pending() };
             for c in ai_goals {
                 let goal = c.text.trim();
                 if crate::autoact::parse_goal(goal).is_none() {
@@ -1022,12 +1021,10 @@ impl Agent {
             self.escalation_hold = false;
             self.escalation_since = None;
             report.notes.push("✅ 慢系统已处理 → 解除冻结，快系统继续自主运行".into());
-            // 开一个施工窗口让快系统真正动起来（**不覆盖用户手动暂停**）
-            if !self.user_paused {
-                self.resume("慢系统已处理，恢复施工");
-                self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
-                self.window_owned_by_us = true;
-            }
+            // 开一个施工窗口让快系统真正动起来
+            self.resume("慢系统已处理，恢复施工");
+            self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
+            self.window_owned_by_us = true;
         }
 
         // ---- 决策 + 执行 ----
@@ -1112,14 +1109,16 @@ impl Agent {
                     //   已下的长线工单照常执行，慢系统改方向后下一轮接着干。
                     self.escalation_hold = true;
                     self.escalation_since = Some(Instant::now());
+                    // ★ 意外不等慢系统：已上报 AI，但继续往下走 Urgent 抢占逻辑，
+                    //   让快系统本轮就执行保命动作（救援/产氧/建厕所）。
+                    //   长线 goal 已在"紧急闸门"处跳过（见 907 行附近）。
                     report.notes.push(
-                        "⏸ semantic decision escalated to AI; 本轮不下新工单（世界继续跑，长线工单照常执行）".into(),
+                        "🚨 semantic decision 已上报 AI；快系统同时执行紧急抢占（意外不等慢系统）".into(),
                     );
-                    return report;
                 }
             } else {
-                report.notes.push("⏸ semantic decision escalated to AI; no local action".into());
-                return report;
+                // 已在冷静期/等待中：不重复上报，但仍走抢占，意外照常处理。
+                report.notes.push("⏸ semantic 决策等待慢系统；快系统继续紧急抢占".into());
             }
         }
 

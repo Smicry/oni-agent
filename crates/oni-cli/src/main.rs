@@ -953,15 +953,13 @@ fn cmd_agent(args: &[String]) -> anyhow::Result<()> {
             "--interval" => { cfg.interval_secs = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(10); i += 2; }
             "--plan" => { cfg.plan_path = args.get(i + 1).cloned().unwrap_or_else(|| "plan.json".into()); i += 2; }
             "--cooldown" => { cfg.pause_cooldown = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(600); i += 2; }
-            "--no-auto-resume" => { cfg.auto_resume_manual = false; i += 1; }
-            "--auto-resume" => { cfg.auto_resume_manual = true; i += 1; }
             "--window" => { cfg.work_window_secs = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(90); i += 2; }
             _ => i += 1,
         }
     }
     let mut agent = Agent::new(s, cat, cfg);
-    println!("oni-agent 守护进程启动：每 {}s 一轮；施工窗口 {}s（窗口结束即冻回暂停）；手动暂停越权恢复={}",
-        agent.cfg.interval_secs, agent.cfg.work_window_secs, agent.cfg.auto_resume_manual);
+    println!("oni-agent 守护进程启动：每 {}s 一轮；施工窗口 {}s（AI总开关=hold/release）",
+        agent.cfg.interval_secs, agent.cfg.work_window_secs);
     loop {
         let r = agent.cycle();
         let mut line = format!("[{}] cycle={} verdict={} 节点={} 动作={}",

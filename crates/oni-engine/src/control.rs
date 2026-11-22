@@ -1,19 +1,12 @@
-//! **暂停所有权**（control ownership）—— 谁暂停的世界，只有谁能恢复。
+//! **暂停所有权**（control ownership）—— 落盘的暂停事件，跨进程重启可见。
 //!
-//! 为什么需要：
-//!   旧设计用**四个内存布尔标志**（user_paused / frozen / idle_stopped / paused_by_us）
-//!   靠"排除法"推断"是谁暂停的"：都不是 → 那一定是用户 → 绝不恢复。
-//!   这个推断在**守护进程重启换二进制**时必然崩：内存标志全清零，
-//!   而游戏暂停状态还在 → 下一轮判"用户暂停"→ 谁都不恢复 → 死锁
-//!   。
+//! 唯一的用户停止信号是 **hold**（AI 总开关，Owner::Hold）：
+//!   - hold：冻结世界 + 代理待命，重载/重启后保持，直到 release；
+//!   - 其余 owner（agent/none/user/escalation）的暂停，代理一律自主恢复 + 开施工窗口，
+//!     长线任务不被打断。用户不再需要单独暂停游戏。
 //!
-//! 正解：**暂停是一次有主的事件，不是一组推断出来的标志**。
-//!   - 暂停时落盘 owner + reason + since（按存档隔离，跨进程重启保留）；
-//!   - 恢复时按 owner 决定谁能解除；
-//!   - 未知来源的暂停 → 保守判 user（宁可不恢复，也不越权）。
-//!
-//! 若想恢复被 user/hook 暂停的世界：CLI `resume` 或 `oni window <秒>`
-//!   显式把 owner 改成 agent/hook_resume —— 这是"用户授权代理恢复"的信号。
+//! 落盘 owner + reason + since（按存档隔离，跨进程重启保留），供守护进程读取。
+//! 主 agent 改代码：`oni hold` / `oni release`（与 AI 总开关同一机制）。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -138,11 +131,6 @@ pub fn resume(expected: Owner) -> bool {
 /// 无条件清除（用户显式 `oni resume` / 换存档时用）。
 pub fn clear() {
     let _ = std::fs::write(path(), serde_json::to_string_pretty(&ControlState::default()).unwrap_or_default());
-}
-
-/// hook 是否暂停的（给守护进程快速判定）。
-pub fn is_user_paused() -> bool {
-    read().owner == Owner::User
 }
 
 #[cfg(test)]
