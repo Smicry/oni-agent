@@ -487,31 +487,35 @@ fn save_dir() -> std::path::PathBuf {
     base
 }
 
-/// 组装对话流：用户指令 + 慢系统决策，按时间排序（最近30条）。
-/// 每条用户指令带完成状态（done? 成功/失败/待处理），慢系统决策带 goal 和 reason。
+/// 组装对话流：四类角色构成完整三方对话链：
+///   fast      快系统卡点（escalations/history.jsonl）—— 发现问题
+///   assistant 慢系统决策（decisions.jsonl source=slow_service）—— 做决策
+///   result    快系统执行反馈（goal_outcomes.jsonl）—— 执行结果回执
+///   user      用户指令（commands.jsonl source=user）—— 人工介入
+/// 每条带 status（成功/失败/待处理）与可选 status_label。按时间排序，按角色配额截断。
 fn build_conversation() -> Vec<Value> {
     let sd = save_dir();
     let mut msgs: Vec<Value> = Vec::new();
-    // 用户指令（source=user）
+
+    // 1) 用户指令（source=user，ai_goal 不进对话流避免噪音）
     if let Ok(text) = std::fs::read_to_string(sd.join("commands.jsonl")) {
         for line in text.lines() {
             let Ok(c) = serde_json::from_str::<Value>(line) else { continue };
-            let source = c.get("source").and_then(|v| v.as_str()).unwrap_or("");
-            if source != "user" { continue; } // ai_goal 不进对话流，避免噪音
-            let text = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let decoded = decode_unicode_escapes(text);
+            if c.get("source").and_then(|v| v.as_str()) != Some("user") { continue; }
+            let decoded = decode_unicode_escapes(c.get("text").and_then(|v| v.as_str()).unwrap_or(""));
             let done = c.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
             let result = c.get("result").and_then(|v| v.as_str()).unwrap_or("");
-            let status = if !done { "pending" }
-                else if result.contains("失败") || result.contains("未成功") { "fail" }
-                else { "success" };
+            let (status, label) = if !done { ("pending", "待处理") }
+                else if result.contains("失败") || result.contains("未成功") { ("fail", "失败") }
+                else { ("success", "完成") };
             msgs.push(serde_json::json!({
-                "role": "user", "text": decoded, "status": status,
+                "role": "user", "text": decoded, "status": status, "status_label": label,
                 "result": result, "ts": c.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
             }));
         }
     }
-    // 慢系统决策
+
+    // 2) 慢系统决策
     if let Ok(text) = std::fs::read_to_string(sd.join("decisions.jsonl")) {
         let dlines: Vec<&str> = text.lines().rev().take(12).collect();
         for line in dlines.iter().rev() {
@@ -524,18 +528,66 @@ fn build_conversation() -> Vec<Value> {
             let text = if goal.is_empty() { format!("[{}] {}", priority, reason) }
                 else { format!("[{}] goal={} → {}", priority, goal, reason) };
             msgs.push(serde_json::json!({
-                "role": "assistant", "text": text, "status": "",
+                "role": "assistant", "text": text, "status": "", "status_label": "",
                 "result": action, "ts": d.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
             }));
         }
     }
+
+    // 3) 快系统卡点（escalation history）—— 发现问题
+    if let Ok(text) = std::fs::read_to_string(sd.join("escalations/history.jsonl")) {
+        let elines: Vec<&str> = text.lines().rev().take(10).collect();
+        for line in elines.iter().rev() {
+            let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
+            let ts = e.get("ts").and_then(|v| v.as_i64())
+                .or_else(|| e.get("id").and_then(|v| v.as_i64())).unwrap_or(0);
+            if ts == 0 { continue; }
+            let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let detail: String = e.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(90).collect();
+            let node = e.get("node").and_then(|v| v.as_str()).unwrap_or("");
+            let acked = e.get("acked").and_then(|v| v.as_bool()).unwrap_or(false);
+            let (status, label) = if acked { ("success", "已处理") } else { ("pending", "待处理") };
+            let text = if node.is_empty() { format!("[{}] {}", kind, detail) }
+                else { format!("[{}][{}] {}", kind, node, detail) };
+            msgs.push(serde_json::json!({
+                "role": "fast", "text": text, "status": status, "status_label": label,
+                "result": "", "ts": ts,
+            }));
+        }
+    }
+
+    // 4) 快系统执行反馈（goal outcomes）—— 执行结果回执
+    if let Ok(text) = std::fs::read_to_string(sd.join("goal_outcomes.jsonl")) {
+        let olines: Vec<&str> = text.lines().rev().take(10).collect();
+        for line in olines.iter().rev() {
+            let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
+            let goal = o.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+            if goal.is_empty() { continue; }
+            let ok = o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(80).collect();
+            let text = format!("goal={} → {}: {}", goal, if ok { "成功" } else { "失败" }, detail);
+            msgs.push(serde_json::json!({
+                "role": "result", "text": text,
+                "status": if ok { "success" } else { "fail" },
+                "status_label": if ok { "成功" } else { "失败" },
+                "result": "", "ts": o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
+            }));
+        }
+    }
+
+    // 按时间排序 → 按角色配额截断（保留各类最近若干条）→ 再按时间排序
     msgs.sort_by_key(|m| m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0));
-    // 配额截断：保留最近15条 user + 最近15条 assistant，保证对话里用户指令不被淹没
-    let mut users: Vec<Value> = msgs.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user")).cloned().collect();
-    let mut ais: Vec<Value> = msgs.iter().filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("user")).cloned().collect();
-    if users.len() > 15 { users = users[users.len()-15..].to_vec(); }
-    if ais.len() > 15 { ais = ais[ais.len()-15..].to_vec(); }
-    let mut out = users; out.extend(ais);
+    let take_role = |role: &str, n: usize| -> Vec<Value> {
+        let mut v: Vec<Value> = msgs.iter()
+            .filter(|m| m.get("role").and_then(|x| x.as_str()) == Some(role))
+            .cloned().collect();
+        if v.len() > n { v = v[v.len()-n..].to_vec(); }
+        v
+    };
+    let mut out = take_role("user", 12);
+    out.extend(take_role("assistant", 12));
+    out.extend(take_role("fast", 8));
+    out.extend(take_role("result", 8));
     out.sort_by_key(|m| m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0));
     out
 }

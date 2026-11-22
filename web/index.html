@@ -20,8 +20,12 @@ button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
 .msg{margin:8px 0;padding:8px 10px;border-radius:6px;line-height:1.5}
 .msg-user{background:#3b4252;border-left:3px solid #88c0d0}
 .msg-ai{background:#434c5e;border-left:3px solid #a3be8c}
+.msg-fast{background:#4c566a;border-left:3px solid #ebcb8b}
+.msg-result{background:#3b4252;border-left:3px solid #b48ead}
 .msg .who{font-size:11px;color:#88c0d0;margin-bottom:3px}
 .msg-ai .who{color:#a3be8c}
+.msg-fast .who{color:#ebcb8b}
+.msg-result .who{color:#b48ead}
 .msg .body{white-space:pre-wrap;word-break:break-word}
 .msg .result{margin-top:5px;font-size:11px;color:#ebcb8b;border-top:1px dashed #4c566a;padding-top:4px}
 .badge{font-size:10px;padding:1px 5px;border-radius:3px;margin-left:6px}
@@ -42,7 +46,7 @@ button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
 <div class="card"><div class="grid" id="stats"></div></div>
 <h2>复制人</h2><div class="card" id="dupes"></div>
 <h2>待决策卡点 <span class="small" id="esccount"></span></h2><div id="escs"></div>
-<h2>对话（用户指令 ↔ 慢系统决策 ↔ 执行结果）</h2>
+<h2>对话（快系统卡点 ↔ 慢系统决策 ↔ 执行反馈 ↔ 用户指令）</h2>
 <div id="conv"></div>
 <div class="card inputrow">
   <input id="cmd" placeholder="输入指令后回车发送（世界暂停→慢系统处理→恢复自主）" onkeydown="if(event.key==='Enter')sendCmd()">
@@ -70,12 +74,14 @@ async function refresh(){
     return '<div class="esc">#'+e.id+' '+esc(e.detail)+'<div class="small">卡点='+esc(c.obstacle||'-')+'</div>'+cands+'</div>';}).join('')||'<div class="small">无待决策卡点</div>';
   // 对话流
   var conv=document.getElementById('conv');
+  var roleUi={'user':['你','msg-user'],'assistant':['慢系统','msg-ai'],'fast':['快系统·卡点','msg-fast'],'result':['快系统·反馈','msg-result']};
   conv.innerHTML=(s.conversation||[]).map(function(m){
-    var isUser=m.role==='user';
-    var badge=m.status?'<span class="badge '+m.status+'">'+(m.status==='success'?'完成':m.status==='fail'?'失败':'待处理')+'</span>':'';
+    var ui=roleUi[m.role]||roleUi['assistant'];
+    var label=m.status_label||(m.status==='success'?'完成':m.status==='fail'?'失败':'待处理');
+    var badge=m.status?'<span class="badge '+m.status+'">'+esc(label)+'</span>':'';
     var result=m.result?'<div class="result">→ '+esc(m.result)+'</div>':'';
-    return '<div class="msg '+(isUser?'msg-user':'msg-ai')+'">'+
-      '<div class="who">'+(isUser?'你':'慢系统')+' '+badge+' <span class="small">'+time(m.ts)+'</span></div>'+
+    return '<div class="msg '+ui[1]+'">'+
+      '<div class="who">'+ui[0]+' '+badge+' <span class="small">'+time(m.ts)+'</span></div>'+
       '<div class="body">'+esc(m.text)+'</div>'+result+'</div>';
   }).join('')||'<div class="small">暂无对话</div>';
   conv.scrollTop=conv.scrollHeight;
