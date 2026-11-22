@@ -18,22 +18,107 @@ pub struct SlowConfig {
     pub endpoint: Option<String>,
     pub api_key: Option<String>,
     pub model: String,
+    /// "anthropic" (Messages API) or "openai" (chat/completions)
+    pub api_format: String,
+    /// 自定义 headers（如 User-Agent），格式 "K:V,K2:V2"
+    pub extra_headers: String,
     pub interval_secs: u64,
     pub web_port: u16,
 }
 impl Default for SlowConfig {
     fn default() -> Self {
+        let endpoint = std::env::var("ONI_LLM_ENDPOINT").ok();
+        let api_key = std::env::var("ONI_LLM_KEY").ok();
+        let model = std::env::var("ONI_LLM_MODEL").ok();
+        let api_format = std::env::var("ONI_LLM_FORMAT").ok();
+        // 环境变量不全 → 尝试从 MCode 的 config.yaml 读 custom_provider（用户在设置界面填的）
+        let (endpoint, api_key, model, api_format, extra_headers) =
+            if endpoint.is_some() && api_key.is_some() && model.is_some() {
+                (endpoint, api_key, model.unwrap(),
+                 api_format.unwrap_or_else(|| "openai".into()), String::new())
+            } else if let Some(m) = load_mcode_provider() {
+                (Some(m.endpoint), Some(m.api_key), m.model, m.format, m.headers)
+            } else {
+                (endpoint, api_key, model.unwrap_or_else(|| "gpt-4o-mini".into()),
+                 api_format.unwrap_or_else(|| "openai".into()), String::new())
+            };
         Self {
-            endpoint: std::env::var("ONI_LLM_ENDPOINT").ok(),
-            api_key: std::env::var("ONI_LLM_KEY").ok(),
-            model: std::env::var("ONI_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
-            interval_secs: 5,
-            web_port: 8789,
+            endpoint, api_key, model, api_format, extra_headers,
+            interval_secs: 5, web_port: 8789,
         }
     }
 }
 impl SlowConfig {
     pub fn is_mock(&self) -> bool { self.endpoint.is_none() || self.api_key.is_none() }
+    pub fn is_anthropic(&self) -> bool { self.api_format.eq_ignore_ascii_case("anthropic") }
+}
+
+/// 从 MCode config.yaml 的 custom_provider 里读一个 LLM provider 配置（零 yaml 依赖的轻量解析）。
+struct McodeProvider {
+    endpoint: String, api_key: String, model: String, format: String, headers: String,
+}
+
+fn load_mcode_provider() -> Option<McodeProvider> {
+    let path = std::env::var("__MAVIS_PARENT_DATA_DIR")
+        .or_else(|_| std::env::var("MINIMAX_DATA_DIR"))
+        .unwrap_or_else(|_| format!("{}/.minimax", std::env::var("HOME").unwrap_or_default()));
+    let text = std::fs::read_to_string(format!("{}/config.yaml", path)).ok()?;
+    // 优先找 enabled + 含 baseURL 的 anthropic provider，否则第一个 custom provider
+    let lines: Vec<&str> = text.lines().collect();
+    // 定位 custom_provider 段内的 provider 名（缩进2，形如 "  magpie:"）
+    let mut providers: Vec<(String, usize)> = Vec::new();
+    let mut in_custom = false;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_end() == "custom_provider:" { in_custom = true; continue; }
+        if in_custom {
+            let indent = line.len() - line.trim_start().len();
+            if indent == 0 && !line.trim().is_empty() { break; }
+            if indent == 2 && line.trim_end().ends_with(':') {
+                let name = line.trim().trim_end_matches(':').to_string();
+                providers.push((name, i));
+            }
+        }
+    }
+    // 优先 anthropic 格式的 provider（用户本地接入通常是它），其次其余。
+    let mut ordered: Vec<&(String, usize)> = providers.iter().collect();
+    ordered.sort_by_key(|(n, s)| {
+        let end = providers.iter().map(|(_, p)| *p).filter(|p| p > s).min().unwrap_or(lines.len());
+        let seg = &lines[*s..end];
+        let is_anthropic = seg.iter().any(|l| l.trim().starts_with("api:") && l.contains("anthropic"));
+        if is_anthropic { 0 } else { 1 }
+    });
+    for (name, start) in ordered.iter().map(|x| *x) {
+        // 段范围：从 start 到下一个同级 provider
+        let end = providers.iter().map(|(_, p)| *p).filter(|p| p > start).min().unwrap_or(lines.len());
+        let seg = &lines[*start..end];
+        let mut base = String::new(); let mut key = String::new();
+        let mut api = String::new(); let mut ua = String::new();
+        let mut model = String::new(); let mut in_models = false;
+        for l in seg {
+            let t = l.trim();
+            if t.starts_with("models:") { in_models = true; continue; }
+            if let Some(v) = t.strip_prefix("baseURL:") { base = clean_yaml(v); }
+            if let Some(v) = t.strip_prefix("apiKey:") { key = clean_yaml(v); }
+            if let Some(v) = t.strip_prefix("api:") { api = clean_yaml(v); }
+            if let Some(v) = t.strip_prefix("User-Agent:") { ua = clean_yaml(v); }
+            if in_models && t.ends_with(':') && !t.starts_with('#') {
+                let ind = l.len() - l.trim_start().len();
+                if ind == 6 { model = t.trim_end_matches(':').to_string(); break; }
+            }
+        }
+        if !base.is_empty() && !key.is_empty() && !model.is_empty() {
+            let format = if api.contains("anthropic") { "anthropic" } else { "openai" };
+            let headers = if ua.is_empty() { String::new() } else { format!("User-Agent:{}", ua) };
+            eprintln!("[slow] 使用 MCode provider '{}' ({} / {})", name, format, base);
+            return Some(McodeProvider { endpoint: base, api_key: key, model,
+                format: format.into(), headers });
+        }
+    }
+    None
+}
+
+fn clean_yaml(v: &str) -> String {
+    v.trim().trim_matches('"').trim_matches(|c| c == '\'').to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,29 +163,77 @@ fn now() -> i64 {
 fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str) -> Result<String, String> {
     let endpoint = cfg.endpoint.as_ref().ok_or("no endpoint")?;
     let key = cfg.api_key.as_ref().ok_or("no api key")?;
-    let body = serde_json::json!({
-        "model": cfg.model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2,
-        "max_tokens": 512,
-    });
-    let resp = ureq::post(endpoint)
-        .set("Authorization", &format!("Bearer {}", key))
-        .set("Content-Type", "application/json")
-        .send_json(body)
+
+    let (url, body) = if cfg.is_anthropic() {
+        // Anthropic Messages API: {baseURL}/messages
+        let url = format!("{}/messages", endpoint.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": cfg.model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+        });
+        (url, body)
+    } else {
+        // OpenAI chat/completions
+        let body = serde_json::json!({
+            "model": cfg.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 4096,
+        });
+        (endpoint.clone(), body)
+    };
+
+    let mut req = ureq::post(&url);
+    if cfg.is_anthropic() {
+        req = req.set("x-api-key", key)
+                 .set("anthropic-version", "2023-06-01");
+    } else {
+        req = req.set("Authorization", &format!("Bearer {}", key));
+    }
+    req = req.set("Content-Type", "application/json");
+    // 自定义 headers（如 User-Agent）
+    for pair in cfg.extra_headers.split(',') {
+        if let Some((k, v)) = pair.split_once(':') {
+            let (k, v) = (k.trim(), v.trim());
+            if !k.is_empty() { req = req.set(k, v); }
+        }
+    }
+    let resp = req.send_json(body)
         .map_err(|e| format!("LLM HTTP error: {}", e))?;
     let mut text = String::new();
     resp.into_reader().read_to_string(&mut text)
         .map_err(|e| format!("LLM read error: {}", e))?;
     let v: Value = serde_json::from_str(&text)
         .map_err(|e| format!("LLM JSON error: {}", e))?;
-    v.pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "LLM response missing content".into())
+    if cfg.is_anthropic() {
+        // Anthropic: {"content":[{"type":"text"|"thinking","text"|"thinking":"..."}]}
+        let arr = v.get("content").and_then(|c| c.as_array());
+        // 优先找 text 块
+        let text_out = arr.and_then(|a| a.iter()
+            .find(|x| x.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .and_then(|x| x.get("text").and_then(|t| t.as_str())));
+        if let Some(t) = text_out { return Ok(t.to_string()); }
+        // 推理模型可能只输出 thinking 块：从中提取最后的 JSON 对象
+        let thinking = arr.map(|a| a.iter()
+            .filter(|x| x.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+            .filter_map(|x| x.get("thinking").and_then(|t| t.as_str()))
+            .collect::<Vec<&str>>().join("\n")).unwrap_or_default();
+        if let (Some(s), Some(e)) = (thinking.find('{'), thinking.rfind('}')) {
+            return Ok(thinking[s..=e].to_string());
+        }
+        Err(format!("Anthropic response has no text/json: stop={} thinking_len={}",
+            v.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("?"), thinking.len()))
+    } else {
+        v.pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "LLM response missing content".into())
+    }
 }
 
 fn parse_decision(text: &str) -> Result<LlmDecision, String> {
@@ -126,7 +259,7 @@ fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool) -> LlmDe
     }
 }
 
-const SYSTEM_PROMPT: &str = "你是缺氧殖民地慢系统决策者。快系统每10秒采集局面，遇卡点上报结构化诊断(含候选)。从候选中选一个，或对用户指令决策。原则:1)先死因优先(食物/氧气续航短) 2)可达性问题让快系统自救 3)改目标说明依据 4)用户指令优先(世界已暂停)。输出严格JSON: {choice,action,reason,commands[]}，action∈{resolve,command,wait,custom}。";
+const SYSTEM_PROMPT: &str = "你是缺氧殖民地慢系统决策者。快系统每10秒采集局面，遇卡点上报结构化诊断(含候选)。从候选中选一个，或对用户指令决策。原则:1)先死因优先(食物/氧气续航短) 2)可达性问题让快系统自救 3)改目标说明依据 4)用户指令优先(世界已暂停)。输出严格JSON: {choice,action,reason,commands[]}，action∈{resolve,command,wait,custom}。commands只能是可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply'、'order 挖 土@(127,197):9')或留空[]，绝不能是自然语言描述。";
 
 fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
     let mut p = String::from("== 当前局面 ==\n");

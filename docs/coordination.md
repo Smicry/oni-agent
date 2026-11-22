@@ -278,3 +278,18 @@ LLM 调用失败 -> 自动降级 mock，原因写进决策 reason。
 - 慢系统服务不在快系统关键路径上：它挂了，快系统靠看门狗 300s 降级继续（见 §5）。
 - mock 模式只验证闭环，不做真实决策；生产必须配 ONI_LLM_*。
 - LLM 输出严格 JSON：choice/action/reason/commands；解析失败降级 mock。
+
+
+### 12.7 LLM 配置：自动复用 MCode 已填的 provider（无需重复填写）
+
+oni slow 启动时按以下优先级解析 LLM：
+1. 环境变量 ONI_LLM_ENDPOINT / ONI_LLM_KEY / ONI_LLM_MODEL / ONI_LLM_FORMAT（显式覆盖）
+2. 否则自动读 ~/.minimax/config.yaml 的 custom_provider：
+   - 优先选 anthropic-messages 格式的 provider（如用户在设置界面填的本地 magpie）
+   - 读它的 baseURL / apiKey / model / headers
+   - **API Key 已在 MCode 设置里填过，oni slow 直接复用，无需再填**
+
+已验证：本地 magpie（Anthropic Messages, http://127.0.0.1:3425, group~smart）
+自动接入成功，LLM 能从结构化诊断做语义决策并输出有效 JSON。
+注意该模型是推理模型：返回 thinking 块，oni slow 会从中提取决策 JSON；
+max_tokens 设为 4096 以容纳推理链。
