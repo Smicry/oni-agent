@@ -1409,6 +1409,18 @@ pub fn rescue_dupes(session: &McpSession, dupes: &[crate::sense::Dupe]) -> Vec<S
         // 移动前先记位置（供下一轮复核「是否真的挪动了」）
         let from_pos = dupe_position_now(session, &d.name);
         for t in targets {
+            // 落点必须是**富氧格**：先查建筑位置，再看该格是否氧气主导。
+            // 旧逻辑只看"建筑存在就移"→ 把窒息的人从氧气梯子列送进 CO₂ 坑的藻类箱
+            // （2026-11-22 裴/麦克斯呼吸反复掉到16就是这么来的）。读不到气体 → 保守跳过。
+            if let Some((bx, by)) = find_building_pos(session, t) {
+                let cells = oni_world::cell::fetch_many(session, &[(bx, by)]);
+                let safe = cells.get(&(bx, by)).map(|c| c.is_safer_for_occupied()).unwrap_or(false);
+                if !safe {
+                    continue; // 该建筑在 CO₂/污染区 → 不把人往毒气里送
+                }
+            } else {
+                continue; // 建筑不存在 → 跳过（旧逻辑靠 mod 报错来筛，这里提前筛）
+            }
             let line = format!("移 人@{} -> {} confirm=true", d.name, t);
             let res = session.call_text(
                 "world_editor",
