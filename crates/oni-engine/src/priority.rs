@@ -274,7 +274,9 @@ pub fn direct(
             ),
             action: Action::Rescue,
             forbid_expansion: false,
-            needs_ai: true,
+            // Only escalate when breathing is actually low;
+            // normal-breath exposure is a routine chore (Watch), not a decision.
+            needs_ai: breath_low,
         };
     }
 
