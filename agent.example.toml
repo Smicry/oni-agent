@@ -1,0 +1,16 @@
+# ONI fast/slow system config (copy to agent.toml and fill in)
+# agent.toml contains API key and is gitignored.
+
+[fast]
+interval = 10
+window = 120
+
+[slow]
+interval = 5
+web_port = 8789
+
+[llm]
+endpoint = ""
+key = ""
+model = ""
+format = "anthropic"

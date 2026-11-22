@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         "call" => cmd_call(&rest),
         "agent" => cmd_agent(&rest),
         "slow" => cmd_slow(&rest),
+        "serve" => cmd_serve(),
         "window" => cmd_window(&rest),
         "hold" => cmd_hold(&rest),
         "release" => cmd_release(),
@@ -842,6 +843,86 @@ fn cmd_release() -> anyhow::Result<()> {
     oni_engine::control::resume(oni_engine::control::Owner::Hold);
     println!("✅ hold 已解除：代理恢复自主循环（需要时用 `oni window <秒>` 开施工窗口）");
     Ok(())
+}
+
+
+/// 轻量解析 agent.toml（[section] key = value），供 serve 读取快慢系统配置。
+/// 返回 (fast_interval, fast_window, slow_interval, web_port, llm_endpoint, llm_key, llm_model, llm_format)
+fn read_agent_toml() -> Option<(u64, u64, u64, u16, String, String, String, String)> {
+    let path = std::path::Path::new("agent.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut section = String::new();
+    let mut fast_i = 10u64; let mut fast_w = 120u64;
+    let mut slow_i = 5u64; let mut port = 8789u16;
+    let mut ep = String::new(); let mut key = String::new();
+    let mut model = String::new(); let mut fmt = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        if t.starts_with('[') && t.ends_with(']') {
+            section = t[1..t.len()-1].trim().to_string();
+            continue;
+        }
+        let (k, v) = match t.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim().trim_matches('"').trim_matches('\'').to_string()),
+            None => continue,
+        };
+        match (section.as_str(), k) {
+            ("fast", "interval") => fast_i = v.parse().unwrap_or(fast_i),
+            ("fast", "window") => fast_w = v.parse().unwrap_or(fast_w),
+            ("slow", "interval") => slow_i = v.parse().unwrap_or(slow_i),
+            ("slow", "web_port") => port = v.parse().unwrap_or(port),
+            ("llm", "endpoint") => ep = v,
+            ("llm", "key") => key = v,
+            ("llm", "model") => model = v,
+            ("llm", "format") => fmt = v,
+            _ => {},
+        }
+    }
+    Some((fast_i, fast_w, slow_i, port, ep, key, model, fmt))
+}
+
+/// 统一启动：一个进程同时跑快系统(agent循环) + 慢系统(LLM决策+Web)。
+/// 配置从项目根 agent.toml 读取（复制 agent.example.toml 填写）。
+fn cmd_serve() -> anyhow::Result<()> {
+    use oni_engine::agent::{Agent, AgentConfig};
+    let s = connect()?;
+    let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut fast = AgentConfig::default();
+    let mut slow = oni_engine::slow::SlowConfig::default();
+    if let Some((fi, fw, si, port, ep, key, model, fmt)) = read_agent_toml() {
+        fast.interval_secs = fi;
+        fast.work_window_secs = fw;
+        slow.interval_secs = si;
+        slow.web_port = port;
+        if !ep.is_empty() { slow.endpoint = Some(ep); }
+        if !key.is_empty() { slow.api_key = Some(key); }
+        if !model.is_empty() { slow.model = model; }
+        if !fmt.is_empty() { slow.api_format = fmt; }
+        println!("已加载 agent.toml 配置");
+    } else {
+        println!("未找到 agent.toml，使用默认配置（可复制 agent.example.toml 填写）");
+    }
+
+    // 慢系统线程（自带 Web server）
+    let web_port = slow.web_port;
+    let slow_thread = std::thread::spawn(move || oni_engine::slow::run(slow, false));
+
+    let mut agent = Agent::new(s, cat, fast);
+    println!("oni serve 启动：快系统每{}s/窗口{}s + 慢系统+Web(:{})",
+        agent.cfg.interval_secs, agent.cfg.work_window_secs, web_port);
+    loop {
+        let r = agent.cycle();
+        let mut line = format!("[{}] cycle={} verdict={} 节点={} 动作={}",
+            chrono::Local::now().format("%H:%M:%S"), r.cycle, r.verdict.label(),
+            r.node.clone().unwrap_or_else(|| "-".into()), if r.acted { "已执行" } else { "无" });
+        for n in &r.notes { line.push_str(" | "); line.push_str(n); }
+        println!("{}", line);
+        std::thread::sleep(std::time::Duration::from_secs(agent.cfg.interval_secs));
+    }
+    #[allow(unreachable_code)]
+    let _ = slow_thread.join();
 }
 
 /// 慢系统服务：常驻轮询 escalation/用户指令 → LLM 决策 → 执行 + Web 页面。

@@ -20,6 +20,9 @@
 # ── 本地环境配置（国内 crates.io 镜像，非工程必需）──
 /.cargo/config.toml
 
+# ── 本机 agent 配置（含 LLM API Key，不进 git）──
+/agent.toml
+
 # ── 编辑器 / 工具状态 ─────────────────────────
 .DS_Store
 *.swp

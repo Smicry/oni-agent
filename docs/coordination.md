@@ -293,3 +293,22 @@ oni slow 启动时按以下优先级解析 LLM：
 自动接入成功，LLM 能从结构化诊断做语义决策并输出有效 JSON。
 注意该模型是推理模型：返回 thinking 块，oni slow 会从中提取决策 JSON；
 max_tokens 设为 4096 以容纳推理链。
+
+
+### 12.8 统一启动：oni serve（一个进程跑快慢系统）
+
+用户定稿：快慢系统作为一个 agent 一起启动，配置填在项目里。
+
+    oni serve
+
+一个进程同时跑：
+- 主线程：快系统 agent 循环（采快照/判危/执行）
+- 线程：慢系统决策循环（LLM 选候选） + Web 服务(:8789)
+
+配置文件：项目根 agent.toml（复制 agent.example.toml 填写）。
+- [fast] / [slow]：两个系统的间隔、窗口、端口
+- [llm]：endpoint / model / format；key 留空则复用 MCode 设置里已填的
+- agent.toml 已在 .gitignore 排除（含敏感信息不进 git）
+
+不再需要分开启动 oni agent 和 oni slow；oni serve 一条命令即可。
+旧的 oni agent / oni slow 命令仍保留（单独调试用）。
