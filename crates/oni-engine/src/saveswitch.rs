@@ -1,15 +1,15 @@
 //! 换存档检测与**自动隔离**。
 //!
-//! ★ 为什么（2026-11-22 小星局实测）：
+//! 为什么：
 //!   换存档后，上一局的 plan.json（全 done）、目标锁、侦察报告、趋势样本
 //!   全被新局继承 → 代理拿着旧计划空转 40 分钟（"依赖图里没有可执行目标"）。
 //!
-//! ★ 隔离动作（换局后**必须**做，否则新局继承旧局的局内状态）：
+//! 隔离动作：
 //!   1. 旧存档的 plan.json 归档到 saves/<旧指纹>/plan.json（保留、可追溯、可回滚）
 //!   2. 工作区的 plan.json 按模板重置（全部 todo）并打上**新存档指纹**
 //!   3. 当前存档切到新的状态目录 → 目标锁/侦察报告/趋势样本/实时快照自然隔离
 //!
-//! ★ 指纹写在 plan.json 里（save_fingerprint 字段）→ 判断"这份计划属于哪一局"
+//! 指纹写在 plan.json 里（save_fingerprint 字段）→ 判断"这份计划属于哪一局"
 //!   不依赖外部记账，且计划文件自证出身（谁把它拷到别的存档里，一眼能看出来）。
 
 use std::path::Path;
@@ -53,7 +53,7 @@ pub fn stamp_plan(plan_path: &str, fp: &str) -> bool {
 /// 按模板重置计划（并打指纹）。
 /// 写回计划（带存档指纹）。
 ///
-/// ★ 重规划与人工编辑都走这一条路径 → 指纹永远正确 → 换局不会误重置。
+/// 重规划与人工编辑都走这一条路径 → 指纹永远正确 → 换局不会误重置。
 pub fn write_plan(plan_path: &str, plan: &crate::decide::Plan, fp: Option<&str>) -> bool {
     let Ok(mut v) = serde_json::to_value(plan) else {
         return false;
@@ -95,8 +95,8 @@ pub fn clear_save_state() {
 
 /// 计划看起来像"上一局残留"吗？
 ///
-/// ★ 判据：**所有节点都已是 done/blocked** ⇒ 这份计划在本局没有任何可做的事
-///   ⇒ 极可能是上一局的残留（换局未清）⇒ 可以安全按模板重置。
+/// 判据：**所有节点都已是 done/blocked** ⇒ 这份计划在没有任何可做的事
+///   ⇒ 极可能是上一局的残留⇒ 可以安全按模板重置。
 ///   反之（还有 todo 节点）就当作**人正在用的计划** ⇒ 只补指纹，不重置。
 pub fn plan_looks_stale(plan_path: &str) -> bool {
     let Ok(t) = std::fs::read_to_string(plan_path) else {
@@ -127,10 +127,10 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
 
     // 同一存档：只刷新进程内的当前存档指针
     //
-    // ★★ 2026-11-22（陨石坑局实测）：**计划文件里的指纹才是权威**。
+    // **计划文件里的指纹才是权威**。
     //   旧逻辑要求 meta 的 last_seen **和** 计划指纹同时匹配才算「同一局」；
     //   meta 一旦丢了（换机器 / 换存档读档 / 手改 plan.json 没打指纹）就会误报
-    //   「检测到换存档（旧指纹 → 新指纹，**两个值一模一样**）」→ 归档 + 刷屏，
+    //   「检测到换存档」→ 归档 + 刷屏，
     //   让人以为计划被重置（实际只是补了个指纹）。
     if plan_fp.as_deref() == Some(new.fingerprint.as_str()) {
         save::set_current(new);
@@ -143,7 +143,7 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
         }
     }
 
-    // 切换了（或计划文件没有出身信息 → 按可疑处理）
+    // 切换了
     save::set_current(new.clone());
     save::write_meta(&new);
 
@@ -161,9 +161,9 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
     }
 
     // 2) 重置计划 + 打指纹
-    //    ★★ 只有**明显是上一局残留**的计划（所有节点都已 done/blocked）才重置。
+    //    只有**明显是上一局残留**的计划（所有节点都已 done/blocked）才重置。
     //      否则（人手写的计划没打指纹）**只补打指纹，绝不冲掉人的计划**。
-    //      （2026-11-22 实测：一次自动存档读档就把定制计划冲成了模板。）
+    //      
     if plan_looks_stale(plan_path) {
         reset_plan(plan_path, &new.fingerprint);
     } else {

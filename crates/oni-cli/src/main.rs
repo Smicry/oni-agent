@@ -5,7 +5,7 @@
 //!   doctor     连通性/目录/协议自检
 //!   preflight  下单前预检（挖掘工位 / 建造占格+支撑+材料）
 //!   plan       按依赖图选本轮唯一目标
-//!   act        执行本轮目标（预检 → dry-run → apply → 复读）
+//!   act        执行本轮目标
 //!   watch      常驻观察：危急自动暂停、条件解除自动恢复
 
 use std::process::ExitCode;
@@ -41,6 +41,7 @@ fn main() -> ExitCode {
         "audit" => cmd_audit(),
         "bus" => cmd_bus(&rest),
         "command" => cmd_command(&rest),
+        "decision" => cmd_decision(&rest),
         "scout" => cmd_scout(),
         "state" => cmd_state(),
         "note" => cmd_note(&rest),
@@ -105,6 +106,8 @@ const HELP: &str = r#"oni <子命令>
   area <y0> <y1>         一次读图层摘要（水体/气室/建筑/植物/危险点）
   bus [timeline|ack N|resolve N]  协同总线：快慢系统的统一事件时间线（QoS 过滤/可回放）
   command [add <指令>|list|done <id>]  用户指令队列（下发指令给慢系统）
+  decision add <json>|list [n]|resolve <id> <实际结果>
+                                  慢系统决策记录（依据/预期/回填）
   state                 存档身份 / 指纹 / 局内缓存目录（跨局隔离检查）
   note <文本>            写进本存档的 notes.md（局内笔记，不进通用记忆）
   promote <kind> <文本>  上提到通用记忆：rule→AGENTS.md knowledge→knowledge-base.md issue→optimization-backlog"#;
@@ -114,7 +117,7 @@ fn connect() -> anyhow::Result<McpSession> {
 }
 
 fn cmd_observe(args: &[String]) -> anyhow::Result<()> {
-    // ★ --cached：读守护进程落盘的共享快照，**不碰 MCP**。
+    // --cached：读守护进程落盘的共享快照，**不碰 MCP**。
     //   用途：主 agent "看局势"时零 MCP 压力；两边看到的也是同一份真值。
     //   需要实时数据（要下指令前）时用默认的实时读。
     if args.iter().any(|a| a == "--cached") {
@@ -162,15 +165,15 @@ fn cmd_doctor() -> anyhow::Result<()> {
 
 /// **用模板重置 plan**（换存档时用）：把 plan.json 恢复成 plan.template.json 的开局状态。
 ///
-/// ★ 为什么需要（2026-11-21 实测）：换存档后 plan.json 里上一局的 done 状态会被继承，
+/// 为什么需要：换存档后 plan.json 里上一局的 done 状态会被继承，
 ///   代理以为建材/产氧已经做过 → 跳过关键步骤 → 开局就卡住。
 
-// ---- ★ 存档相关命令（跨局隔离 + 记忆上提）------------------------
+// ---- 存档相关命令------------------------
 
 /// 识别当前存档并设为进程内"当前存档"。
 ///
 /// 指纹来自**存档内不变**的事实：存档名 + 世界名 + 世界 id + 打印舱锚点。
-/// （存档名会重名、dupe 会增减、周期会重置 → 都不能当指纹。）
+/// 
 fn current_save() -> Option<oni_mcp::save::SaveId> {
     let session = connect().ok()?;
     let id = oni_mcp::save::identify(&session)?;
@@ -213,7 +216,7 @@ fn cmd_state() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 局内笔记：写进**本存档**的 notes.md（只对本局有意义，不进通用记忆）。
+/// 局内笔记：写进**本存档**的 notes.md（只对有意义，不进通用记忆）。
 fn cmd_note(args: &[String]) -> anyhow::Result<()> {
     let text = args.join(" ");
     if text.trim().is_empty() {
@@ -235,11 +238,11 @@ fn cmd_note(args: &[String]) -> anyhow::Result<()> {
 
 /// 记忆上提：把**可复用**的结论写进仓库的通用记忆文件。
 ///
-///   rule      → AGENTS.md                       硬规则（跨局无条件生效）
+///   rule      → AGENTS.md                       硬规则
 ///   knowledge → docs/knowledge-base.md           机制知识（存档无关的事实）
 ///   issue     → records/optimization-backlog.md 待优化清单（还没落地的改进）
 ///
-/// ★ 分层纪律：局内发现先落在 notes.md / session-*.md；
+/// 分层纪律：局内发现先落在 notes.md / session-*.md；
 ///   **确认换个存档也成立**，再上提到这里。
 fn cmd_promote(args: &[String]) -> anyhow::Result<()> {
     let kind = args.first().map(|s| s.as_str()).unwrap_or("");
@@ -269,13 +272,13 @@ fn cmd_promote(args: &[String]) -> anyhow::Result<()> {
 
 /// **自动开局规划**：采集世界事实 → 匹配策略族 → 生成依赖图 → 写 plan.json。
 ///
-/// ★ 这是"通用助手"的核心入口：不再由人（AI）手写计划。
+/// 这是"通用助手"的核心入口：不再由人（AI）手写计划。
 ///   换一颗星球 / 换一种开局 → 重新采集 → 匹配到不同策略族 → 生成不同计划。
 fn cmd_plan_auto(args: &[String]) -> anyhow::Result<()> {
     let keep_done = args.iter().any(|a| a == "--keep");
     let s = connect()?;
     let snap = oni_engine::sense::sense(&s);
-    // ★ 采集与生成都走 engine（CLI 与 agent 共用同一套逻辑 → 不会各说各话）
+    // 采集与生成都走 engine
     let facts = oni_engine::planner::collect_facts(&s, &snap);
     let (mut plan, strategy) = oni_engine::planner::build_plan(&facts);
 
@@ -300,10 +303,10 @@ fn cmd_plan_auto(args: &[String]) -> anyhow::Result<()> {
 
 /// **慢系统工作台**：读快系统（代理）喊上来的升级请求。
 ///
-/// ★ 快慢分工的交接点：
+/// 快慢分工的交接点：
 ///   快系统遇到规则解不开的情况 → 写 escalation + 停手；
 ///   慢系统（AI / 主 agent）用这个命令读出来 → 诊断 → 改计划 / 改代码 / 改策略
-/// ★ P0-48 统一收口：同时确认 escalations + bus 两个通道的同一事件。
+/// P0-48 统一收口：同时确认 escalations + bus 两个通道的同一事件。
 ///   避免慢系统处理后只清一处、另一处残留过时升级误导后续判断。
 fn cmd_resolve(args: &[String]) -> anyhow::Result<()> {
     let _ = current_save();
@@ -320,7 +323,7 @@ fn cmd_resolve(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// ★ 慢系统主动中枢：一屏聚合 audit + bus + commands + escalations + 暂停态（零 MCP 读缓存）。
+/// 慢系统主动中枢：一屏聚合 audit + bus + commands + escalations + 暂停态（零 MCP 读缓存）。
 fn cmd_status() -> anyhow::Result<()> {
     let _ = current_save();
     let paused = oni_engine::live::load(120).map(|s| s.paused).unwrap_or(false);
@@ -335,7 +338,7 @@ fn cmd_status() -> anyhow::Result<()> {
 
 ///   → `oni escalations ack` 告诉快系统"我处理了，继续"。
 fn cmd_escalations(args: &[String]) -> anyhow::Result<()> {
-    // ★ 必须先识别当前存档：save::current() 是**进程内**状态，
+    // 必须先识别当前存档：save::current() 是**进程内**状态，
     //   不先识别就读不到正确的存档目录（会读到 saves/unknown）。
     let _ = current_save();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
@@ -353,8 +356,8 @@ fn cmd_escalations(args: &[String]) -> anyhow::Result<()> {
         "clear" => {
             let esc_n = oni_engine::escalate::read_pending().len();
             oni_engine::escalate::clear();
-            // ★ P0-48：escalations 与 bus 是同一问题的两个通道，必须一起清，
-            //   否则过时事件残留总线误导后续判断（本局实测 14 条残留）。
+            // P0-48：escalations 与 bus 是同一问题的两个通道，必须一起清，
+            //   否则过时事件残留总线误导后续判断。
             let inbox = oni_engine::bus::inbox();
             let mut bus_n = 0;
             for ev in &inbox {
@@ -417,12 +420,12 @@ fn cmd_escalations(args: &[String]) -> anyhow::Result<()> {
 
 /// **慢系统主动巡检**：体检当前局面，列出所有"不对劲"的地方。
 ///
-/// ★ 这是慢系统的**主动**发现通道（escalation 是被动喊人）。
+/// 这是慢系统的**主动**发现通道（escalation 是被动喊人）。
 ///   很多问题是慢慢恶化的：CO₂ 占比在涨、产氧器没投料、电网没负载、
 ///   梯子链悄悄断了…… 等出事再喊就晚了。
 fn cmd_audit() -> anyhow::Result<()> {
     let _ = current_save();
-    // ★★ 慢系统**零 MCP** 读局势：守护进程（唯一采集者）已经把快照落盘了。
+    // 慢系统**零 MCP** 读局势：守护进程（唯一采集者）已经把快照落盘了。
     //   自己再采一次 = 双倍 MCP 成本 + 两份可能不一致的真相。
     //   缓存太旧（守护进程没跑/挂了）才退回实时采集。
     let snap = match oni_engine::live::load(120) {
@@ -446,7 +449,7 @@ fn cmd_audit() -> anyhow::Result<()> {
         tr.food_cycles_left,
         Some(snap.power_summary()),
     );
-    // ★ 慢系统主动能力：发现写入 bus（去重/TTL/可回放），红线时显式提示介入。
+    // 慢系统主动能力：发现写入 bus（去重/TTL/可回放），红线时显式提示介入。
     let published = oni_engine::audit::persist(&report);
     if published > 0 {
         println!("📡 已写入协同总线 {} 条巡检发现", published);
@@ -503,7 +506,7 @@ fn cmd_command(args: &[String]) -> anyhow::Result<()> {
             let id = oni_engine::commands::push(&text, "user");
             println!("📌 已入队指令 #{}：{}", id, text);
             println!("   （慢系统会读它 → 翻译成计划/工单 → 回执）");
-            // ★ 用户下指令 = **立刻冻结世界**：慢系统翻译指令要花时间，
+            // 用户下指令 = **立刻冻结世界**：慢系统翻译指令要花时间，
             //   这段时间快系统照旧施工 → 指令还没生效就可能做错事。
             //   （无人倒地时冻结是安全的：ONI 暂停会冻结倒计时。）
             if let Ok(s) = connect() {
@@ -556,6 +559,50 @@ fn cmd_command(args: &[String]) -> anyhow::Result<()> {
 ///   oni bus timeline     全部事件（可回放）
 ///   oni bus ack <id>     确认接手
 ///   oni bus resolve <id> 确认已解决（正反馈回路）
+fn cmd_decision(args: &[String]) -> anyhow::Result<()> {
+    let _ = current_save();
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "add" => {
+            let text = args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("JSON 无效: {e}"))?;
+            let cycle = v.get("cycle").and_then(|x| x.as_i64()).unwrap_or(0);
+            let context = v.get("context").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let candidates: Vec<String> = v.get("candidates")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(|x| x.to_string())).collect())
+                .unwrap_or_default();
+            let chosen = v.get("chosen").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let rationale = v.get("rationale").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let expected = v.get("expected").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let evidence = match v.get("evidence").and_then(|x| x.as_str()).unwrap_or("snapshot") {
+                "official" => oni_engine::decisions::Evidence::Official,
+                "inferred" => oni_engine::decisions::Evidence::Inferred,
+                "heuristic" => oni_engine::decisions::Evidence::Heuristic,
+                _ => oni_engine::decisions::Evidence::Snapshot,
+            };
+            let id = oni_engine::decisions::record(cycle, &context, &candidates, &chosen, &rationale, evidence, &expected);
+            println!("✅ 已记录决策 #{id}: {chosen}");
+        }
+        "resolve" => {
+            let Some(id) = args.get(1).and_then(|x| x.parse::<u64>().ok()) else {
+                anyhow::bail!("用法: oni decision resolve <id> <实际结果>");
+            };
+            let actual = args.iter().skip(2).cloned().collect::<Vec<_>>().join(" ");
+            if oni_engine::decisions::resolve(id, &actual) {
+                println!("✅ 决策 #{id} 已回填实际结果");
+            } else {
+                anyhow::bail!("找不到决策 #{id}");
+            }
+        }
+        "list" => {
+            let n = args.get(1).and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
+            println!("{}", oni_engine::decisions::summary_for(n));
+        }
+        other => anyhow::bail!("用法: oni decision add <json> | list [n] | resolve <id> <实际结果>（未知: {other}）"),
+    }
+  Ok(())
+}
 fn cmd_bus(args: &[String]) -> anyhow::Result<()> {
     let _ = current_save();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
@@ -627,13 +674,13 @@ fn cmd_plan_reset() -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("模板不是合法 JSON: {e}"))?;
     std::fs::write(PLAN, &text)?;
-    // ★ 给计划文件打上**当前存档的指纹**：计划自证出身。
-    //   换局后指纹对不上 → 守护进程自动归档旧计划并按模板重置（不跨局污染）。
+    // 给计划文件打上**当前存档的指纹**：计划自证出身。
+    //   换局后指纹对不上 → 守护进程自动归档旧计划并按模板重置。
     let id = current_save();
     if let Some(i) = &id {
         oni_engine::saveswitch::stamp_plan(PLAN, &i.fingerprint);
     }
-    // ★ 只清**当前存档**的局内状态；别的存档的缓存在各自的目录里，互不影响。
+    // 只清**当前存档**的局内状态；别的存档的缓存在各自的目录里，互不影响。
     oni_engine::saveswitch::clear_save_state();
     let n = v.get("nodes").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
     println!("✅ plan.json 已按模板重置（{n} 个节点，全部 todo）");
@@ -646,7 +693,7 @@ fn cmd_plan_reset() -> anyhow::Result<()> {
 
 /// **开局资源侦察**：探测关键资源分布并落盘 ~/.oni-agent/scout.json。
 ///
-/// ★ 事故 9 的对策：不知道资源在哪就深挖 → 挖开地下 CO₂ → 三人全灭。
+///  的对策：不知道资源在哪就深挖 → 挖开地下 CO₂ → 三人。
 fn cmd_scout() -> anyhow::Result<()> {
     let s = connect()?;
     let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -661,8 +708,8 @@ fn cmd_scout() -> anyhow::Result<()> {
 /// 用法：`oni restart [存档索引]`（索引来自 `oni call game_control {"domain":"save","action":"list"}`）
 /// 不给索引时用最近的一个 auto_save（Cycle N）。
 ///
-/// ★ 为什么需要：换存档后 plan.json 的 done 状态、目标锁、趋势样本都会继承上一局的脏数据，
-///   代理会以为关键步骤做过了 → 开局卡住（实测）。本命令一次性清干净。
+/// 为什么需要：换存档后 plan.json 的 done 状态、目标锁、趋势样本都会继承上一局的脏数据，
+///   代理会以为关键步骤做过了 → 开局卡住（）。本命令一次性清干净。
 fn cmd_restart(args: &[String]) -> anyhow::Result<()> {
     let s = connect()?;
     let list = s
@@ -682,7 +729,7 @@ fn cmd_restart(args: &[String]) -> anyhow::Result<()> {
         }
         let cols: Vec<&str> = t.split(',').collect();
         let idx: usize = cols.first().and_then(|x| x.trim().parse().ok()).unwrap_or(usize::MAX);
-        // ★ 用 name（第3列，"小队 Cycle 4"）而不是 fileName（"小队 Cycle 4.sav"）
+        // 用 name而不是 fileName
         //   —— restart_load 的 name 参数要的是显示名。
         let name = cols.get(2).map(|x| x.trim().to_string()).unwrap_or_default();
         // auto_save 判定：path 里含 auto_save 目录
@@ -927,7 +974,7 @@ fn cmd_pause_resume(args: &[String], pause: bool) -> anyhow::Result<()> {
     let out = s.call_text("game_control", serde_json::json!({
         "domain": "speed", "action": action, "task": format!("oni: {why}")
     })).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // ★ 暂停所有权：CLI 的 pause 来自用户/hook → 落盘 owner=User（跨进程重启保留）；
+    // 暂停所有权：CLI 的 pause 来自用户/hook → 落盘 owner=User（跨进程重启保留）；
     //   resume 是用户显式恢复 → 清掉 owner，代理才能接管。
     if pause {
         oni_engine::control::pause(oni_engine::control::Owner::User, &why);
@@ -938,8 +985,8 @@ fn cmd_pause_resume(args: &[String], pause: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// ★ P1-57：一次读一层地图的 **Visual Spatial Summary**（水体/气室/建筑/植物/危险点），
-///   比逐格 probe 高效一个量级。图层按 32 行分块（layer_192_223.md）。
+/// P1-57：一次读一层地图的 **Visual Spatial Summary**（水体/气室/建筑/植物/危险点），
+///   比逐格 probe 高效一个量级。图层按 32 行分块。
 fn cmd_area(args: &[String]) -> anyhow::Result<()> {
     let y0: i32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(192);
     let y1: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(223);
@@ -953,8 +1000,8 @@ fn cmd_area(args: &[String]) -> anyhow::Result<()> {
         let args = serde_json::json!({ "command": "read", "path": path, "task": "区域摘要" });
         match s.call_text("world_editor", args) {
             Ok(text) => {
-                // 只打印摘要段（Visual Spatial Summary → Grid Map 之前），跳过庞大的网格。
-                // ★ 暂停态下 mod 可能不生成摘要段 → fallback 打印文件头元信息，不空手而归。
+                // 只打印摘要段，跳过庞大的网格。
+                // 暂停态下 mod 可能不生成摘要段 → fallback 打印文件头元信息，不空手而归。
                 let mut in_summary = false;
                 let mut summary_lines: Vec<&str> = Vec::new();
                 let mut header_lines: Vec<&str> = Vec::new();
@@ -1019,7 +1066,7 @@ fn cmd_preflight(args: &[String]) -> anyhow::Result<()> {
                     t.reasons.join("; ")
                 );
             }
-            // ★ 前沿（当前就能开挖的格）：这决定了代理这一轮会下什么单
+            // 前沿（当前就能开挖的格）：这决定了代理这一轮会下什么单
             println!("→ 前沿(可立即开挖) {} 格: {:?}", pf.ready.len(), pf.ready);
             println!("→ 复制人可达格数 = {}", pf.reachable_count);
             println!("→ 预检{}", if pf.ok { "通过" } else { "未通过（不会执行）" });
@@ -1029,11 +1076,11 @@ fn cmd_preflight(args: &[String]) -> anyhow::Result<()> {
             let anchor = args.get(1).ok_or_else(|| anyhow::anyhow!("用法: oni preflight build x,y Prefab"))?;
             let prefab = args.get(2).ok_or_else(|| anyhow::anyhow!("用法: oni preflight build x,y Prefab"))?;
             let def = cat.find(prefab).ok_or_else(|| anyhow::anyhow!("目录里没有 {prefab}"))?;
-            // ★ 2026-11-22 修正：**不能取目录第一个材料**（目录顺序 ≠ 地上有货）。
+            // 修正：**不能取目录第一个材料**（目录顺序 ≠ 地上有货）。
             //   取**第一个真实可用量 > 0** 的；都没有就如实报"需要采建材"。
-            // ★★ 2026-11-22：**材料必须问实时 mod**（oni://buildings/materials），
+            // **材料必须问实时 mod**（oni://buildings/materials），
             //   不能用 catalog 缓存里的 available_kg —— 缓存 TTL 30 分钟，
-            //   库存早就变了（实测：缓存说 0kg，实际地上有 6520kg 砂岩）。
+            //   库存早就变了。
             let live = oni_engine::exec::mod_materials_with_kg(&s, &def.prefab_id);
             let usable = live
                 .iter()

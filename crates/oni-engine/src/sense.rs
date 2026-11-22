@@ -41,7 +41,7 @@ pub struct Dupe {
 impl Dupe {
     /// 所在格是否**不可呼吸**（污染水 / CO₂ / 氯气 / 污染氧 / 真空）。
     ///
-    /// ★ 为什么需要（2026-11-21 复盘）：三次全灭都发生在"人泡在不可呼吸的格里"。
+    /// 为什么需要：三次都发生在"人泡在不可呼吸的格里"。
     ///   代理以前只看得见全局气体比例，看不见**人具体泡在哪** ——
     ///   这一项把人变成一等公民：判定看的是"人所在格"，不是地图平均。
     pub fn in_unbreathable(&self) -> bool {
@@ -80,7 +80,7 @@ pub struct Snapshot {
     pub reach_bounds: Option<(i32, i32, i32, i32)>,
     /// **官方可达格数**（reachability 的 reachableCells）。
     ///
-    /// ★ 用途：估算**生活区**（复制人真正待着的封闭气室）的空气量 ——
+    /// 用途：估算**生活区**（复制人真正待着的封闭气室）的空气量 ——
     ///   全局氧气把殖民地根本够不到的气室也算进去 → 空气红线永远看不见。
     pub reachable_cells: usize,
     pub latency_ms: u128,
@@ -91,7 +91,7 @@ pub struct Snapshot {
     pub pending_orders: Option<i64>,
     /// **施工中**的建筑数（梯子/砖块等在施工队列里）。
     ///
-    /// ★ 为什么单独统计：建筑施工**不是**工单（不在 remainingTrackedOrders 里），
+    /// 为什么单独统计：建筑施工**不是**工单（不在 remainingTrackedOrders 里），
     ///   所以"全员空闲 + 无工单"会误判成空跑 → 代理停机 → 梯子永远铺不完。
     ///   梯子在施工时复制人确实闲着，但那是**有意义的等待**，不能停机。
     pub under_construction: i64,
@@ -126,9 +126,9 @@ impl Default for Snapshot {
 
 impl Snapshot {
     pub fn food_kcal(&self) -> f64 {
-        // ★ P0-58：inventory 全量 totalCaloriesKcal 求和是权威源。
-        //   本局两次误判"收割无效"就是因为只读 diagnostics.foodKcal 这个派生单点
-        //   （淤泥根 800→1600 时它仍显示旧值）。权威源优先，派生值只做 fallback。
+        // P0-58：inventory 全量 totalCaloriesKcal 求和是权威源。
+        //   两次误判"收割无效"就是因为只读 diagnostics.foodKcal 这个派生单点
+        //   。权威源优先，派生值只做 fallback。
         let mut total = 0.0;
         let mut found = false;
         if let Some(items) = self.inventory.get("items").and_then(|i| i.as_array()) {
@@ -190,10 +190,10 @@ impl Snapshot {
     pub fn suffocation_risk(&self) -> String {
         self.atmos_str("suffocationRisk")
     }
-    /// 最高的膀胱百分比（0~100）。
+    /// 最高的膀胱百分比。
     ///
-    /// ★ 为什么要它（2026-11-21 实测根因链）：没有厕所时膀胱满 → 复制人随地排泄
-    ///   → 地面生成**污染水** → 三人泡在污染水里（呼吸 87.5）→ 差点重演事故 7/9。
+    /// 为什么要它：没有厕所时膀胱满 → 复制人随地排泄
+    ///   → 地面生成**污染水** → 三人泡在污染水里→ 差点重演/9。
     ///   所以膀胱是"污染"的**一级预警信号**，必须进调度。
     pub fn max_bladder(&self) -> f64 {
         self.dupes
@@ -224,8 +224,8 @@ impl Snapshot {
     }
     /// **可呼吸气体比例** = 氧气 / (氧气 + CO₂)。
     ///
-    /// ★ 为什么用比例而不是绝对值：密闭空间里氧气总量可以还很可观，
-    ///   但只要 CO₂ 占比高，复制人照样窒息（开局就是这么全灭的）。
+    /// 为什么用比例而不是绝对值：密闭空间里氧气总量可以还很可观，
+    ///   但只要 CO₂ 占比高，复制人照样窒息。
     pub fn breath_ratio(&self) -> f64 {
         let o = self.atmos_num("oxygenMassKg");
         let c = self.co2_kg();
@@ -245,7 +245,7 @@ impl Snapshot {
     }
     /// **进展指纹**：把"殖民地有没有变好"压成一个可比较的串。
     ///
-    /// ★ 为什么需要：上一轮代理连续几十轮重复同一条无效命令
+    /// 为什么需要：上一轮代理连续几十轮重复同一条无效命令
     ///   （挖了但材料不涨、工单被 ONI 取消），看起来"在跑"其实零进展。
     ///   有指纹才能识别"卡住"，进而熔断换方案。
     pub fn progress_fingerprint(&self) -> String {
@@ -272,11 +272,11 @@ impl Snapshot {
     }
     /// **生活区（复制人真正待着的封闭气室）的氧气量**估算。
     ///
-    /// ★★ 为什么必须有这个指标（2026-11-22 陨石坑局复盘）：
+    /// 为什么必须有这个指标：
     ///   全局氧气 394kg、比例 99% —— 看着非常安全；
-    ///   但生活区是个**封闭气室**（开局只有十几格、~20kg 氧气）。
+    ///   但生活区是个**封闭气室**。
     ///   全局指标把「殖民地根本够不到的气室」也算进去 → 空气红线**永远看不见**。
-    ///   上一局（小星2）就是这么死的：全局比例正常，人在封闭区里窒息到 0。
+    ///   上一局就是这么死的：全局比例正常，人在封闭区里窒息到 0。
     ///   口径：全局氧气密度（oxygenKgVisible / 可呼吸格）× 官方可达格数。
     pub fn living_oxygen_kg(&self) -> Option<f64> {
         let cells = self.reachable_cells;
@@ -303,7 +303,7 @@ impl Snapshot {
             .unwrap_or(0)
     }
     pub fn idle_count(&self) -> usize {
-        // ★ 官方原生判定优先：差事名会把"已预约工单但还在走"的人算成空闲 →
+        // 官方原生判定优先：差事名会把"已预约工单但还在走"的人算成空闲
         //   误判成全员空闲 → 守护进程反复停机 → 反而在空跑。
         if let Some(n) = self.native_idle {
             return n;
@@ -312,7 +312,7 @@ impl Snapshot {
     }
     /// **在休息/睡觉**的人数（不算"真的没活干"）。
     ///
-    /// ★ 为什么需要（2026-11-21 优化 P1-8）：
+    /// 为什么需要：
     ///   官方的 workIdleCount 语义是"不在工作日程里" → **睡觉的复制人也算 idle**。
     ///   于是 observe 常年显示"全员空闲 3/3"，看起来像代理卡住，其实他们只是在睡觉。
     ///   这个误判会让守护进程误停机（空跑）或误判无进展（熔断好节点）。
@@ -333,7 +333,7 @@ impl Snapshot {
     }
     /// **真的没活干**的人数：在 idle 里排除掉正在休息的。
     ///
-    /// ★ 这是"代理是不是空转"的正确判据：
+    /// 这是"代理是不是空转"的正确判据：
     ///   全员睡觉 ≠ 全员闲着没事干（他们醒来会干活）；只有真空闲才说明没工单可做。
     pub fn truly_idle_count(&self) -> usize {
         let idle = self.idle_count();
@@ -342,7 +342,7 @@ impl Snapshot {
     }
     /// 是否有复制人**倒地/失去行动能力**。
     ///
-    /// ★ 为什么必须单独识别（2026-11-21 致命事故）：
+    /// 为什么必须单独识别：
     ///   倒地的复制人**不会去执行任何差事** —— 代理还在下挖掘工单、以为工单会被完成，
     ///   结果三个人在 CO₂ 泡到死。看见倒地就必须立刻转入救援（排毒/拖到有空气处/治疗）。
     pub fn downed_count(&self) -> usize {
@@ -382,7 +382,7 @@ pub fn sense(session: &McpSession) -> Snapshot {
     let t0 = Instant::now();
     let mut errors: Vec<String> = Vec::new();
 
-    // ★ 官方原生空闲事实：step_facts 的 workIdleCount（不恢复游戏，只读事实）
+    // 官方原生空闲事实：step_facts 的 workIdleCount（不恢复游戏，只读事实）
     // 官方建筑索引 → prefabId 计数（计划的"梯子/砖块数量"判据靠它）
     let buildings: Value = session
         .call_text(
@@ -400,10 +400,10 @@ pub fn sense(session: &McpSession) -> Snapshot {
                 if cols.len() < 4 || cols[2].is_empty() {
                     continue;
                 }
-                // ★ 跳过表头/分隔行（2026-11-21 实测 bug）：
+                // 跳过表头/分隔行：
                 //   表头 `| Building | Prefab | ID | Position | ... |` 的 cols[2]="Prefab"
                 //   → 被当成一个叫 "Prefab" 的建筑计入 → 计数污染，
-                //   observe 还会显示成 "建筑 Prefab 4"（看起来像建了 4 个）。
+                //   observe 还会显示成 "建筑 Prefab 4"。
                 if cols[2] == "Prefab" || cols[2].chars().all(|c| c == '-') {
                     continue;
                 }
@@ -455,7 +455,7 @@ pub fn sense(session: &McpSession) -> Snapshot {
             .and_then(|l| l.split(':').nth(1))
             .and_then(|v| v.trim().parse::<i64>().ok())
     });
-    // ★ 删掉了重复的 step_facts 调用（原来调了两次，白花一次 MCP 往返）。
+    // 删掉了重复的 step_facts 调用（原来调了两次，白花一次 MCP 往返）。
 
     let mut raw: BTreeMap<&str, Value> = BTreeMap::new();
     let results: Vec<(&str, &str, Result<Value, String>)> = SOURCES
@@ -475,14 +475,14 @@ pub fn sense(session: &McpSession) -> Snapshot {
     }
 
     // 可达包络（虚拟文件）
-    // ★ 同一个文件里顺便取「可达格数」→ 用来估算生活区空气量（不额外加 MCP 压力）
+    // 同一个文件里顺便取「可达格数」→ 用来估算生活区空气量（不额外加 MCP 压力）
     let reach_text = session
         .call_text(
             "world_editor",
             serde_json::json!({ "command": "read", "path": "/active/dupes/reachability.md", "confirm": true, "task": "SENSE: 可达包络" }),
         )
         .ok();
-    // ★ 可达格数（官方 reachableCells，取第一处 = 全体并集）
+    // 可达格数（官方 reachableCells，取第一处 = 全体并集）
     let reachable_cells = reach_text
         .as_deref()
         .and_then(|t| {

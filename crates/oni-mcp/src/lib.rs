@@ -1,6 +1,6 @@
 //! oni-mcp —— 我们自己的 MCP（Model Context Protocol）客户端。
 //!
-//! 协议：MCP `2025-11-25` over Streamable HTTP（`http://127.0.0.1:8788/mcp/`）。
+//! 协议：MCP `2025-11-25` over Streamable HTTP。
 //!
 //! 设计要点（来自实战教训）：
 //! * **持久 session**：握手一次、复用 `Mcp-Session-Id`，不要每次读数都重连。
@@ -24,7 +24,7 @@ pub use transport::{McpError, Transport, PROTOCOL_VERSION};
 /// **代理状态目录**：`~/.oni-agent`。
 ///
 /// 仓库改名后统一走这里；旧目录 `~/.oni-mcp` 首次访问时自动迁移，
-/// 免得丢缓存（建造目录 137 项要重新抓）与趋势样本。
+/// 免得丢缓存与趋势样本。
 pub fn state_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let new = std::path::PathBuf::from(&home).join(".oni-agent");

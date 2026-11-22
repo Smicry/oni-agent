@@ -14,7 +14,7 @@ pub const WILDCARD: &str = ".*";
 
 /// 生成建造 token。
 ///
-/// ★ 关键（2026-11-21 实测）：material 为空时**绝不能**留下 `Prefab:7#` 的悬空 `#`。
+/// 关键：material 为空时**绝不能**留下 `Prefab:7#` 的悬空 `#`。
 /// `Ladder` 的 `availableMaterials` 是空数组 → 旧代码拼出 `Ladder:7#SandStone`，
 /// mod 报 `Unsupported map cell transitions ... x->Ladder:7#`（材料不在白名单 +
 /// 悬空 `#`）→ 梯子永远铺不下去 → 竖井挖不动。**空材料必须省略整个 `#` 段**。
@@ -127,7 +127,7 @@ pub fn patch_wild(
         let mut r_cells = vec![WILDCARD.to_string(); map.xs.len()];
         for (x, tok) in changes {
             let i = map.xs.iter().position(|v| v == x).unwrap();
-            // ★ 目标格也用通配符：补丁与复制人位置无关 →
+            // 目标格也用通配符：补丁与复制人位置无关
             //   游戏在跑时复制人移动会让精确 token 补丁 SEARCH 失配（落地失败）。
             s_cells[i] = WILDCARD.to_string();
             r_cells[i] = tok.clone();
@@ -159,7 +159,7 @@ pub fn apply_build(
             }),
         )
         .map_err(|e| e.to_string())?;
-    // ★ 判定成功的依据：mod 成功时返回 `ok: true`（首行），失败时首行是 `ok: false`。
+    // 判定成功的依据：mod 成功时返回 `ok: true`（首行），失败时首行是 `ok: false`。
     //   旧写法 `!out.contains("ok: false")` 会把**正文里任何**提到 ok:false 的
     //   字样误判成失败（例如 details 里嵌套的子结果）。改成看首行 + applied。
     let first = out.lines().next().unwrap_or("").trim();

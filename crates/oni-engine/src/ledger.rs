@@ -40,15 +40,15 @@ pub fn ledger(s: &Snapshot, t: &Trend) -> Ledger {
         }
     }
     if let Some(oc) = oxygen_cycles {
-        warnings.push(format!("氧气 ≈ {:.1} 周期（实测速率）", oc));
+        warnings.push(format!("氧气 ≈ {:.1} 周期（速率）", oc));
         if oc < best {
             best = oc;
             first = format!("缺氧（{oc:.1} 周期）");
         }
     }
-    // ★★ 生活区空气（封闭气室）—— 2026-11-22 新增。
+    // 生活区空气（封闭气室）—— 2026-11-22 新增。
     //   全局氧气把殖民地够不到的气室也算进去 → 上一局就是在「指标正常」中闷死的。
-    //   这里用「生活区氧气量 ÷ 实测每周期耗氧」算续航，比全局口径更接近真实死因。
+    //   这里用「生活区氧气量 ÷ 每周期耗氧」算续航，比全局口径更接近真实死因。
     let living_cycles = s
         .living_oxygen_kg()
         .zip(t.oxygen_per_cycle)

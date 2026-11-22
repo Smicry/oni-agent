@@ -29,21 +29,21 @@ pub struct Node {
     pub success: String,
     /// **救援节点**：有人倒地/窒息时，代理必须优先执行这类节点。
     ///
-    /// ★ 为什么需要（2026-11-21 致命事故）：
+    /// 为什么需要：
     ///   倒地的复制人**不会执行任何差事** —— 代理还在下挖掘工单也白搭，
     ///   人继续泡在 CO2 里直到死亡。救援节点优先级高于一切普通施工。
     #[serde(default)]
     pub rescue: bool,
     #[serde(default)]
     pub note: String,
-    /// ★ P0-54 显式优先级：survival/rescue/urgent/normal。
+    /// P0-54 显式优先级：survival/rescue/urgent/normal。
     ///   decide() 先按 priority，再按 unlocks，最后按文件顺序。
     ///   解决"食物只剩 2 周期却因 unlocks=0 排最后"的问题。
     #[serde(default)]
     pub priority: Option<String>,
     /// **暂不可执行的原因**（如被研究锁）。
     ///
-    /// ★ 与 `blocked`（熔断）严格区分（2026-11-21 实测）：
+    /// 与 `blocked`（熔断）严格区分：
     ///   - `blocked` = 连续无进展熔断 → 代理反复试同一个方案 → 必须换方案；
     ///   - `research_locked` = **外部条件未满足**（研究没完成）→ 试多少次都一样，
     ///     但**不是代理的错** → 不该反复试、也不该冻回停摆，应该跳过它做别的。
@@ -102,8 +102,8 @@ pub struct Decision {
     /// 死锁解锁：正常模式下没有任何可选节点（全被熔断/完成），
     /// 复活了这批 blocked 节点。agent 需把它们写回 todo。
     ///
-    /// ★ 为什么必须有：熔断是"换方案"，不是"让依赖图永远死掉"。
-    ///   N1 被熔断后 N2/N3/N4 全 requires N1 → 整张图没有 ready →
+    /// 为什么必须有：熔断是"换方案"，不是"让依赖图永远死掉"。
+    ///   N1 被熔断后 N2/N3/N4 全 requires N1 → 整张图没有 ready
     ///   日志刷屏"依赖图里没有可执行目标"，代理彻底停摆（真事故）。
     pub revived: Vec<String>,
 }
@@ -126,12 +126,12 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
         if n.is_done() || (n.is_blocked() && !revive) {
             continue;
         }
-        // ★ 暂不可执行（研究锁 / 连续失败）→ 本轮跳过。
-        //   ★★★ 但**不阻塞下游**（2026-11-21 实测死锁）：
-        //     旧逻辑把 deferred 当成"没完成" → requires 判定不通过 →
+        // 暂不可执行（研究锁 / 连续失败）→ 本轮跳过。
+        //   但**不阻塞下游**：
+        //     旧逻辑把 deferred 当成"没完成" → requires 判定不通过
         //     下游全被挡 → 整张图没有可执行目标 → 代理彻底停摆。
-        //     实测：暂缓 4 个节点 → 下游 7 个节点全被堵 → "依赖图里没有可执行目标"。
-        //   正解：暂缓 = "这条现在做不了"，不是"这条永远做不了" →
+        //     暂缓 4 个节点 → 下游 7 个节点全被堵 → "依赖图里没有可执行目标"。
+        //   正解：暂缓 = "这条现在做不了"，不是"这条永远做不了"
         //     下游照常参与调度（它自己可能不依赖暂缓节点的效果）。
         if n.is_deferred() {
             blocked.push((n.id.clone(), format!("暂缓: {}", n.deferred.clone().unwrap_or_default())));
@@ -140,7 +140,7 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
         let unmet: Vec<&str> = n
             .requires
             .iter()
-            // ★ 依赖里若有被暂缓的节点 → 视为"暂时不阻塞"
+            // 依赖里若有被暂缓的节点 → 视为"暂时不阻塞"
             //   （下游自己可能能做；真做不了时它会自己失败并被暂缓）
             .filter(|r| {
                 let dep_done = done.get(r.as_str()).copied().unwrap_or(false);
@@ -172,7 +172,7 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
         match best {
             None => best = Some(n),
             Some(b) => {
-                // ★ P0-54：先比显式 priority，再比 unlocks（平局取文件靠前，保持原语义）。
+                // P0-54：先比显式 priority，再比 unlocks。
                 let nk = (n.priority_rank(), n.unlocks.len());
                 let bk = (b.priority_rank(), b.unlocks.len());
                 if nk > bk {
@@ -207,10 +207,10 @@ mod tests {
         }
     }
 
-    /// ★★ 暂缓节点**不能阻塞下游**（2026-11-21 实测死锁）。
+    /// 暂缓节点**不能阻塞下游**。
     ///
-    /// 旧逻辑：deferred 当成"没完成" → requires 不通过 → 下游全被挡 →
-    /// 整张图没有可执行目标 → 代理彻底停摆（实测暂缓 4 个节点 → 7 个下游被堵）。
+    /// 旧逻辑：deferred 当成"没完成" → requires 不通过 → 下游全被挡
+    /// 整张图没有可执行目标 → 代理彻底停摆。
     #[test]
     fn deferred_node_does_not_block_downstream() {
         let plan = Plan {
@@ -237,7 +237,7 @@ mod tests {
         assert!(chosen.is_none(), "暂缓节点本轮不应被选中");
     }
 
-    /// ★ P0-54：显式 priority 优先于 unlocks 数量。
+    /// P0-54：显式 priority 优先于 unlocks 数量。
     ///   食物告急节点 unlocks=0 但 priority=urgent，必须排在 unlocks=3 的 normal 节点前。
     #[test]
     fn priority_beats_unlock_count() {
@@ -255,9 +255,9 @@ mod tests {
     }
 }
 
-/// 选节点：只看"前置已完成"的节点；在这些里选**能解锁最多下游**的那个（平局取文件顺序）。
+/// 选节点：只看"前置已完成"的节点；在这些里选**能解锁最多下游**的那个。
 ///
-/// ★ 死锁兜底：正常模式无任何可选节点时，复活所有 blocked 节点重试。
+/// 死锁兜底：正常模式无任何可选节点时，复活所有 blocked 节点重试。
 ///   熔断是为了换方案，不是让整张依赖图停摆。agent 会把 revived 里的节点写回 todo。
 pub fn decide(plan: &Plan) -> Decision {
     let (chosen, ready, blocked) = decide_inner(plan, false);

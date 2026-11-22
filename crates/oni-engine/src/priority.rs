@@ -1,8 +1,8 @@
 //! 实时优先级调度器：每轮根据**当前真实状态**算出"最该做什么"，
 //! 能打断静态依赖图（plan.json）。
 //!
-//! ★ 为什么需要（2026-11-21 三次全灭的复盘结论）：
-//!   事故 1/2/3/5/6 的共同根因是**代理看不见人** —— 观察的是材料/建筑/气体总量，
+//! 为什么需要：
+//!   /2/3/5/6 的共同根因是**代理看不见人** —— 观察的是材料/建筑/气体总量，
 //!   没有"每个人现在怎么样"。等 plan.json 反应过来时人已经没了。
 //!   所以调度必须**实时**：每轮重新评估，能抢占当前节点。
 //!
@@ -10,7 +10,7 @@
 //!
 //! | Level | 触发 | 动作 |
 //! |---|---|---|
-//! ★ 事故 8 铁律（2026-11-21）：氧气续航告急时**禁止扩张性挖掘** ——
+//!  铁律：氧气续航告急时**禁止扩张性挖掘** ——
 //!   挖开会暴露地下 CO₂，在缺氧时是负收益。必须先产氧，不能越缺氧越挖地表。
 //!
 //! | 3 救命 | 有人失去行动能力 | 救援：排毒 / 拖到有空气处 / 治疗 |
@@ -40,7 +40,7 @@ pub struct Directive {
     pub action: Action,
     /// **禁止扩张性挖掘**（挖地表/开拓新矿层）。
     ///
-    /// ★ 事故 8：缺氧时挖掘暴露地下 CO₂ 是负收益，会让氧气掉得更快。
+    /// ：缺氧时挖掘暴露地下 CO₂ 是负收益，会让氧气掉得更快。
     ///   为 true 时 agent 必须跳过换气/地表/挖矿类节点，只做产氧/救援/食物。
     pub forbid_expansion: bool,
 }
@@ -60,7 +60,7 @@ pub enum Action {
     ForageFood,
     /// 供电：接电网
     Power,
-    /// 建厕所（膀胱告急 → 随地排泄 → 污染水）
+    /// 建厕所
     BuildToilet,
 }
 
@@ -81,14 +81,14 @@ impl Action {
 
 /// 呼吸值低于此值 = 危险（与 judge 的红线一致）。
 pub const URGENT_BREATH: f64 = 50.0;
-/// 氧气续航低于此周期数 = 禁止扩张性挖掘，产氧优先（事故 8）。
+/// 氧气续航低于此周期数 = 禁止扩张性挖掘，产氧优先（）。
 pub const OXYGEN_CYCLES_CRITICAL: f64 = 3.0;
 /// food runway below this -> forage first (incident 8).
 pub const FOOD_CYCLES_CRITICAL: f64 = 0.5;
 /// 膀胱超过此百分比且**没有厕所** → 判定必须建厕所。
 ///
-/// ★ 2026-11-21 实测根因链：没厕所 → 膀胱满 → 随地排泄 → 污染水 →
-///   三人泡在污染水里（呼吸 87.5）→ 差点重演事故 7/9。
+/// 根因链：没厕所 → 膀胱满 → 随地排泄 → 污染水
+///   三人泡在污染水里→ 差点重演/9。
 ///   厕所是**污染的一级预防**，不是舒适度需求。
 pub const BLADDER_CRITICAL: f64 = 80.0;
 
@@ -136,12 +136,12 @@ pub fn direct(
         }
     }
 
-    // ---- Level 2：stress **相对基线**显著上升（窒息的早期预警，比呼吸值掉 0 早几分钟）----
-    //  ★ 量纲纪律：maxStress 是 0–100 制的百分比。开局三个人的基线就有 4.4~4.7（完全正常）。
-    //    旧代码用固定绝对阈值 3.0 → 每轮都判"有人在受苦" → 抢占正常计划 → 卡死开局（实测）。
-    //  ★ 正确判据：**相对近期基线的上升量**（trend::stress_baseline + STRESS_RISE_DELTA）。
-    //    事故证据：死亡前 stress 0.0 → 3.3 → 5.1（基线 0，上升 3.3）—— 相对上升抓得住，
-    //    绝对阈值抓不住（4.4 的常态基线会天天误报）。
+    // ---- Level 2：stress **相对基线**显著上升----
+    //  量纲纪律：maxStress 是 0–100 制的百分比。开局三个人的基线就有 4.4~4.7（完全正常）。
+    //    旧代码用固定绝对阈值 3.0 → 每轮都判"有人在受苦" → 抢占正常计划 → 卡死开局（）。
+    //  正确判据：**相对近期基线的上升量**（trend::stress_baseline + STRESS_RISE_DELTA）。
+    //    事故证据：死亡前 stress 0.0 → 3.3 → 5.1—— 相对上升抓得住，
+    //    绝对阈值抓不住。
     if stress_rising {
         return Directive {
             level: Level::Urgent,
@@ -155,8 +155,8 @@ pub fn direct(
         };
     }
 
-    // ---- Level 2：氧气完全冻结 = 人已经不再呼吸（比"呼吸值掉 0"早好几分钟）----
-    //  ★ 必须有**旁证**才报警（2026-11-21 事故 7）：
+    // ---- Level 2：氧气完全冻结 = 人已经不再呼吸----
+    //  必须有**旁证**才报警：
     //    复制人闲着/睡觉时耗氧极小 → 可见氧气读数几乎不变 → 误判"人不再呼吸"
     //    → 抢占正常计划 → 开局被劫持。
     //    真正的死亡信号是**呼吸值掉下来 / 胁迫飙升**，氧气冻结只是辅助证据。
@@ -186,7 +186,7 @@ pub fn direct(
     // ---- Level 1：按判定结果选主题 ----
     if judgment.verdict == Verdict::Danger {
         let action = if judgment.danger_keys.iter().any(|k| k == "oxygen") {
-            // ★ 事故 8：氧气耗尽 → 产氧优先，绝不 Ventilate（挖地表暴露 CO₂ 是负收益）
+            // ：氧气耗尽 → 产氧优先，绝不 Ventilate（挖地表暴露 CO₂ 是负收益）
             Action::ProduceOxygen
         } else if judgment.danger_keys.iter().any(|k| k.starts_with("air") || k.starts_with("co2") || k.starts_with("suffocation")) {
             Action::Ventilate
@@ -207,19 +207,19 @@ pub fn direct(
         };
     }
 
-    // ---- Level 1：膀胱告急 → 必须有厕所（2026-11-21 实测根因链）----
-    //  ★ 完整根因链（实测）：开局没有厕所 → 复制人膀胱涨到 97% →
-    //    膀胱满又没厕所 → 随地排泄 → 地面生成**污染水**（DirtyWater）→
-    //    污染水沿刚挖开的竖井底向西蔓延 → 三人泡在污染水里（呼吸掉到 87.5）→
-    //    代理还在他们脚下开井 → 走���事故 7/9 的死亡路径。
-    //  ★ 所以"厕所"不是舒适度需求，而是**污染的一级预防**。
+    // ---- Level 1：膀胱告急 → 必须有厕所----
+    //  完整根因链（）：开局没有厕所 → 复制人膀胱涨到 97%
+    //    膀胱满又没厕所 → 随地排泄 → 地面生成**污染水**（DirtyWater）
+    //    污染水沿刚挖开的竖井底向西蔓延 → 三人泡在污染水里
+    //    代理还在他们脚下开井 → 走���/9 的死亡路径。
+    //  所以"厕所"不是舒适度需求，而是**污染的一级预防**。
     let max_bladder = snap.max_bladder();
     if max_bladder > BLADDER_CRITICAL && snap.building("toilets") < snap.dupes.len() as i64 {
         return Directive {
         level: Level::Urgent,
         reason: format!(
             "🚽 膀胱已达 {max_bladder:.0}%（阈值 {BLADDER_CRITICAL}）且**厕所数 {} < 人口 {}** → \\
-            随地排泄会生成污染水（实测三人已泡在污染水里）→ 立刻建厕所",
+            随地排泄会生成污染水（三人已泡在污染水里）→ 立刻建厕所",
             snap.building("toilets"),
             snap.dupes.len(),
         ),
@@ -231,17 +231,17 @@ pub fn direct(
     // ---- Level 1：有人在不可呼吸的格子里（最精确的信号）----
     let in_bad = snap.dupes.iter().filter(|d| d.in_unbreathable()).count();
     if in_bad > 0 {
-        // ★ 人在不可呼吸格 **且** 呼吸值真的低 → Urgent（真危险，抢占救人）。
-        //   人在 CO₂ 格但呼吸 100（AGENTS.md §6：CO₂ 洞穴的常态差事，不是危急信号）
+        // 人在不可呼吸格 **且** 呼吸值真的低 → Urgent（真危险，抢占救人）。
+        //   人在 CO₂ 格但呼吸 100
         //   → 降级为 Watch：只记行动项，**不抢占**正常计划。
-        //   ★ 为什么必须这样（2026-11-21 实测）：
-        //     旧逻辑不看 breath 值 → 每轮都判 Urgent → 抢占"换气"节点 →
+        //   为什么必须这样：
+        //     旧逻辑不看 breath 值 → 每轮都判 Urgent → 抢占"换气"节点
         //     研究站（可持续产氧链）被饿死 → 代理单点反复挖 → 局面不可持续。
-        // ★★★ 事故 13（吉恩之死）：全局 min_breath + 阈值 50 太宽 ——
-        //   人在 CO₂ 里发电时呼吸值一路 100→93→88→77，代理一直判"常态差事"→
+        // （吉恩之死）：全局 min_breath + 阈值 50 太宽 ——
+        //   人在 CO₂ 里发电时呼吸值一路 100→93→88→77，代理一直判"常态差事"
         //   不抢占 → 他继续待在 CO₂ 里直到归零死亡。
         //   现在只看**身处不可呼吸环境的那部分人**，呼吸值掉到 95 以下就抢占救援；
-        //   读不到呼吸值时保守判危险（AGENTS.md §13.6）。
+        //   读不到呼吸值时保守判危险。
         let bad_breaths: Vec<f64> = snap
             .dupes
             .iter()
@@ -268,9 +268,9 @@ pub fn direct(
         };
     }
 
-    // ---- Level 2：氧气续航告急 → 产氧优先 + 禁止扩张性挖掘（事故 8 核心修复）----
-    //  ★ 为什么不能继续 Ventilate（挖地表）：氧气快见底时，挖开会暴露地下 CO₂，
-    //    让可呼吸气体掉得更快 —— 实测把 245kg 氧气的一局推到 149kg 死亡螺旋。
+    // ---- Level 2：氧气续航告急 → 产氧优先 + 禁止扩张性挖掘（ 核心修复）----
+    //  为什么不能继续 Ventilate（挖地表）：氧气快见底时，挖开会暴露地下 CO₂，
+    //    让可呼吸气体掉得更快 —— 把 245kg 氧气的一局推到 149kg 死亡螺旋。
     //    正确做法：停止一切扩张，只做产氧/救援/食物。
     let o2_critical = oxygen_cycles_left
         .map(|c| c < OXYGEN_CYCLES_CRITICAL)
@@ -287,7 +287,7 @@ pub fn direct(
         };
     }
 
-    // ---- Level 1：食物续航告急 → 补给优先（事故 8）----
+    // ---- Level 1：食物续航告急 → 补给优先（）----
     let food_critical = food_cycles_left.map(|c| c < FOOD_CYCLES_CRITICAL).unwrap_or(false);
     if food_critical {
         return Directive {
@@ -299,7 +299,7 @@ pub fn direct(
     }
 
     // ---- Level 1：空气比例低（还没到危险线，但趋势明确）----
-    //   ★ 只有在**确实读到气体数据**时才用比例判断；读不到就别假设"空气差"。
+    //   只有在**确实读到气体数据**时才用比例判断；读不到就别假设"空气差"。
     let has_atmos = snap.atmos.get("oxygenMassKg").and_then(|v| v.as_f64()).is_some();
     let breath = snap.breath_ratio();
     if has_atmos && breath < 0.75 {
@@ -342,10 +342,10 @@ mod tests {
         }
     }
 
-    /// ★ 膀胱告急 + 没有厕所 → 必须抢占到"建厕所"。
+    /// 膀胱告急 + 没有厕所 → 必须抢占到"建厕所"。
     ///
-    /// 根因链（2026-11-21 实测）：没厕所 → 膀胱满 → 随地排泄 → 污染水 →
-    /// 三人泡在污染水里（呼吸 87.5）→ 差点重演事故 7/9。
+    /// 根因链：没厕所 → 膀胱满 → 随地排泄 → 污染水
+    /// 三人泡在污染水里→ 差点重演/9。
     #[test]
     fn high_bladder_without_toilet_triggers_build_toilet() {
         let mut snap = Snapshot::default();
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(dir.level, Level::Urgent);
     }
 
-    /// ★ 有厕所时膀胱告急**不该**抢占（厕所本身不是问题）。
+    /// 有厕所时膀胱告急**不该**抢占（厕所本身不是问题）。
     #[test]
     fn high_bladder_with_toilet_does_not_trigger() {
         let mut snap = Snapshot::default();
@@ -372,9 +372,9 @@ mod tests {
         assert_ne!(dir.action, Action::BuildToilet);
     }
 
-    /// ★ 2026-11-22 实测：厕所是**人均资源** —— 1 个旱厕给 3 个人用会排队，
-    ///   膀胱照样涨到 80%+（实测三人 80.6/82.4/84.2）→ 随地排泄 →
-    ///   污染水 → 事故 7/9 的死亡路径。
+    /// 厕所是**人均资源** —— 1 个旱厕给 3 个人用会排队，
+    ///   膀胱照样涨到 80%+→ 随地排泄
+    ///   污染水 → /9 的死亡路径。
     ///   旧逻辑只在"零厕所"时抢占 → 3 人 1 厕永远不建第二个 → 膀胱红线失守。
     #[test]
     fn high_bladder_with_one_toilet_for_three_triggers() {
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(dir.action, Action::BuildToilet, "1 个厕所 3 个人 → 排队 → 必须加厕所");
     }
 
-    /// ★★★ 事故 13（吉恩之死）：人在**不可呼吸环境**里、呼吸值 77~93 时**必须**抢占救援。
+    /// （吉恩之死）：人在**不可呼吸环境**里、呼吸值 77~93 时**必须**抢占救援。
     ///   旧逻辑用全局 min_breath < 50 → 人在 CO₂ 里慢慢窒息时一直不抢占 → 归零死亡。
     #[test]
     fn breather_in_co2_with_falling_breath_triggers_rescue() {
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(dir.level, Level::Urgent, "CO₂ 里呼吸值掉到 88 必须抢占救援");
     }
 
-    /// ★ 2026-11-22：危险格判据按**浓度**校准 ——
+    /// 危险格判据按**浓度**校准 ——
     ///   基地 CO₂ 只有 ~1.15kg/格时复制人呼吸仍是 100（不算危险），
     ///   但污染水/真空/污染氧/氯气永远算危险。
     ///   一刀切排除 CO₂ 会让发电选址全否 → 永远造不出发电机 → 基地永远没氧气。
@@ -462,7 +462,7 @@ mod tests {
     }
 
 
-    /// ★ 事故 8：氧气续航告急时产氧优先 + 禁止扩张性挖掘。
+    /// ：氧气续航告急时产氧优先 + 禁止扩张性挖掘。
     ///   氧气 2 周期、比例 0.5 → 必须 ProduceOxygen 且 forbid_expansion。
     #[test]
     fn low_oxygen_forbids_expansion() {
@@ -486,7 +486,7 @@ mod tests {
         assert!(!d.forbid_expansion, "氧气充足不应禁止扩张");
     }
 
-    /// ★ 人在 CO₂ 格但呼吸正常 → 只记行动项，不抢占（避免饿死研究站）。
+    /// 人在 CO₂ 格但呼吸正常 → 只记行动项，不抢占（避免饿死研究站）。
     #[test]
     fn unbreathable_cell_with_healthy_breath_does_not_preempt() {
         let mut snap = Snapshot::default();
@@ -519,14 +519,14 @@ mod tests {
         let mut snap = Snapshot::default();
         snap.dupes.push(mk_dupe("空闲", 100.0, "氧气"));
         let judgment = crate::judge::judge(&snap, None);
-        // ★ 2026-11-22：阈值改成 0.5 周期（真正快饿死了）才抢占。
+        // 阈值改成 0.5 周期（真正快饿死了）才抢占。
         let d = direct(&snap, &judgment, Some(10.0), false, false, Some(20.0), Some(0.4));
         assert_eq!(d.action, Action::ForageFood);
         assert_eq!(d.level, Level::Watch);
     }
 
-    /// ★★ 2026-11-22 实测教训：食物"还够 2 周期"时**不该**抢占主线。
-    ///   旧阈值 3.0 → 只要 < 3 周期就永远抢占收割节点 A2 →
+    /// 教训：食物"还够 2 周期"时**不该**抢占主线。
+    ///   旧阈值 3.0 → 只要 < 3 周期就永远抢占收割节点 A2
     ///   surface（挖地表）/供电/研究全部饿死，代理 10 秒一轮重复收割。
     ///   收割是**应急**手段，不能当成常态调度器。
     #[test]

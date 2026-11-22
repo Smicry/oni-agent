@@ -1,10 +1,10 @@
 //! 存档身份 + **按存档隔离的状态目录**。
 //!
-//! ★ 为什么（2026-11-22 小星局实测）：
+//! 为什么：
 //!   换存档后，上一局的 plan.json（全 done）、目标锁、侦察报告、趋势样本
 //!   全被新局继承 → 代理拿着旧计划空转 40 分钟（"依赖图里没有可执行目标"）。
 //!
-//! ★ 记忆分层（三层，各司其职，别混）：
+//! 记忆分层（三层，各司其职，别混）：
 //!   1. **局内缓存**（本存档）：saves/<指纹>/ 下的 plan 归档 / 目标锁 / 侦察报告 /
 //!      趋势样本 / 实时快照。换局自动丢弃，不跨局污染。
 //!   2. **跨局可复用状态**（进程级）：catalog.json（建造目录）、mcp_slots（闸门）、
@@ -26,7 +26,7 @@ use crate::session::McpSession;
 pub struct SaveId {
     /// 指纹：存档名 + 世界名 + 世界 id + 打印舱锚点 的哈希。
     ///
-    /// ★ 只用**存档内不变**的事实：换存档可能同名（实测两局都叫"讨人厌的实验室"），
+    /// 只用**存档内不变**的事实：换存档可能同名，
     /// 用 dupe id / 建筑数 / 周期数都会误判（dupe 会死会来，建筑会越建越多）。
     pub fingerprint: String,
     #[serde(default)]
@@ -73,7 +73,7 @@ pub fn save_dir(fp: &str) -> PathBuf {
 
 /// **局内**状态文件路径（按当前存档指纹隔离）。
 ///
-/// 还没识别出存档时退回根目录（兼容旧布局，且不会污染别的存档）。
+/// 还没识别出存档时退回根目录。
 pub fn save_file(name: &str) -> PathBuf {
     match current() {
         Some(id) => save_dir(&id.fingerprint).join(name),
@@ -102,7 +102,7 @@ pub fn remember(id: &SaveId) {
     let _ = std::fs::write(p, serde_json::to_string_pretty(id).unwrap_or_default());
 }
 
-/// 指纹（FNV-1a 64bit，不引新依赖）。
+/// 指纹。
 pub fn fingerprint_of(parts: &[&str]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for p in parts {
@@ -191,9 +191,9 @@ fn printing_pod_anchor(session: &McpSession) -> Option<String> {
 
 /// 存档名归一化：去掉自动存档的「 Cycle N」后缀。
 ///
-/// ★ 2026-11-22 实测踩坑：ONI 的自动存档叫「存档名 Cycle 6」，
-///   读一次自动存档 = 存档名变了 = 指纹变了 = 代理以为换存档 →
-///   **把正在跑的计划冲成模板**（本局就这么丢过一次定制计划）。
+/// 踩坑：ONI 的自动存档叫「存档名 Cycle 6」，
+///   读一次自动存档 = 存档名变了 = 指纹变了 = 代理以为换存档
+///   **把正在跑的计划冲成模板**（就这么丢过一次定制计划）。
 ///   周期号是"第几个周期"，不是"哪一局" ⇒ 不能进指纹。
 pub fn normalize_save_name(raw: &str) -> String {
     let t = raw.trim();

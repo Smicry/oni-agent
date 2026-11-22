@@ -25,7 +25,7 @@ pub enum Kind {
 /// **关键建筑保护区**：这些建筑被压/被拆 = 殖民地直接完蛋。
 ///
 /// 打印舱是**唯一的新人来源**，人力发电机是唯一的电源。
-/// 本局就被压过一次：存储箱盖在电线（打印舱供电）上。
+/// 就被压过一次：存储箱盖在电线（打印舱供电）上。
 pub const PROTECTED: &[&str] = &[
     "Headquarters", "ManualGenerator", "Electrolyzer", "Battery", "BatteryMedium", "BatterySmart",
 ];
@@ -35,7 +35,7 @@ pub struct Grid {
     pub cells: HashMap<(i32, i32), Kind>,
     /// **地板砖（Tile）**占格 —— `OnFloor` 建筑只认它当支撑（天然岩石不算）。
     ///
-    /// ★ 见 `is_floor_tile()` 的注释：这是 2026-11-21 实测踩的坑。
+    /// 见 `is_floor_tile()` 的注释：这是 2026-11-21 踩的坑。
     pub floor_tiles: HashSet<(i32, i32)>,
 }
 
@@ -107,8 +107,8 @@ fn kind_of(token: &str, building_glyphs: &HashSet<String>) -> Kind {
 /// 两种来源格式一致：三个 X 表头（百位/十位/个位）+ `Y=<row>: tok tok ┆ tok ...` 行。
 /// 展开一行的 token 列表（处理 RLE 压缩）。
 ///
-/// ★ 分层地图文件（`/active/map/layers/*.md`）用 RLE：`?x5` = 5 个 `?`，
-///   `Ox3` = 3 个 `O`。**不解 RLE 会让所有坐标错位**（整行只对上 1 列）。
+/// 分层地图文件（`/active/map/layers/*.md`）用 RLE：`?x5` = 5 个 `?`，
+///   `Ox3` = 3 个 `O`。**不解 RLE 会让所有坐标错位**。
 ///   viewport.md 在 compact=false 下不用 RLE，但同一套解析器能兼容两者。
 fn expand_row_tokens(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(256);
@@ -199,7 +199,7 @@ mod tests {
 }
 /// 世界纵向分层：每层 32 行。mod 的 `/active/map/layers/` 按这个粒度切。
 const LAYER_HEIGHT: i32 = 32;
-/// 层文件数量上限（Y=0..383，即 12 层）。
+/// 层文件数量上限。
 const MAX_LAYERS: usize = 12;
 
 impl Grid {
@@ -221,20 +221,20 @@ impl Grid {
         let cells = parse_map_text(&text, &building_glyphs);
         let mut grid = Grid { cells, floor_tiles: HashSet::new() };
         grid.mark_protected(session);
-        // ★★ 必须同时标记**全部**建筑的占格（2026-11-21 实测）：
+        // 必须同时标记**全部**建筑的占格：
         //   旧代码只调 mark_protected（关键建筑保护区），没调 mark_official_buildings
-        //   → 打印舱/口粮箱/研究站的**内部格子**在网格里仍是 Gas（空地）→
-        //   预检选中 (127,189) 这种"打印舱肚子里"的格子 →
-        //   落地报 occupied_by_building → 发电机/烤箱永远造不成（实测连撞两次）。
+        //   → 打印舱/口粮箱/研究站的**内部格子**在网格里仍是 Gas（空地）
+        //   预检选中 (127,189) 这种"打印舱肚子里"的格子
+        //   落地报 occupied_by_building → 发电机/烤箱永远造不成（连撞两次）。
         grid.mark_official_buildings(session, catalog);
         Ok(grid)
     }
 
     /// 读**全图**（不受相机视野限制）。
     ///
-    /// ★ 为什么需要：`viewport.md` 只有相机看得见的 65×41 —— 换一张大地图、
+    /// 为什么需要：`viewport.md` 只有相机看得见的 65×41 —— 换一张大地图、
     ///   或者把相机移开，"到地表要挖几格""哪个气室在憋 CO₂"就全算错了。
-    ///   mod 提供 `/active/map/layers/layer_<y0>_<y1>.md`（全宽 X=0~255，按 Y 每 32 行一层），
+    ///   mod 提供 `/active/map/layers/layer_<y0>_<y1>.md`，
     ///   逐层读就能拿到整张星体的地形。
     ///
     /// 层是**按需读**的：只读覆盖 [y_lo, y_hi] 的层，其余跳过。
@@ -283,14 +283,14 @@ impl Grid {
         }
         let mut grid = Grid { cells, floor_tiles: HashSet::new() };
         grid.mark_protected(session);
-        // ★ 2026-11-22 修正：全图加载路径**也要**标记全部建筑占格与地板砖，
+        // 修正：全图加载路径**也要**标记全部建筑占格与地板砖，
         //   否则同一张图在全图模式下预检认为「空地」、在视野模式下认为是「建筑」
-        //   → 两种模式选出的落点互相矛盾（实测：床位/厕所一会儿有落点一会儿没有）。
+        //   → 两种模式选出的落点互相矛盾（床位/厕所一会儿有落点一会儿没有）。
         grid.mark_official_buildings(session, catalog);
         Ok(grid)
     }
 
-    /// 标出关键建筑及其 1 格缓冲（缓冲区也顺便吸收索引锚点偏 1 的误差）。
+    /// 标出关键建筑及其 1 格缓冲。
     fn mark_protected(&mut self, session: &McpSession) {
         let Ok(text) = session.call_text(
             "world_editor",
@@ -310,7 +310,7 @@ impl Grid {
             if !PROTECTED.contains(&prefab) {
                 continue;
             }
-            // ★ 2026-11-22 修正：坐标在 **cols[4]**（cols[3] 是 ID）→ 旧代码永远解析失败
+            // 修正：坐标在 **cols[4]**→ 旧代码永远解析失败
             //   → 打印舱/发电机的保护区**一个都没标上** → 预检允许把建筑压在打印舱上。
             let Some((xs, ys)) = cols[4].trim_start_matches('(').split_once(',') else {
                 continue;
@@ -319,7 +319,7 @@ impl Grid {
                 continue;
             };
             // 4x4 打印舱 / 2x2 发电机：按 4x4 铺（够覆盖），再加 1 格缓冲
-            // ★ 缓冲只包**正交**邻格，不含对角：
+            // 缓冲只包**正交**邻格，不含对角：
             //   打印舱右上角 (133,198) 是最近煤柱的竖井入口，被对角保护挡住就得多挖 6 层。
             for dy in -1..=4 {
                 for dx in -1..=4 {
@@ -359,7 +359,7 @@ impl Grid {
             if prefab.is_empty() {
                 continue;
             }
-            // ★ 2026-11-22 修正：坐标在 **cols[4]**（cols[3] 是 ID）→ 旧代码一栋建筑都没标记
+            // 修正：坐标在 **cols[4]**→ 旧代码一栋建筑都没标记
             //   → 预检把建筑占格当成空地 → 落点必报 occupied_by_building。
             let Some((xs, ys)) = cols[4].trim_start_matches('(').split_once(',') else {
                 continue;
@@ -371,15 +371,15 @@ impl Grid {
                 .and_then(|c| c.find(prefab))
                 .map(|d| (d.width.max(1) as i32, d.height.max(1) as i32))
                 .unwrap_or((1, 1));
-            // ★ 记录**地板砖**（Tile）占格：OnFloor 建筑只认它当支撑。
+            // 记录**地板砖**（Tile）占格：OnFloor 建筑只认它当支撑。
             if prefab == "Tile" {
                 self.floor_tiles.insert((x, y));
                 self.floor_tiles.insert((x - 1, y));
             }
-            // ★ 锚点容错（2026-11-21 实测）：index.md 的 Position 是**建筑判定点**，
+            // 锚点容错：index.md 的 Position 是**建筑判定点**，
             //   而 mod 的实际占格锚点是 cell_X_Y.md 里的 **bottomLeft**。
-            //   打印舱：index 说 (126,189)，但 mod 报的 anchorX 是 125（偏 1 格）→
-            //   按 index 铺的占格整体偏移 → (127,189) 被当成空地 →
+            //   打印舱：index 说 (126,189)，但 mod 报的 anchorX 是 125
+            //   按 index 铺的占格整体偏移 → (127,189) 被当成空地
             //   预检选中那里 → 落地报 occupied_by_building → 发电机/烤箱永远造不成。
             //   正解：三种可能锚点都铺（宁可多保护，不可漏保护）。
             for (ax, ay) in [(x, y), (x - 1, y), (x, y - 1)] {
@@ -403,13 +403,13 @@ impl Grid {
 
     /// 能否当 `OnFloor` 建筑的**人工地板**（地板砖 Tile）。
     ///
-    /// ★ 为什么单独判定（2026-11-21 实测）：
+    /// 为什么单独判定：
     ///   ONI 的 `buildLocationRule=OnFloor` 建筑（人力发电机/旱厕/洗手盆）
-    ///   要求下方是**地板砖**，**天然岩石不算** →
+    ///   要求下方是**地板砖**，**天然岩石不算**
     ///   mod 报 `Unsupported OnFloor building: place floor/support tiles below` +
     ///   `reasonCode=missing_support`。
-    ///   旧预检把天然岩石也当支撑 → 选中"其实不行"的落点 →
-    ///   落地必失败 → 代理无限重试同一个节点（实测发电机失败 10+ 次）。
+    ///   旧预检把天然岩石也当支撑 → 选中"其实不行"的落点
+    ///   落地必失败 → 代理无限重试同一个节点。
     ///
     /// `Kind::Building` 里只有 **Tile（砖块）** 算人工地板；
     ///   其它建筑（打印舱/口粮箱/研究站…）不算。
@@ -419,9 +419,9 @@ impl Grid {
 
     /// 某格能否站人：不是实心/建筑，且**下方能找到地板**。
     ///
-    /// ★ 为什么是"向下扫 8 格"而不是只看 y-1：
+    /// 为什么是"向下扫 8 格"而不是只看 y-1：
     ///   复制人会往下掉，掉完必须站得住。开局打印舱东侧有个 3 层高的空腔，
-    ///   只看 y-1 会把整个空腔判成不可站 → 可达区少一大块 → 预检全灭。
+    ///   只看 y-1 会把整个空腔判成不可站 → 可达区少一大块 → 预检。
     pub fn walkable(&self, c: (i32, i32)) -> bool {
         match self.kind(c) {
             Kind::Ladder => return true,
@@ -444,16 +444,16 @@ impl Grid {
     /// 同 `walkable`，但**官方可达区内的建筑格也算可站**。
     ///
     /// 打印舱门廊、口粮箱这类"占格但实际能走"的建筑，
-    /// 靠渲染 token 猜会把整条走廊掐断（实测 17 格走廊被算成 8 格，
-    /// 于是所有工位都被判"不可达"→ 预检全灭 → 一格也挖不动）。
+    /// 靠渲染 token 猜会把整条走廊掐断（ 17 格走廊被算成 8 格，
+    /// 于是所有工位都被判"不可达"→ 预检 → 一格也挖不动）。
     /// 官方 navigator 的可达包围盒（`/active/dupes/reachability.md`）才是真值。
     pub fn walkable_with(&self, c: (i32, i32), official: &HashSet<(i32, i32)>) -> bool {
-        // ★★★ 2026-11-22 修正（**从项目第一天就存在的致命 bug**）：
-        //   梯子的特判原本写在 `if !open { return false; }` **之后** →
+        // 修正（**从项目第一天就存在的致命 bug**）：
+        //   梯子的特判原本写在 `if !open { return false; }` **之后**
         //   而 match 里没有 Kind::Ladder → 梯子格 open=false → **提前 return false**
         //   → 梯子永远走不到那个特判 → **所有梯子格都被当成墙**。
-        //   后果：网格 BFS 的可达集永远不含梯子 → 爬梯可达集也扩不出来 →
-        //   竖井天花板永远挖不动（实测：梯子铺了 2 格就再也没进展）。
+        //   后果：网格 BFS 的可达集永远不含梯子 → 爬梯可达集也扩不出来
+        //   竖井天花板永远挖不动。
         //   正解：**梯子必须直接进 open 集合**。
         let open = match self.kind(c) {
             Kind::Gas | Kind::Dupe | Kind::Liquid | Kind::Ladder => true,

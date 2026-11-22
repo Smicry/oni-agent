@@ -1,6 +1,6 @@
 //! 地图图结构 —— 把一局地图重建为「气室连通图 + 挖掘路径图」。
 //!
-//! 为什么要有它（2026-11-21 迭代）：
+//! 为什么要有它：
 //! 线性网格只能回答"这一格能不能挖"，回答不了"哪个气室快没气了"、
 //! "从打印舱到地表要挖通几个气室"、"挖哪一层能一次性连通最多空间"。
 //! 把地图变成图之后，这些都能用 BFS / Dijkstra 直接算，代理面对新局面不再靠猜。
@@ -24,7 +24,7 @@ use oni_mcp::{Catalog, McpSession};
 use crate::cell::fetch_many;
 use crate::grid::{Grid, Kind};
 
-/// 每个复制人每周期耗氧（kg）。社区经验值（≈0.1kg/s × 600s/cycle），
+/// 每个复制人每周期耗氧（kg）。社区经验值，
 /// 非官方数值；只用于气室续航的相对比较，不用于生死判定。
 const OXY_PER_DUPE_CYCLE: f64 = 60.0;
 
@@ -53,7 +53,7 @@ impl Chamber {
     pub fn co2_kg(&self) -> f64 {
         self.masses.get("CarbonDioxide").copied().unwrap_or(0.0)
     }
-    /// 危险气体：氯气 / 污染氧（按质量排序，只返回 >0 的）。
+    /// 危险气体：氯气 / 污染氧。
     pub fn hazards(&self) -> Vec<(&str, f64)> {
         let mut v: Vec<(&str, f64)> = [
             ("ChlorineGas", self.masses.get("ChlorineGas").copied().unwrap_or(0.0)),
@@ -109,7 +109,7 @@ pub struct DigRoute {
     pub reaches_surface: bool,
     /// 路径中落在**未探索区**的格数。
     ///
-    /// ★ 为什么要单独记：全图模式覆盖整张星体，但大片区域未探索（地图渲染 `?`）。
+    /// 为什么要单独记：全图模式覆盖整张星体，但大片区域未探索（地图渲染 `?`）。
     ///   寻路会乐观地穿过未探索区 → 那部分是**推测**，不是事实。
     ///   未探索格数多 = 这条路径不可信，别直接照着下单。
     pub unknown_cells: usize,
@@ -125,13 +125,13 @@ pub struct MapGraph {
     pub surface_y: i32,
     /// 未探索格（地图渲染为 `?`）：**不是墙**，是可以挖通的未知区域。
     ///
-    /// ★ 为什么单独记：全图里大量区域未探索。若把 `?` 当实心岩，
+    /// 为什么单独记：全图里大量区域未探索。若把 `?` 当实心岩，
     ///   寻路会被完全挡住 → "到地表：无路径"，代理无法规划任何开拓方向。
     ///   语义上它是"代价未知的可挖空间"。
     pub unknown: HashSet<(i32, i32)>,
     /// 复制人当前所在格。
     ///
-    /// ★ 2026-11-22：寻路起点必须**无条件**包含这些格 ——
+    /// 寻路起点必须**无条件**包含这些格 ——
     ///   复制人所在的格若未被探索（`?`），它不属于任何气室 → 只靠气室找起点会得到空集。
     pub dupe_cells: HashSet<(i32, i32)>,
 }
@@ -145,7 +145,7 @@ impl MapGraph {
 
     /// 从**全图**构建气室图（不受相机视野限制）。
     ///
-    /// ★ 换地图 / 相机移开时必须用这个：viewport 只有 65×41 视野，
+    /// 换地图 / 相机移开时必须用这个：viewport 只有 65×41 视野，
     ///   算出来的"到地表要挖几格"会随相机位置漂移。
     pub fn build_full(
         session: &McpSession,
@@ -168,7 +168,7 @@ impl MapGraph {
             .filter(|(_, k)| matches!(k, Kind::Unknown))
             .map(|(c, _)| *c)
             .collect();
-        // BFS 求连通域（4 邻接；气体不斜向扩散，所以不用对角）
+        // BFS 求连通域
         let mut chambers: Vec<Chamber> = Vec::new();
         let mut cell_chamber: HashMap<(i32, i32), usize> = HashMap::new();
         let mut remaining = open.clone();
@@ -191,7 +191,7 @@ impl MapGraph {
             });
         }
 
-        // ★ 取数策略：全图有近 10 万格，**不能逐格 fetch**（会把一次查询拖到几分钟）。
+        // 取数策略：全图有近 10 万格，**不能逐格 fetch**（会把一次查询拖到几分钟）。
         //   只对"值得精确统计"的格取质量：
         //   1) 含复制人的气室（生活区，必须精确 —— 空气预算直接决定生死）
         //   2) 面积最大的若干个气室（主要活动空间）
@@ -220,7 +220,7 @@ impl MapGraph {
         // 没取到精确数据的格子：标记为"未统计"，报告里要能区分
         let _ = &cell_data;
 
-        // ★ 地表判定：**不能**用 max_y（全图顶部是太空 Y=383，不是地表）。
+        // 地表判定：**不能**用 max_y。
         //   正确做法：地表是"有实心地形的最高层"。地表之上是未探索区（地图渲染为 `?`），
         //   之下是岩石/矿层。所以取**最高的一行含实心格**作为地表基准。
         //   （Klei 星球的地表上下浮动，这个定义对任何地图都成立。）
@@ -270,14 +270,14 @@ impl MapGraph {
         }).collect()
     }
 
-    /// 从含复制人的气室到地表的最短挖掘路径（Dijkstra：开放格代价 0，实心格代价 1）。
+    /// 从含复制人的气室到地表的最短挖掘路径。
     /// 返回代价最低的那条。这是"往哪挖能最快接通无限空气"的直接答案。
     pub fn route_to_surface(&self) -> Option<DigRoute> {
         let mut starts: Vec<(i32, i32)> = self.chambers.iter()
             .filter(|c| c.has_dupes)
             .flat_map(|c| c.cells.iter().copied())
             .collect();
-        // ★★ 2026-11-22 修正（新存档实测：「复制人不在任何气室内？」→ 无路径）：
+        // 修正：
         //   复制人所在格若是**未探索**（`?`），它不属于任何气室 → starts 为空 → 直接 None。
         //   正解：**无条件把复制人实际坐标加进起点**（他们站着的地方一定是可站的）。
         for d in self.dupe_cells.iter().copied() {
@@ -288,7 +288,7 @@ impl MapGraph {
         if starts.is_empty() { return None; }
         let surface_y = self.surface_y;
         let is_open = |c: (i32, i32)| -> bool { self.cell_chamber.contains_key(&c) };
-        // ★ 未探索格（`?`）按"可挖通但代价 1"处理，不是墙。
+        // 未探索格（`?`）按"可挖通但代价 1"处理，不是墙。
         //   否则全图里未探索区域会彻底挡住寻路 → 永远找不到地表。
         // 0-1 BFS：用双端队列，开放格 push_front，可挖格 push_back
         let mut dist: HashMap<(i32, i32), usize> = HashMap::new();

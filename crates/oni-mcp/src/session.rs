@@ -8,7 +8,7 @@ pub struct McpSession {
     t: Transport,
     /// 资源快照缓存：短时间内重复读同一 URI 直接复用。
     ///
-    /// ★ 写入类调用（call_tool）会自动清空缓存 —— 状态变了，旧快照就是错的。
+    /// 写入类调用（call_tool）会自动清空缓存 —— 状态变了，旧快照就是错的。
     cache: SnapshotCache,
 }
 
@@ -28,13 +28,13 @@ impl McpSession {
     }
 
     pub fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
-        // ★ 工具调用可能改变世界 → 缓存立即失效（宁可多读一次，也不能用过期快照决策）
+        // 工具调用可能改变世界 → 缓存立即失效（宁可多读一次，也不能用过期快照决策）
         self.cache.clear();
         self.t.request("tools/call", Some(json!({ "name": name, "arguments": args })))
     }
 
     pub fn read_resource(&self, uri: &str) -> Result<Value, McpError> {
-        // ★ 快照复用：同一 URI 在 TTL 内只打一次 MCP。
+        // 快照复用：同一 URI 在 TTL 内只打一次 MCP。
         //   守护进程每轮读 11 个观察源，主 agent 的查询也在读同样的源 ——
         //   没有缓存时同一份数据在几秒内被反复拉取，既浪费又给 mod 端点加压。
         if let Some(v) = self.cache.get(uri) {

@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod control;
+pub mod decisions;
 pub mod autoact;
 pub mod decide;
 pub mod live;

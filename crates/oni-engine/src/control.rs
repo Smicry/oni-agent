@@ -1,11 +1,11 @@
 //! **暂停所有权**（control ownership）—— 谁暂停的世界，只有谁能恢复。
 //!
-//! ★★ 为什么需要（2026-11-22 陨石坑局三次全灭的架构根因）：
+//! 为什么需要：
 //!   旧设计用**四个内存布尔标志**（user_paused / frozen / idle_stopped / paused_by_us）
 //!   靠"排除法"推断"是谁暂停的"：都不是 → 那一定是用户 → 绝不恢复。
 //!   这个推断在**守护进程重启换二进制**时必然崩：内存标志全清零，
 //!   而游戏暂停状态还在 → 下一轮判"用户暂停"→ 谁都不恢复 → 死锁
-//!   （实测：膀胱从 82% 涨到 100%，随地排泄 → 污染水 → 全灭）。
+//!   。
 //!
 //! 正解：**暂停是一次有主的事件，不是一组推断出来的标志**。
 //!   - 暂停时落盘 owner + reason + since（按存档隔离，跨进程重启保留）；
@@ -61,7 +61,7 @@ impl Default for ControlState {
     }
 }
 
-/// ★ 路径必须**跨进程稳定**：CLI（`oni pause`/`window`）与守护进程是两个进程，
+/// 路径必须**跨进程稳定**：CLI（`oni pause`/`window`）与守护进程是两个进程，
 ///   `save::current()` 是**进程内**状态 —— CLI 没跑 ensure 时是 None，
 ///   会把 control.json 写到 state 根，而守护进程写到 saves/<fp>/ → 两边读不到对方的 owner。
 ///   正解：用 `last_seen()`（从 meta 文件读，跨进程一致）拼存档目录。
@@ -99,7 +99,7 @@ pub fn pause(owner: Owner, reason: &str) {
     if std::fs::write(&tmp, serde_json::to_string_pretty(&st).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(&tmp, &p);
     }
-    // ★ 效果回执：每次暂停都进统一事件流（可审计"谁在什么时候暂停了世界"）
+    // 效果回执：每次暂停都进统一事件流（可审计"谁在什么时候暂停了世界"）
     let _ = crate::bus::publish(
         crate::bus::Kind::AuditFinding,
         crate::bus::Priority::Info,

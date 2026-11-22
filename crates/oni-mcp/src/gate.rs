@@ -1,6 +1,6 @@
 //! 并发闸门 + 过载退避：保护 mod 的 HTTP 端点不被压垮。
 //!
-//! ★ 为什么需要（2026-11-21 实测）：
+//! 为什么需要：
 //!   mod 的 MCP 端点在**几十个并发请求**下会直接返回 503。
 //!   `oni graph --full` 逐格读全图时，单次查询就是几百个请求；
 //!   多个查询叠加（守护进程 + 主 agent + 子代理）→ 每个查询 300+ 格读取失败。
@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 默认最大并发请求数（**跨进程**共享）。
 ///
-/// 取值理由：mod 端点是本地单进程 ONI。实测 8 并发在单进程内没问题，
-/// 但 4 进程 × 8 = 32 并发就会大面积 503；实测降到 2 时 4 进程并发零失败。
+/// 取值理由：mod 端点是本地单进程 ONI。 8 并发在单进程内没问题，
+/// 但 4 进程 × 8 = 32 并发就会大面积 503；降到 2 时 4 进程并发零失败。
 /// 8 是"单进程够快、跨进程合计可能偏高"的折中；用 `ONI_MAX_CONCURRENT` 可调。
 pub const DEFAULT_MAX_CONCURRENT: usize = 4;
 
@@ -189,7 +189,7 @@ pub fn is_overload(err: &str) -> bool {
         || err.contains("429")
 }
 
-/// 指数退避时长：100ms → 200ms → 400ms ...（上限 2s）。
+/// 指数退避时长：100ms → 200ms → 400ms ...。
 pub fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(100u64 << attempt.saturating_sub(1).min(4)).min(Duration::from_secs(2))
 }
