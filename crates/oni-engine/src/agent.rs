@@ -1610,6 +1610,24 @@ impl Agent {
         } else {
             self.action_failures = 0;
         }
+        // ★ 自动放宽选址判据：连续失败（多半是"落点判据太严"）→ 放宽 CO₂ 阈值。
+        //   这是"策略在代码里可调"的最小闭环：慢系统不必每次都出手，
+        //   快系统先按策略自己放宽一档；仍不行再上报慢系统。
+        {
+            let mut pol = oni_world::preflight::site_policy();
+            if pol.relax_after_fail > 0 && self.action_failures >= pol.relax_after_fail {
+                let old = pol.co2_max_kg;
+                pol.co2_max_kg = (pol.co2_max_kg * 2.0).min(8.0);
+                if pol.co2_max_kg > old {
+                    oni_world::preflight::set_site_policy(pol.clone());
+                    self.action_failures = 0;
+                    report.notes.push(format!(
+                        "🔧 选址判据自动放宽：CO₂ 上限 {}kg → {}kg（连续失败 {} 次）",
+                        old, pol.co2_max_kg, pol.relax_after_fail
+                    ));
+                }
+            }
+        }
 
         // ---- ★ 动作级循环检测（"循环即升级"）----
         //   节点级计数看不见"代理在同一格上反复下同样的工单"（实测厕所：每轮挖

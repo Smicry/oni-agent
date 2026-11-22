@@ -85,6 +85,17 @@ through. On life-red-line emergencies the fast system skips only *expansion* goa
   "user instruction" that never existed — a self-reinforcing hallucination loop.
 - **Result-bearing chat history**: escalation cards in the conversation carry the slow system's
   resolve note as `result`, so later decisions can see how a prior issue was handled (feedback loop).
+- **Loop → escalation**: an action fingerprint (`kind@x,y`) repeated ≥3 times means the executor is
+  spinning (same dig order over and over) — the fast system stops repeating it, reports a structured
+  card, and defers the node so the slow system can pick a different route.
+- **Parameterised site policy**: "what counts as a safe build site" is a *policy*, not a hardcoded
+  rule. `site_policy.json` holds `co2_max_kg` / `strict_prefabs` / `relax_after_fail`; the slow
+  system sees them in its prompt and can adjust them (`oni policy set`, or a `policy` field in its
+  decision) with immediate + persisted effect. The fast system also self-relaxes after repeated
+  failures. Facts (what a cell is, whether an order landed) stay in code.
+- **Singleflight + cache**: concurrent reads of the same cell URI collapse into one MCP request and
+  the read cache TTL covers a whole cycle, so the per-cycle preflight no longer floods the mod
+  endpoint (it used to queue hundreds of requests and stall the cycle for ~90s).
 
 ## MCode integration (Hook + Skill)
 

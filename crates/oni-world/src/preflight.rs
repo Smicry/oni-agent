@@ -567,6 +567,75 @@ pub fn preflight_build_in(
     }
 }
 
+/// ★ 选址策略（可被慢系统调整）——把"什么算安全落点"从硬编码变成可调参数。
+///
+/// 为什么需要参数化：开局氧气稀薄时，"厕所必须纯氧"的硬编码判据会把所有落点否掉
+///   → 反复挖同一格 → 厕所永远建不成（实测）。这类**权衡**属于慢系统的活，
+///   但阈值得能落到代码可执行的参数上，而不是每次都改代码。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SitePolicy {
+    /// 选址允许的 CO₂ 浓度上限（kg/格）。超过 → 视为危险格。
+    pub co2_max_kg: f64,
+    /// 这些建筑"人要长时间待" → 仍要求纯氧（不看 co2_max_kg）。
+    pub strict_prefabs: Vec<String>,
+    /// 连续失败多少次后自动放宽判据（0 = 不自动放宽）。
+    pub relax_after_fail: usize,
+}
+
+impl Default for SitePolicy {
+    fn default() -> Self {
+        Self {
+            co2_max_kg: 2.0,
+            strict_prefabs: vec!["Bed".into(), "Generator".into(), "Electrolyzer".into()],
+            relax_after_fail: 2,
+        }
+    }
+}
+
+/// 全局选址策略（慢系统可调）。用 RwLock + OnceLock：读多写极少。
+static SITE_POLICY: std::sync::OnceLock<std::sync::RwLock<SitePolicy>> = std::sync::OnceLock::new();
+
+fn policy_slot() -> &'static std::sync::RwLock<SitePolicy> {
+    SITE_POLICY.get_or_init(|| std::sync::RwLock::new(SitePolicy::default()))
+}
+
+/// 读当前选址策略（快系统每轮调用）。
+pub fn site_policy() -> SitePolicy {
+    policy_slot().read().map(|p| p.clone()).unwrap_or_default()
+}
+
+/// 设置选址策略（慢系统调用；即刻对快系统生效）。
+pub fn set_site_policy(p: SitePolicy) {
+    if let Ok(mut w) = policy_slot().write() {
+        *w = p;
+    }
+}
+
+impl SitePolicy {
+    /// 该建筑是否按严格纯氧判据（长时间有人待）。
+    pub fn is_strict(&self, prefab_id: &str) -> bool {
+        self.strict_prefabs.iter().any(|p| prefab_id.contains(p.as_str()))
+    }
+    /// 该格在当前策略下是否可作为"人要待在里面"的落点。
+    pub fn site_cell_ok(&self, cd: &crate::cell::Cell, strict: bool) -> bool {
+        if strict {
+            return cd.is_safer_for_occupied();
+        }
+        // 宽松判据：排除污染水/真空/污染氧/氯气；CO₂ 按**当前策略阈值**判。
+        if cd.is_solid() { return false; }
+        let el = cd.element.as_str();
+        if matches!(el, "DirtyWater" | "污染水" | "SewageWater" | "污水" | "Water" | "水"
+            | "Vacuum" | "真空" | "ContaminatedOxygen" | "污染氧" | "ChlorineGas" | "氯气") {
+            return false;
+        }
+        if matches!(el, "CarbonDioxide" | "二氧化碳") {
+            return cd.mass_kg <= self.co2_max_kg;
+        }
+        if el.is_empty() { return false; } // 读不到 ≠ 安全
+        true
+    }
+}
+
 /// **语义选点**：在给定区域内找一个能放下的落点。
 ///
 /// 为什么需要它：计划里写死坐标在换一个存档就全废；
@@ -602,14 +671,17 @@ pub fn find_build_site(
     //     排除污染水/真空/污染氧/氯气/高浓度CO₂，但允许低浓度 CO₂（0.5~1.5kg 的普通气室）。
     //   旧逻辑对所有建筑都用严格判据 → 开局氧气稀薄时厕所落点全被否 →
     //   find_build_site 永远返回 None → 反复走 dig_space_for 挖同一格 → 厕所永远建不成。
-    let strict_occupancy = prefab_id.contains("Bed")
-        || prefab_id.contains("Generator") || prefab_id.contains("Electrolyzer");
+    // ★ 判据来自**全局选址策略**（慢系统可调），不再硬编码：
+    //   严格纯氧的建筑（床/发电机/电解器，看策略）用 is_safer_for_occupied；
+    //   短暂使用设施（旱厕等）按策略的 co2_max_kg 判 CO₂ 是否可接受。
+    let policy = site_policy();
+    let strict_occupancy = policy.is_strict(prefab_id);
     let safe = |a: (i32, i32)| -> bool {
         footprint(a.0, a.1, size.0, size.1)
             .iter()
             // None = 这一格**没读到** -> 保守排除（不能当安全）
             .all(|c| cells.get(c).map(|cd| {
-                if strict_occupancy { !cd.is_safer_for_occupied() } else { !cd.is_hazardous() }
+                policy.site_cell_ok(cd, strict_occupancy)
             }).unwrap_or(false))
     };
     // 区域搜索的候选也必须用**实时**数据复核"占格为空"，

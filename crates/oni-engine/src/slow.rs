@@ -135,6 +135,10 @@ pub struct LlmDecision {
     pub goal: String,
     #[serde(default)]
     pub commands: Vec<String>,
+    /// ★ 可选的**策略调整**（判据参数化）：慢系统直接改选址判据。
+    ///   例：{"co2_max_kg":3.0} / {"strict_prefabs":["Bed"]} / {"relax_after_fail":1}
+    #[serde(default)]
+    pub policy: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,19 +264,19 @@ fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool, proactiv
     if has_command {
         LlmDecision { choice: "custom".into(), action: "command".into(),
             reason: "mock: 用户指令优先，已记录并恢复自主".into(),
-            priority: "P3".into(), goal: String::new(), commands: vec!["window 90".into()] }
+            priority: "P3".into(), goal: String::new(), commands: vec!["window 90".into()], policy: Value::Null }
     } else if has_escalation {
         let c = if prompt.contains("食物") && prompt.contains("switch_goal") { "switch_goal" } else { "dig_access" };
         LlmDecision { choice: c.into(), action: "resolve".into(),
-            reason: "mock: 选合理候选，验证闭环".into(), priority: "P1".into(), goal: String::new(), commands: vec![] }
+            reason: "mock: 选合理候选，验证闭环".into(), priority: "P1".into(), goal: String::new(), commands: vec![], policy: Value::Null }
     } else if proactive {
         // 主动规划模式：mock 也要产出一个可推进目标，不能 wait（那是失职）
         LlmDecision { choice: "proactive".into(), action: "command".into(),
             reason: "mock: 主动规划，依据战略进度推进自给".into(),
-            priority: "P2".into(), goal: "material".into(), commands: vec![] }
+            priority: "P2".into(), goal: "material".into(), commands: vec![], policy: Value::Null }
     } else {
         LlmDecision { choice: "none".into(), action: "wait".into(),
-            reason: "mock: 无待处理事项".into(), priority: "P0".into(), goal: String::new(), commands: vec![] }
+            reason: "mock: 无待处理事项".into(), priority: "P0".into(), goal: String::new(), commands: vec![], policy: Value::Null }
     }
 }
 
@@ -298,7 +302,10 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
   合法值: surface/mop_dirty/material/scout/oxygen/expand/open_chamber/power/research/forage/element:元素名
   例: 断粮时填 forage；要产氧填 oxygen；要建材填 material；没新目标留空。
   **重要**: 想让游戏做事就填 goal（这是你真正的执行力），别只在 reason 里写文字描述。
-- commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。";
+- commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。
+- policy: **可选**，当卡点是落点判据太严或太松时调整选址策略（会落盘并立刻生效）：
+  co2_max_kg=3.0 放宽选址允许的CO₂上限；strict_prefabs=[Bed] 改哪些建筑仍要求纯氧；
+  relax_after_fail=1 让快系统失败1次就自动放宽。不需要时留空或省略。";
 
 /// 失败熔断阈值：同一 goal 连续失败达到此次数 → 禁止再选，强制换策略。
 const FAIL_CIRCUIT_THRESHOLD: usize = 3;
@@ -559,6 +566,14 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
         p.push_str("不要输出 wait，不要空等卡点——那等于失职。若战略进度显示所有节点完成，选一个合理的扩张/自给目标（expand/research/power/element:X）。\n\n");
     }
     p.push_str(&strategy_progress());
+    // ★ 当前选址策略（慢系统可调）：让慢系统知道有哪些判据能自己改。
+    {
+        let pol = oni_world::preflight::site_policy();
+        p.push_str(&format!(
+            "== 🔧 当前选址策略（你能调）==\n  - co2_max_kg={}（选址允许的CO₂浓度上限kg/格）\n  - strict_prefabs={:?}（这些建筑仍要求纯氧）\n  - relax_after_fail={}（连续失败几次后快系统自动放宽）\n  调整方式: oni policy set co2_max_kg=3.0（放宽CO₂上限）或 oni policy set strict_prefabs=Bed（改哪些建筑仍要求纯氧）\n\n",
+            pol.co2_max_kg, pol.strict_prefabs, pol.relax_after_fail
+        ));
+    }
     let (streak_summary, streak, cur_goal) = recent_goal_streak();
     if !streak_summary.is_empty() { p.push_str(&streak_summary); }
     if streak >= 3 {
@@ -685,6 +700,32 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
 
 fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String {
     let mut log = Vec::new();
+    // ★ 策略调整落地：慢系统直接改选址判据（落盘 + 立刻对快系统生效）。
+    //   这就是"LLM 最终决策"落到可执行参数上的落点——不是每次改代码，
+    //   而是慢系统按局面调整阈值/严格名单，快系统下一轮照新判据选点。
+    if !dec.policy.is_null() && dec.policy.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        let mut pol = oni_world::preflight::site_policy();
+        let v = &dec.policy;
+        if let Some(x) = v.get("co2_max_kg").and_then(|x| x.as_f64()) {
+            pol.co2_max_kg = x.clamp(0.0, 20.0);
+        }
+        if let Some(x) = v.get("relax_after_fail").and_then(|x| x.as_u64()) {
+            pol.relax_after_fail = x.min(10) as usize;
+        }
+        if let Some(x) = v.get("strict_prefabs").and_then(|x| x.as_array()) {
+            pol.strict_prefabs = x.iter().filter_map(|y| y.as_str().map(|s| s.to_string())).collect();
+        }
+        oni_world::preflight::set_site_policy(pol.clone());
+        // 落盘：跨进程保持（serve 重启后仍生效）
+        let sd = save_dir();
+        let _ = std::fs::create_dir_all(&sd);
+        let _ = std::fs::write(sd.join("site_policy.json"),
+            serde_json::to_string_pretty(&pol).unwrap_or_default());
+        log.push(format!(
+            "🔧 选址策略已调整: co2_max_kg={} strict={:?} relax_after_fail={}",
+            pol.co2_max_kg, pol.strict_prefabs, pol.relax_after_fail
+        ));
+    }
     // 🔴 代码级熔断：prompt 是软约束，LLM 可能无视；这里是硬闸门。
     // 连续失败≥3次且未过冷却的 goal 绝不入队，并写一条 circuit_break 留痕进对话。
     let statuses = goal_status_snapshot();
@@ -1090,9 +1131,30 @@ fn json_response(stream: &mut TcpStream, status: &str, body: &str, content_type:
 
 fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
     let addr = format!("0.0.0.0:{}", cfg.web_port);
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) => { eprintln!("[slow] web bind {} failed: {}", addr, e); return; }
+    // ★ 绑定失败要**重试**，不能一失败就退出：重启 serve 时旧进程的端口还在
+    //   TIME_WAIT → "Address already in use" → web 线程静默死掉 → 控制台整个不可用
+    //   （实测反复出现：进程活着但 :8789 连不上）。
+    let listener = {
+        let mut last_err = None;
+        let mut listener = None;
+        for attempt in 1..=15 {
+            match TcpListener::bind(&addr) {
+                Ok(l) => { listener = Some(l); break; }
+                Err(e) => {
+                    last_err = Some(e);
+                    eprintln!("[slow] web bind {} failed (第{}次): {}", addr, attempt, last_err.as_ref().unwrap());
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+        match listener {
+            Some(l) => l,
+            None => {
+                eprintln!("[slow] web bind {} 彻底失败，放弃 web 服务: {}", addr,
+                    last_err.map(|e| e.to_string()).unwrap_or_default());
+                return;
+            }
+        }
     };
     eprintln!("[slow] web: http://localhost:{}/", cfg.web_port);
     for stream in listener.incoming() {

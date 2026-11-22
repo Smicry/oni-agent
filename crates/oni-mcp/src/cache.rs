@@ -15,7 +15,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// 默认 TTL：够覆盖一轮循环内的重复读，又不会让状态过期到误导决策。
-pub const DEFAULT_TTL: Duration = Duration::from_secs(2);
+///
+/// ★ 从 2s 提到 8s：一轮 cycle（间隔 10s）里快系统会分多个阶段读同一批 cell
+///   （danger_cells / deadly_below_cells / 建筑安全复核 / 实时复核），
+///   2s TTL 在这些阶段之间就过期了 → 缓存形同虚设 → 每轮几百个重复请求。
+///   8s 覆盖"一轮内的重复读"，又不跨越一轮的边界（状态变化仍会被写操作清空）。
+pub const DEFAULT_TTL: Duration = Duration::from_secs(8);
 
 /// 资源快照缓存。
 pub struct SnapshotCache {

@@ -45,6 +45,7 @@ fn main() -> ExitCode {
         "scout" => cmd_scout(),
         "state" => cmd_state(),
         "note" => cmd_note(&rest),
+        "policy" => cmd_policy(&rest),
         "promote" => cmd_promote(&rest),
         "restart" => cmd_restart(&rest),
         "act" => cmd_act(),
@@ -216,6 +217,91 @@ fn cmd_state() -> anyhow::Result<()> {
         None => println!("  plan.json 指纹: （无 —— 未标记出身，按可疑处理）"),
     }
     Ok(())
+}
+
+/// ★ 选址策略：把"什么算安全落点"从硬编码变成**慢系统可调参数**。
+///
+/// 为什么需要：开局氧气稀薄时"厕所必须纯氧"的硬编码判据会把所有落点否掉 →
+///   反复挖同一格 → 厕所永远建不成（实测）。这类权衡属于慢系统的活，
+///   但阈值必须能落到代码可执行的参数上，而不是每次改代码。
+///
+/// 用法：
+///   oni policy show                打印当前策略
+///   oni policy set co2_max_kg=3.0   调整策略（立即生效 + 落盘）
+///   oni policy reset               恢复默认
+fn cmd_policy(args: &[String]) -> anyhow::Result<()> {
+    use oni_world::preflight::{site_policy, SitePolicy};
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("show");
+    let id = current_save().ok_or_else(|| anyhow::anyhow!("识别不到当前存档"))?;
+    let dir = oni_mcp::save::save_dir(&id.fingerprint);
+    let path = dir.join("site_policy.json");
+    match sub {
+        "show" => {
+            // 落盘优先（跨进程可见），否则用进程内当前值。
+            let p: SitePolicy = std::fs::read_to_string(&path).ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_else(site_policy);
+            println!("== 选址策略（慢系统可调） ==");
+            println!("  co2_max_kg        = {}   (选址允许的 CO₂ 浓度上限 kg/格)", p.co2_max_kg);
+            println!("  strict_prefabs    = {:?} (这些建筑仍要求纯氧)", p.strict_prefabs);
+            println!("  relax_after_fail  = {}   (连续失败几次后自动放宽)", p.relax_after_fail);
+            Ok(())
+        }
+        "set" => {
+            let text = args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+            if text.trim().is_empty() {
+                anyhow::bail!("用法: oni policy set co2_max_kg=3.0（或完整 JSON）");
+            }
+            // 支持两种写法：完整 JSON，或 key=value 简写（慢系统更不容易写错）。
+            let v: serde_json::Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => {
+                    // key=value / k=v,k=v 解析
+                    let mut map = serde_json::Map::new();
+                    for pair in text.split(',') {
+                        let pair = pair.trim();
+                        if pair.is_empty() { continue; }
+                        let Some((k, val)) = pair.split_once('=') else {
+                            anyhow::bail!("无法解析: {pair}（用 JSON 或 key=value）");
+                        };
+                        let k = k.trim();
+                        let val = val.trim();
+                        let parsed: serde_json::Value = match val {
+                            "true" => serde_json::Value::Bool(true),
+                            "false" => serde_json::Value::Bool(false),
+                            _ => match val.parse::<f64>() {
+                                Ok(n) => serde_json::json!(n),
+                                Err(_) => serde_json::Value::String(val.to_string()),
+                            },
+                        };
+                        map.insert(k.to_string(), parsed);
+                    }
+                    serde_json::Value::Object(map)
+                }
+            };
+            let mut p = site_policy();
+            if let Some(x) = v.get("co2_max_kg").and_then(|x| x.as_f64()) { p.co2_max_kg = x; }
+            if let Some(x) = v.get("relax_after_fail").and_then(|x| x.as_u64()) {
+                p.relax_after_fail = x as usize;
+            }
+            if let Some(x) = v.get("strict_prefabs").and_then(|x| x.as_array()) {
+                p.strict_prefabs = x.iter().filter_map(|y| y.as_str().map(|s| s.to_string())).collect();
+            }
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(&path, serde_json::to_string_pretty(&p)?)?;
+            oni_world::preflight::set_site_policy(p.clone());
+            println!("✅ 选址策略已更新并落盘: co2_max_kg={} strict={:?} relax_after_fail={}",
+                p.co2_max_kg, p.strict_prefabs, p.relax_after_fail);
+            Ok(())
+        }
+        "reset" => {
+            let _ = std::fs::remove_file(&path);
+            oni_world::preflight::set_site_policy(SitePolicy::default());
+            println!("✅ 选址策略已恢复默认");
+            Ok(())
+        }
+        other => anyhow::bail!("用法: oni policy [show|set <json>|reset]（未知子命令 {other}）"),
+    }
 }
 
 /// 局内笔记：写进**本存档**的 notes.md（只对有意义，不进通用记忆）。
@@ -888,6 +974,16 @@ fn cmd_serve() -> anyhow::Result<()> {
     use oni_engine::agent::{Agent, AgentConfig};
     let s = connect()?;
     let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // ★ 加载本存档的选址策略（慢系统此前调整过的判据 → 跨进程保持生效）。
+    if let Some(id) = current_save() {
+        let p = oni_mcp::save::save_dir(&id.fingerprint).join("site_policy.json");
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<oni_world::preflight::SitePolicy>(&t) {
+                oni_world::preflight::set_site_policy(v);
+            }
+        }
+    }
 
     let mut fast = AgentConfig::default();
     let mut slow = oni_engine::slow::SlowConfig::default();

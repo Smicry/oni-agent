@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
+
 use serde_json::{json, Value};
 
 use crate::cache::SnapshotCache;
@@ -10,7 +13,15 @@ pub struct McpSession {
     ///
     /// 写入类调用（call_tool）会自动清空缓存 —— 状态变了，旧快照就是错的。
     cache: SnapshotCache,
+    /// ★ singleflight：同 URI 的并发读合并成一次（MCP 请求按 uri 合并，见 transport 说明）。
+    ///
+    /// 为什么需要：cell 事实被快系统多个阶段反复读、且快慢两线程会同时读同一格
+    ///   → 几百个重复 HTTP 请求 → mod 端点排队 → 60s 超时 → 周期空窗。
+    inflight: Mutex<HashMap<String, Arc<InflightSlot>>>,
 }
+
+/// singleflight 槽位：一次请求的结果 + 完成信号。
+type InflightSlot = (Mutex<Option<Result<Value, String>>>, Condvar);
 
 impl McpSession {
     pub fn connect(endpoint: &str) -> Result<Self, McpError> {
@@ -24,7 +35,7 @@ impl McpSession {
             })),
         )?;
         t.notify("notifications/initialized", None);
-        Ok(Self { t, cache: SnapshotCache::default() })
+        Ok(Self { t, cache: SnapshotCache::default(), inflight: Mutex::new(HashMap::new()) })
     }
 
     pub fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {
@@ -42,11 +53,47 @@ impl McpSession {
                 return Ok(parsed);
             }
         }
-        let v = self.t.request("resources/read", Some(json!({ "uri": uri })))?;
-        if let Ok(text) = serde_json::to_string(&v) {
-            self.cache.put(uri, &text);
+        // ★ singleflight：同 URI 的**并发**读合并成一次请求，其余线程等共享结果。
+        //   为什么需要：cell 事实（元素/质量/建筑/标记）被快系统多个阶段反复读
+        //   （danger_cells / deadly_below_cells / 建筑安全复核 / 实时复核），
+        //   快慢两线程还会同时读同一格 → 几百个重复 HTTP 请求 → mod 端点排队
+        //   → 60s 超时 → 周期空窗 89 秒（实测多次）。
+        //   合并后同一时刻每个 URI 只打一次，其余线程直接拿结果。
+        {
+            let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = map.get(uri).cloned() {
+                drop(map); // 不持锁等待
+                let (lock, cv) = &*slot;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while guard.is_none() {
+                    guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                return match guard.take() {
+                    Some(Ok(v)) => Ok(v),
+                    Some(Err(e)) => Err(McpError::Http(e)),
+                    None => Err(McpError::Http("singleflight 结果缺失".into())),
+                };
+            }
+            // 我是第一个 → 登记槽位并去发请求
+            let slot = Arc::new((Mutex::new(None), Condvar::new()));
+            map.insert(uri.to_string(), slot.clone());
+            drop(map);
+
+            let result = self.t.request("resources/read", Some(json!({ "uri": uri })));
+            let (lock, cv) = &*slot;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(result.as_ref().map_err(|e| e.to_string()).cloned());
+            cv.notify_all();
+            drop(guard);
+            // 槽位用完即弃（后续读走缓存；缓存过期后再读会重新成为 leader）
+            self.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(uri);
+
+            let v = result?;
+            if let Ok(text) = serde_json::to_string(&v) {
+                self.cache.put(uri, &text);
+            }
+            Ok(v)
         }
-        Ok(v)
     }
 
     /// 读资源并取文本（资源返回 `contents[].text`）。
