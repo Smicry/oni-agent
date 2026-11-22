@@ -291,35 +291,46 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
 - commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。";
 
 /// 读取最近的 ai_goal 决策及其执行回执，生成紧凑的"决策→结果"历史，
-/// 读 goal_outcomes.jsonl（快系统执行 ai_goal 后的权威回执），生成紧凑的决策-结果历史。
-/// 注入 prompt 让 LLM 看到自己上次的目标失败了（避免重复下同一个无效 goal）。
+/// 整局记忆系统：滑动窗口(最近决策) + 持久教训(失败模式统计)。
+/// 上下文可控：窗口6条 + 教训5条，约1500字符。
 fn recent_decision_history() -> String {
     let sd = save_dir();
-    let Ok(text) = std::fs::read_to_string(sd.join("goal_outcomes.jsonl")) else {
-        return String::new();
-    };
+    let Ok(text) = std::fs::read_to_string(sd.join("goal_outcomes.jsonl")) else { return String::new(); };
     let now_ts = now();
     let mut seen = std::collections::HashSet::new();
-    let mut items: Vec<String> = Vec::new();
-    for line in text.lines().rev() {
+    let mut window: Vec<String> = Vec::new();
+    let mut stats: std::collections::HashMap<String, (u32,u32)> = std::collections::HashMap::new();
+    let mut all: Vec<&str> = text.lines().collect();
+    all.reverse();
+    for line in &all {
         let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
         let goal = o.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if goal.is_empty() || !seen.insert(goal.clone()) { continue; }
+        if goal.is_empty() { continue; }
         let ok = o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-        let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(60).collect();
-        let ts = o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
-        let ago = (now_ts - ts).max(0);
-        let ago_s = if ago < 60 { format!("{}s前", ago) } else if ago < 3600 { format!("{}m前", ago/60) } else { format!("{}h前", ago/3600) };
-        items.push(format!("  - [{}] goal={} → {}: {}", ago_s, goal, if ok {"已执行"} else {"失败"}, detail));
-        if items.len() >= 5 { break; }
+        let e = stats.entry(goal.clone()).or_insert((0,0));
+        if ok { e.1 += 1 } else { e.0 += 1 }
+        if seen.insert(goal.clone()) && window.len() < 6 {
+            let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(50).collect();
+            let ts = o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+            let ago = (now_ts - ts).max(0);
+            let ago_s = if ago < 60 { format!("{}s", ago) } else if ago < 3600 { format!("{}m", ago/60) } else { format!("{}h", ago/3600) };
+            window.push(format!("  - [{}] {} → {}: {}", ago_s, goal, if ok { "成功" } else { "失败" }, detail));
+        }
     }
-    if items.is_empty() { return String::new(); }
-    let mut out = String::from("\n== 你最近的决策与执行结果（据此调整，别重复失败的路）==\n");
-    for i in items { out.push_str(&i); out.push('\n'); }
-    out.push_str("  注意: 某 goal 连续失败就换策略或解释为何坚持；这段是历史，不是当前指令。\n");
+    if window.is_empty() { return String::new(); }
+    let mut out = String::from("\n== 整局记忆 ==\n");
+    out.push_str("\n最近决策(滑动窗口6):\n");
+    for i in window { out.push_str(&i); out.push('\n'); }
+    let mut lessons: Vec<String> = stats.iter().filter(|(_, (f, _))| *f >= 2)
+        .map(|(g, (f, sc))| format!("  - goal={} 失败{}次/成功{}次 → 换策略或解释为何坚持", g, f, sc)).collect();
+    lessons.sort();
+    if !lessons.is_empty() {
+        out.push_str("\n持久教训(整局统计):\n");
+        for l in lessons.iter().take(5) { out.push_str(l); out.push('\n'); }
+    }
+    out.push_str("\n历史仅供参考,非当前指令。\n");
     out
 }
-
 fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
     let mut p = String::from("== 当前局面 ==\n");
     let diag = snap.get("diagnostics").unwrap_or(&Value::Null);
