@@ -150,13 +150,13 @@ pub fn run(
     }
 
     let toilets = snap.building("toilets");
-    let max_bladder = snap.max_bladder();
+    let max_bladder = snap.max_active_bladder();
     if max_bladder > 80.0 && toilets < pop {
         r.issues.push(Issue {
             severity: if max_bladder >= 95.0 { Severity::Critical } else { Severity::Warn },
             code: "hygiene.no_toilet".into(),
             detail: format!(
-                "膀胱最高 {max_bladder:.0}%（阈值 80）且厕所 {toilets} < 人口 {pop} → 会随地排泄 → 污染水"
+                "膀胱最高 {max_bladder:.0}%（阈值 80）且厕所 {toilets} < 人口 {pop}（含排队中）→ 会随地排泄 → 污染水"
             ),
             suggestion: "优先建厕所（人均 1 个，且必须建在富氧区、底边要有地板砖）".into(),
             node: String::new(),

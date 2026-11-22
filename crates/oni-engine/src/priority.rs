@@ -221,15 +221,18 @@ pub fn direct(
     //    污染水沿刚挖开的竖井底向西蔓延 → 三人泡在污染水里
     //    代理还在他们脚下开井 → 走���/9 的死亡路径。
     //  所以"厕所"不是舒适度需求，而是**污染的一级预防**。
-    let max_bladder = snap.max_bladder();
+    let max_bladder = snap.max_active_bladder();
+    // 判据：厕所不够 + 有人膀胱满**且没在如厕**。
+    //   max_active_bladder 排除了"正在如厕"者 —— 膀胱100往往正是如厕中的表现，
+    //   拿它当告警会每轮误报、反复复活建厕所节点、抢占采食物/换气。
+    //   排队中（没在如厕）且膀胱满才是真危机。
     if max_bladder > BLADDER_CRITICAL && snap.building("toilets") < snap.dupes.len() as i64 {
         return Directive {
         level: Level::Urgent,
         reason: format!(
-            "🚽 膀胱已达 {max_bladder:.0}%（阈值 {BLADDER_CRITICAL}）且**厕所数 {} < 人口 {}** → \\
-            随地排泄会生成污染水（三人已泡在污染水里）→ 立刻建厕所",
-            snap.building("toilets"),
-            snap.dupes.len(),
+            "🚽 膀胱已达 {max_bladder:.0}%（阈值 {BLADDER_CRITICAL}）且厕所数 {} < 人口 {} → \\
+            随地排泄会生成污染水 → 立刻建厕所",
+            snap.building("toilets"), snap.dupes.len(),
         ),
         action: Action::BuildToilet,
         forbid_expansion: false,
@@ -404,6 +407,23 @@ mod tests {
         let judgment = crate::judge::judge(&snap, None);
         let dir = direct(&snap, &judgment, Some(3.0), false, false, None, None);
         assert_eq!(dir.action, Action::BuildToilet, "1 个厕所 3 个人 → 排队 → 必须加厕所");
+    }
+
+    /// 正在如厕者的膀胱100%是正常现象，不该触发建厕所（否则每轮复活T1、抢占采食物）。
+    #[test]
+    fn toileting_dupe_bladder_does_not_preempt() {
+        let mut snap = Snapshot::default();
+        let mut a = mk_dupe("休息时间：如厕", 100.0, "氧气");
+        a.bladder = Some(100.0);
+        let mut b = mk_dupe("放松", 100.0, "氧气");
+        b.bladder = Some(2.0);
+        let mut c = mk_dupe("放松", 100.0, "氧气");
+        c.bladder = Some(2.2);
+        snap.dupes = vec![a, b, c];
+        snap.diagnostics = serde_json::json!({"buildings": {"toilets": 2}});
+        let judgment = crate::judge::judge(&snap, None);
+        let dir = direct(&snap, &judgment, Some(5.0), false, false, None, None);
+        assert_ne!(dir.action, Action::BuildToilet, "如厕中的膀胱100不该触发建厕所");
     }
 
     /// （吉恩之死）：人在**不可呼吸环境**里、呼吸值 77~93 时**必须**抢占救援。

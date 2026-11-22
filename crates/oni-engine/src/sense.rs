@@ -202,6 +202,23 @@ impl Snapshot {
             .fold(0.0f64, f64::max)
     }
 
+    /// 排除"正在如厕"者的最高膀胱。
+    ///
+    /// 为什么需要：膀胱 100% 的复制人往往**正是正在如厕的那个**
+    ///（chore="休息时间：如厕"/"使用厕所"）—— 拿他当告警源会每轮误报，
+    /// 反复复活建厕所节点、抢占真正该做的采食物/换气。
+    /// 真危机是"有人膀胱满且**没在如厕**、且没有厕所可用"。
+    pub fn max_active_bladder(&self) -> f64 {
+        self.dupes
+            .iter()
+            .filter(|d| {
+                let c = d.chore.as_str();
+                !c.contains("如厕") && !c.contains("厕所")
+            })
+            .filter_map(|d| d.bladder)
+            .fold(0.0f64, f64::max)
+    }
+
     pub fn air_quality(&self) -> String {
         self.atmos_str("airQuality")
     }
@@ -575,5 +592,32 @@ pub fn sense(session: &McpSession) -> Snapshot {
         pending_orders,
         under_construction,
         errors,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dupe(chore: &str, bladder: f64) -> Dupe {
+        serde_json::from_value(serde_json::json!({
+            "name": "t", "x": 0, "y": 0, "chore": chore,
+            "bladder": bladder, "element": "Oxygen", "schedule": "", "blocked": 0
+        })).unwrap()
+    }
+
+    /// 膀胱告警必须排除"正在如厕"者 — 膀胱100往往正是如厕中的表现。
+    #[test]
+    fn max_active_bladder_excludes_toileting() {
+        let snap = Snapshot {
+            dupes: vec![
+                dupe("休息时间：如厕", 100.0),
+                dupe("放松", 2.0),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(snap.max_bladder(), 100.0, "原始最大值仍含如厕者");
+        assert_eq!(snap.max_active_bladder(), 2.0, "活动最大值应排除如厕者");
     }
 }
