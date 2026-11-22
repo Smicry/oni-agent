@@ -831,6 +831,37 @@ impl Agent {
             }
         }
 
+        // ---- 执行慢系统的语义目标（B方案：慢系统定 goal，快系统 autoact 翻译成工单）----
+        //   慢系统把决策 goal 写成 source=ai_goal 的 command；这里消费并执行。
+        //   必须在 wait_slow 停手逻辑**之前**完成，否则 pending_cmd 会因为这条而停手。
+        {
+            let ai_goals: Vec<_> = crate::commands::pending().into_iter()
+                .filter(|c| c.source == "ai_goal")
+                .collect();
+            for c in ai_goals {
+                let goal = c.text.trim();
+                if crate::autoact::parse_goal(goal).is_none() {
+                    crate::commands::complete(c.id, &format!("无效语义目标: {}", goal));
+                    continue;
+                }
+                if !can_execute {
+                    break; // 世界没跑 → 保留，等下一轮
+                }
+                let action = crate::exec::Action::Auto {
+                    goal: goal.to_string(),
+                    why: format!("慢系统语义目标: {}", if c.result.is_empty() { "P级决策" } else { &c.result }),
+                };
+                let out = crate::exec::execute(&self.session, &self.catalog, &[action]);
+                let ok = out.ok;
+                let detail = out.results.iter()
+                    .map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ");
+                crate::commands::complete(c.id, &format!("ai_goal[{}] {}：{}", goal,
+                    if ok { "已执行" } else { "未成功" }, detail));
+                report.notes.push(format!("🎯 慢系统目标[{}]：{} → {}", goal,
+                    if ok { "已执行" } else { "未成功" }, detail));
+            }
+        }
+
         // ---- 快慢分工：慢系统有未处理的升级请求时，**快系统主动停手** ----
         //   例外：有人倒地需要立刻救人 → 救援优先（紧急态允许继续动作）。
         //   其它情况：等慢系统改完计划再继续，避免带病施工浪费周期。

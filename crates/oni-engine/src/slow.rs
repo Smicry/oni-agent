@@ -129,6 +129,10 @@ pub struct LlmDecision {
     /// 本次决策针对的目标层级 P0-P4（P0保命/P1续航/P2自给/P3扩张/P4目标）
     #[serde(default)]
     pub priority: String,
+    /// 语义目标（交给快系统 autoact 翻译成工单）：surface/mop_dirty/material/scout/
+    /// oxygen/expand/open_chamber/power/research/forage/element:X。留空=不下新目标。
+    #[serde(default)]
+    pub goal: String,
     #[serde(default)]
     pub commands: Vec<String>,
 }
@@ -251,14 +255,14 @@ fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool) -> LlmDe
     if has_command {
         LlmDecision { choice: "custom".into(), action: "command".into(),
             reason: "mock: 用户指令优先，已记录并恢复自主".into(),
-            priority: "P3".into(), commands: vec!["window 90".into()] }
+            priority: "P3".into(), goal: String::new(), commands: vec!["window 90".into()] }
     } else if has_escalation {
         let c = if prompt.contains("食物") && prompt.contains("switch_goal") { "switch_goal" } else { "dig_access" };
         LlmDecision { choice: c.into(), action: "resolve".into(),
-            reason: "mock: 选合理候选，验证闭环".into(), priority: "P1".into(), commands: vec![] }
+            reason: "mock: 选合理候选，验证闭环".into(), priority: "P1".into(), goal: String::new(), commands: vec![] }
     } else {
         LlmDecision { choice: "none".into(), action: "wait".into(),
-            reason: "mock: 无待处理事项".into(), priority: "P0".into(), commands: vec![] }
+            reason: "mock: 无待处理事项".into(), priority: "P0".into(), goal: String::new(), commands: vec![] }
     }
 }
 
@@ -277,10 +281,14 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
 3. 可达性/落脚点等确定性问题交给快系统自救（选对应候选即可），别手算坐标。
 4. 改目标/放弃路线是重大决策，必须说明依据；但断粮/窒息这类先死因优先于既有计划。
 
-输出严格 JSON（不要Markdown）: {choice,action,reason,priority,commands[]}。
+输出严格 JSON（不要Markdown）: {choice,action,reason,priority,goal,commands[]}。
 - action ∈ {resolve,command,wait,custom}；priority ∈ {P0,P1,P2,P3,P4}
 - reason 用1-2句说明『这提升了哪个P级、为什么』
-- commands 只能是可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply'、'order 挖 土@(127,197):9')或留空[]，绝不能是自然语言描述。";
+- goal: 你决定推进的**语义目标**，快系统会翻译成具体工单（坐标由快系统算，你不要算）。
+  合法值: surface/mop_dirty/material/scout/oxygen/expand/open_chamber/power/research/forage/element:元素名
+  例: 断粮时填 forage；要产氧填 oxygen；要建材填 material；没新目标留空。
+  **重要**: 想让游戏做事就填 goal（这是你真正的执行力），别只在 reason 里写文字描述。
+- commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。";
 
 fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
     let mut p = String::from("== 当前局面 ==\n");
@@ -345,8 +353,34 @@ fn run_oni(args: &[&str]) -> String {
     }
 }
 
+/// 把慢系统的语义目标写成 source=ai_goal 的指令，供快系统 cycle 消费执行。
+/// 快系统用 autoact 把 goal 翻译成具体工单（坐标由快系统算）。
+fn push_ai_goal(goal: &str, reason: &str) -> bool {
+    if goal.trim().is_empty() { return false; }
+    // 只接受合法语义目标，防止 LLM 输出乱字符串
+    if crate::autoact::parse_goal(goal).is_none() { return false; }
+    let sd = save_dir();
+    let ts = now();
+    let cmd = serde_json::json!({
+        "id": ts, "text": goal, "source": "ai_goal",
+        "ts": ts, "done": false, "result": reason,
+    });
+    use std::io::Write;
+    if let Some(d) = sd.parent() { let _ = std::fs::create_dir_all(d); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+        .open(sd.join("commands.jsonl")) {
+        let _ = writeln!(f, "{}", cmd);
+        return true;
+    }
+    false
+}
+
 fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String {
     let mut log = Vec::new();
+    // B方案：语义目标写进 commands.jsonl，快系统用 autoact 翻译成工单执行。
+    if push_ai_goal(&dec.goal, &dec.reason) {
+        log.push(format!("ai_goal[{}]:已入队(快系统执行)", dec.goal));
+    }
     for c in &dec.commands {
         let parts: Vec<&str> = c.split_whitespace().collect();
         if parts.is_empty() { continue; }
@@ -504,6 +538,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         "cycle": snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
         "source": "slow_service", "choice": decision.choice,
         "action": decision.action, "priority": decision.priority, "reason": decision.reason,
+        "goal": decision.goal, "commands": decision.commands,
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
         .open(sd.join("decisions.jsonl")) {
