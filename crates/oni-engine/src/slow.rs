@@ -1096,14 +1096,13 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         let cooling = std::fs::read_to_string(sd.join("opening_state.json")).ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
             .and_then(|v| v.get("last_fail_ts").and_then(|x| x.as_i64()))
-            .map(|t| now() - t < 1800)
+            .map(|t| now() - t < 600)
             .unwrap_or(false);
         if need && !cooling {
             if let Some(brief_text) = brief {
-                let principles = crate::opening::collect_principles("plan.template.json");
                 let fp = oni_mcp::save::last_seen().map(|s| s.fingerprint);
                 let outcome = crate::opening::author_opening_plan(
-                    cfg, &brief_text, "plan.json", fp.as_deref(), &principles);
+                    cfg, &brief_text, "plan.json", fp.as_deref());
                 match outcome {
                     Ok(summary) => {
                         let rec = serde_json::json!({
@@ -1128,7 +1127,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
                             "cycle": snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
                             "source": "slow_service", "choice": "opening_plan",
                             "action": "fallback_template", "priority": "P1",
-                            "reason": format!("LLM 开局规划失败：{reason}；保持模板基线（机械重规划建议继续走 suggestions 通道）"),
+                            "reason": format!("LLM 开局规划失败：{reason}；本轮无战略计划（快系统保命层照常），10 分钟后重试"),
                             "goal": "", "commands": [],
                         });
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)

@@ -202,6 +202,26 @@
 
 **验收**：契约不变量 9、10。
 
+## P0-6 策略层去 playbook 化（用户决策：战略必须 LLM 化）
+
+**现象**
+* 每局的计划来自 `plan.template.json`（硬编码模板，自带 author=ai/locked=true 假身份
+  把机械 planner 永久锁死）；慢系统 LLM 只发语义目标，从未做过开局规划；
+  且慢系统"战略进度"读错路径（每存档目录没有 plan.json）→ **LLM 每轮看到的战略视图为空**。
+
+**决策（用户）**
+* 战略层**直接面向 LLM**，不保留本地兜底策略；硬编码 playbook（机械策略族 +
+  模板节点图）删除——换地图（水世界/金属星）playbook 就不适用。
+
+**落地**
+1. 新模块 `opening.rs`：LLM 依 `opening_brief.json`（本局世界事实）生成计划
+   → `validate_plan` 强校验（判据白名单/判据去重/五条生命线/产氧需供电前置/禁写死坐标）→ 落盘；
+2. `reset_plan` 写「待 LLM 规划」占位（author=pending_llm）；
+3. `strategy_progress` 路径修正（与快系统同一 plan.json）；
+4. 通用原则固化为 `UNIVERSAL_PRINCIPLES` 常量（跨局教训与地图无关，属系统知识）。
+
+**验收**：opening 模块 7 项单测 + 依赖图 4 项 stall 单测全绿。
+
 ---
 
 ## 已完成（本轮已落地并有单测）

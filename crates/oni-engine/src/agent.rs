@@ -199,7 +199,6 @@ pub struct Agent {
     ///
     /// S5：计划不该是一成不变的 ——
     ///   人口下降 / 氧气告急 / 节点连续失败时，要**按新的世界事实重新生成**。
-    replan_cooldown: u64,
     /// 上一轮的进展指纹（用来识别"卡住"）
     last_fingerprint: String,
     /// 上一轮结束时世界是否在跑（用来判断"这一轮世界有没有真的动过"）。
@@ -254,7 +253,6 @@ impl Agent {
             space_failures: 0,
             stuck_streak: std::collections::HashMap::new(),
             action_loops: std::collections::HashMap::new(),
-            replan_cooldown: 0,
             last_fingerprint: String::new(),
             left_running: false,
             no_progress: 0,
@@ -522,39 +520,6 @@ impl Agent {
         //   计划不该一成不变：人口下降 / 氧气告急 / 节点连续失败时，
         //   要**按新的世界事实重新生成依赖图**（换策略族），而不是继续走老路。
         //   冷却 60s，避免每轮都重算（采集事实要打多次 MCP）。
-        {
-            // 趋势在这里自算一次（load_samples 是读文件、compute 是纯计算，都很便宜）
-            let tr_local = compute(&load_samples(200), &snap);
-            let o2_left = tr_local.oxygen_cycles_left;
-            let reason = if pop_dropped {
-                Some("人口下降")
-            } else {
-                crate::planner::should_replan(self.last_pop, snap.dupes.len(), 0, o2_left)
-                    .filter(|r| *r == "氧气续航告急")
-            };
-            if let Some(reason) = reason {
-                if self.replan_cooldown == 0 {
-                    let facts = crate::planner::collect_facts(&self.session, &snap);
-                    let (mut new_plan, strategy) = crate::planner::build_plan(&facts);
-                    if let Ok(old) = load_plan(std::path::Path::new(&self.cfg.plan_path)) {
-                        crate::planner::merge_done(&mut new_plan, &old);
-                    }
-                    // Slow system owns strategy; mechanical replan only suggests.
-                    self.replan_cooldown = 60;
-                    let plan_json = serde_json::to_string(&new_plan).unwrap_or_default();
-                    crate::decisions::suggest(&reason, strategy.label(), &plan_json);
-                        report.notes.push(format!(
-                            "🔄 重规划建议（{}）→ {}（{} 节点）已写入 suggestions.jsonl，等 AI 审阅（不覆盖 plan.json）",
-                            reason,
-                            strategy.label(),
-                            new_plan.nodes.len()
-                        ));
-                }
-            } else if self.replan_cooldown > 0 {
-                self.replan_cooldown -= 1;
-            }
-        }
-
         // =====================================================================
         // 2) 运行状态机：这一轮世界在不在跑
         //    铁律：**世界不跑 ⇒ 不下工单、不累计进展、不熔断。**
@@ -1015,7 +980,7 @@ impl Agent {
         if plan.author.as_deref() != Some("ai") {
             let brief_path = oni_mcp::save::save_file("opening_brief.json");
             if !std::path::Path::new(&brief_path).exists() {
-                let facts = crate::planner::collect_facts(&self.session, &snap);
+                let facts = crate::opening::collect_facts(&self.session, &snap);
                 let scout_report = crate::autoact::scout_resources(&self.session, Some(&self.catalog));
                 let rec = serde_json::json!({
                     "facts": serde_json::to_value(&facts).unwrap_or_default(),

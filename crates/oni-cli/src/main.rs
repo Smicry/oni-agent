@@ -36,7 +36,6 @@ fn main() -> ExitCode {
         "cells" => cmd_reach_cells(&rest),
         "plan" => cmd_plan(),
         "plan-reset" => cmd_plan_reset(),
-        "plan-auto" => cmd_plan_auto(&rest),
         "escalations" => cmd_escalations(&rest),
         "resolve" => cmd_resolve(&rest),
         "status" => cmd_status(),
@@ -359,44 +358,6 @@ fn cmd_promote(args: &[String]) -> anyhow::Result<()> {
     writeln!(f, "\n<!-- 上提自 {} @ {} -->", src, ts())?;
     writeln!(f, "- {}", text)?;
     println!("✅ 已上提到 {}（来源: {}）", file, src);
-    Ok(())
-}
-
-/// **自动开局规划**：采集世界事实 → 匹配策略族 → 生成依赖图 → 写 plan.json。
-///
-/// 这是"通用助手"的核心入口：不再由人（AI）手写计划。
-///   换一颗星球 / 换一种开局 → 重新采集 → 匹配到不同策略族 → 生成不同计划。
-fn cmd_plan_auto(args: &[String]) -> anyhow::Result<()> {
-    let keep_done = args.iter().any(|a| a == "--keep");
-    let s = connect()?;
-    let snap = oni_engine::sense::sense(&s);
-    // 采集与生成都走 engine
-    let facts = oni_engine::planner::collect_facts(&s, &snap);
-    let (mut plan, strategy) = oni_engine::planner::build_plan(&facts);
-
-    if keep_done {
-        if let Ok(old) = oni_engine::decide::load_plan(std::path::Path::new(PLAN)) {
-            oni_engine::planner::merge_done(&mut plan, &old);
-        }
-    }
-    // Draft by default: the slow system (AI) owns plan.json. Mechanical planner may
-    // only write when explicitly asked with --apply, and the result is marked author=auto.
-    let apply = args.iter().any(|a| a == "--apply");
-    if apply {
-        let id = current_save();
-        let fp = id.as_ref().map(|i| i.fingerprint.clone());
-        if !oni_engine::saveswitch::write_plan(PLAN, &plan, fp.as_deref()) {
-            anyhow::bail!("写 plan.json 失败（可能被 AI 锁定）");
-        }
-        println!("✅ 已落盘机械草稿 plan.json（{} 个节点）", plan.nodes.len());
-    } else {
-        println!("📋 机械草稿（未落盘，{} 个节点）—— AI 审阅后决定采纳", plan.nodes.len());
-    }
-    println!("   策略族: {}", strategy.label());
-    println!("   保命节点: {}", plan.survival_node.clone().unwrap_or_default());
-    for n in &plan.nodes {
-        println!("   - {} [{}] {}", n.id, n.status, n.name);
-    }
     Ok(())
 }
 
@@ -790,28 +751,22 @@ fn cmd_bus(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn cmd_plan_reset() -> anyhow::Result<()> {
-    let tpl = oni_mcp::save::template_path(PLAN);
-    if !tpl.exists() {
-        anyhow::bail!("找不到 {}（应在项目根目录）", tpl.display());
-    }
-    let text = std::fs::read_to_string(&tpl)?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("模板不是合法 JSON: {e}"))?;
-    std::fs::write(PLAN, &text)?;
-    // 给计划文件打上**当前存档的指纹**：计划自证出身。
-    //   换局后指纹对不上 → 守护进程自动归档旧计划并按模板重置。
+    // ★ 新局不再复制模板 playbook（硬编码套路换地图就不适用，已删除）：
+    //   落一份「待 LLM 规划」占位 —— 快系统采集本局世界事实（opening_brief.json），
+    //   慢系统 LLM 依据事实生成正式计划（author=ai）。
     let id = current_save();
-    if let Some(i) = &id {
-        oni_engine::saveswitch::stamp_plan(PLAN, &i.fingerprint);
+    let fp = id.as_ref().map(|i| i.fingerprint.clone());
+    if !oni_engine::saveswitch::reset_plan(PLAN, fp.as_deref().unwrap_or("unknown")) {
+        anyhow::bail!("写 plan.json 占位失败");
     }
     // 只清**当前存档**的局内状态；别的存档的缓存在各自的目录里，互不影响。
     oni_engine::saveswitch::clear_save_state();
-    let n = v.get("nodes").and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0);
-    println!("✅ plan.json 已按模板重置（{n} 个节点，全部 todo）");
-    if let Some(i) = &id {
-        println!("   存档指纹: {}（已写入 plan.json）", i.fingerprint);
+    println!("✅ plan.json 已重置为「待 LLM 规划」占位（author=pending_llm，0 节点）");
+    if let Some(i) = &fp {
+        println!("   存档指纹: {}（已写入 plan.json）", i);
     }
     println!("   已清本存档的局内状态：目标锁 / 侦察报告 / 趋势样本 / 实时快照");
+    println!("   下一步：快系统采集 opening_brief.json → 慢系统 LLM 生成开局战略");
     Ok(())
 }
 

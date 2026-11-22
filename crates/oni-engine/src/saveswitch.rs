@@ -80,15 +80,17 @@ pub fn write_plan(plan_path: &str, plan: &crate::decide::Plan, fp: Option<&str>)
 }
 
 pub fn reset_plan(plan_path: &str, fp: &str) -> bool {
-    let tpl = save::template_path(plan_path);
-    if !tpl.exists() {
-        return false;
-    }
-    if std::fs::copy(&tpl, plan_path).is_err() {
-        return false;
-    }
-    stamp_plan(plan_path, fp);
-    true
+    // ★ 新局不再复制模板 playbook（硬编码套路换地图就不适用，已删除）：
+    //   写一份「待 LLM 规划」的占位计划 —— 快系统照常跑保命层，
+    //   慢系统 LLM 依据 opening_brief.json（本局世界事实）生成正式计划。
+    let v = serde_json::json!({
+        "author": "pending_llm",
+        "locked": false,
+        "save_fingerprint": fp,
+        "objective": "（等待 LLM 开局规划：快系统已采集本局世界事实 opening_brief.json）",
+        "nodes": [],
+    });
+    std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok()
 }
 
 /// 清掉**当前存档**的局内状态（目标锁/侦察报告/趋势样本/实时快照）。
@@ -171,10 +173,12 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
     }
 
     // 2) 重置计划 + 打指纹
-    //    只有**明显是上一局残留**的计划（所有节点都已 done/blocked）才重置。
-    //      否则（人手写的计划没打指纹）**只补打指纹，绝不冲掉人的计划**。
-    //      
-    if plan_looks_stale(plan_path) {
+    //    - 计划文件不存在 → 落「待 LLM 规划」占位（新局的第一步）
+    //    - 明显是上一局残留（所有节点 done/blocked）→ 按占位重置
+    //    - 其它（人在用的计划）→ 只补指纹，绝不冲掉
+    if !Path::new(plan_path).exists() {
+        reset_plan(plan_path, &new.fingerprint);
+    } else if plan_looks_stale(plan_path) {
         reset_plan(plan_path, &new.fingerprint);
     } else {
         stamp_plan(plan_path, &new.fingerprint);
@@ -209,18 +213,7 @@ mod tests {
         assert_ne!(a, f, "打印舱锚点不同 → 指纹不同");
     }
 
-    #[test]
-    fn template_path_derives_from_plan_path() {
-        assert_eq!(
-            oni_mcp::save::template_path("plan.json"),
-            std::path::PathBuf::from("plan.template.json")
-        );
-        assert_eq!(
-            oni_mcp::save::template_path("/x/y/myplan.json"),
-            std::path::PathBuf::from("/x/y/myplan.template.json")
-        );
-    }
-
+    
     #[test]
     fn stamp_and_read_plan_fingerprint() {
         let p = tmp("stamp");

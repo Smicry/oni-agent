@@ -250,10 +250,3 @@ pub fn write_meta(id: &SaveId) {
     );
 }
 
-/// 计划模板路径：plan.json → plan.template.json。
-pub fn template_path(plan_path: &str) -> PathBuf {
-    let p = Path::new(plan_path);
-    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("plan.json");
-    let stem = name.strip_suffix(".json").unwrap_or(name);
-    p.with_file_name(format!("{stem}.template.json"))
-}

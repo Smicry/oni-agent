@@ -71,15 +71,15 @@
 
 ## 4.7 开局规划（LLM 生成，playbook 降级为兜底）
 
-三段兜底链：
-1. **L1 LLM 规划**（author=ai，名副其实）：快系统采世界事实写 `opening_brief.json`
-   （侦察 + 结构化 facts，只采事实——session 在快系统），慢系统 LLM 依据事实生成
-   节点图 → `opening::validate_plan` 强校验 → 落盘。
-2. **L2 机械兜底**：LLM 失败/校验不过 → planner::build_plan（按世界事实分类的策略族）
-   走 suggestions 通道供慢系统审阅。
-3. **L3 模板基线**：plan.template.json 的节点图只作最后基线
-   （**author=template、不 locked**——旧模板自带 author=ai/locked=true 的假身份，
-   会把机械 planner 永久锁死，且换一张地图节点图就不适用）。
+无本地兜底（用户决策：硬编码 playbook 换地图就不适用，已删除）：
+1. **快系统**：计划 author ≠ ai 时，采集本局世界事实写 `opening_brief.json`
+   （侦察 + 结构化 facts——session 在快系统，只采事实）。
+2. **慢系统 LLM 规划**（author=ai，名副其实）：依据 brief 生成节点图 →
+   `opening::validate_plan` 强校验 → 落盘。
+3. **失败即空窗重试**：LLM 失败/校验不过 → 本轮无战略计划
+   （快系统保命层照常跑）→ 冷却 10 分钟后重试；失败原因记 decisions.jsonl。
+   通用性来自 prompt 只含**跨局通用原则**（常量 UNIVERSAL_PRINCIPLES）+ 本局事实；
+   节点结构由 LLM 依事实决定（水世界→藻类箱/电解器，陆地→氧石扩散器/挖掘换气）。
 
 通用性关键：prompt 只放**跨局通用原则**（厕所前置/材料先行/换气判据用真实可达上界/
 缺料自举/造出来≠在运转/产氧需电/研究站解锁高级产氧）+ **本局事实**；

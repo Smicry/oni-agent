@@ -121,5 +121,6 @@ cargo build --release
 - "等慢系统"不是暂停理由；`escalation_hold` 已废除。急症只跳"扩张类"goal，保命/续航 goal 照常执行。
 - AI 慢系统通过 `oni status/escalations/decision` 读局面，改 locked plan / ai_goals，`oni decision` 留痕。
 - **开局战略由慢系统 LLM 生成**（opening.rs：快系统采事实写 opening_brief.json，慢系统 LLM 依本局事实出节点图，强校验后落盘 author=ai）。
-  plan.template.json 只作 L3 基线（author=template，不锁机械 planner）；硬编码策略族只作 L2 兜底。
+  **无本地兜底**：LLM 失败即空窗重试（10 分钟冷却），快系统保命层不受影响；
+  硬编码 playbook（模板节点图/机械策略族）已删除。
   **禁止把某张地图的开局套路固化进模板/代码**——水世界、金属星、沼泽的节点图必须由 LLM 依事实重排。

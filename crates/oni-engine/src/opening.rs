@@ -7,13 +7,13 @@
 //!   换一张地图（水世界/金属星/沼泽）节点图就不适用 → 代理带着错误的计划全灭
 //!   （实测：拉德多局模板没有产氧节点，"挖通地表换气"又被假 done 提前宣告完成）。
 //!
-//! 新契约（三段兜底链）：
-//!   L1 **LLM 开局规划**：快系统采世界事实（opening_brief.json），
-//!      慢系统 LLM 生成节点图（author=ai，名副其实）→ 强校验 → 落盘；
-//!   L2 **机械兜底**：LLM 失败/校验不过 → planner::build_plan（按世界事实分类
-//!      的策略族，author=auto）走 suggestions 通道供慢系统审阅；
-//!   L3 **模板基线**：模板不再锁死机械 planner（author=template），作为最后基线。
-//!
+//! 新契约（无本地兜底，战略层全面 LLM 化）：
+//!   快系统采世界事实（opening_brief.json），
+//!   慢系统 LLM 生成节点图（author=ai，名副其实）→ 强校验 → 落盘。
+//!   **没有本地兜底**（用户决策：硬编码 playbook 换地图就不适用，已删除）：
+//!   LLM 失败/校验不过 → 本轮无战略计划（快系统保命层照常跑），
+//!   冷却 10 分钟后重试 LLM；失败原因记入 decisions.jsonl 可见。
+//!   原 planner.rs 的机械策略族（playbook）已随本契约删除。
 //! 通用性关键：prompt 里**只放跨局通用原则**（厕所前置/材料先行/换气判据用真实
 //! 可达上界/缺料自举/造出来≠在运转/产氧需电）+ **本局事实**；节点结构由 LLM
 //! 依据事实决定（水世界→藻类箱/电解器，陆地→氧石扩散器/挖掘换气）。
@@ -21,6 +21,8 @@
 use crate::decide::{Node, Plan};
 use crate::exec::Action;
 use crate::slow::SlowConfig;
+use oni_mcp::McpSession;
+use serde::Serialize;
 use serde_json::Value;
 
 /// 判据 kind 白名单（`check_success` 支持的全部机器可判判据）。
@@ -35,6 +37,201 @@ pub const CHECK_KINDS: &[&str] = &[
 /// 计划节点允许使用的动作 kind（**禁止带坐标的 build/dig/order/auto_connect**——
 /// 写死坐标换个存档就废，这是"playbook 不可通用"的老坑）。
 pub const ACTION_KINDS: &[&str] = &["auto", "auto_build", "scout", "call"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// 先建材型：开局地上零建材 → 梯子/砖/厕所/床全部造不了。
+    /// → 第一目标：采建材（横向挖，低风险）；梯子本身也要建材才能挖竖井。
+    MaterialFirst,
+    /// 憋死型：可站区域只有一行高（复制人被封在走廊里）
+    /// → 第一目标：垂直竖井 + 梯子 → 开阔气室；禁止向下深挖。
+    Suffocate,
+    /// 近地表型：到地表很近 → 第一目标：打通地表（永久换气）。
+    NearSurface,
+    /// 富氧型：开局附近有氧石 → 第一目标：产氧器（氧石）。
+    RichOxygen,
+    /// 富矿型：附近有煤 + 铜 → 第一目标：供电链。
+    RichOre,
+    /// 无植物型：开局没有可食植物 → 食物必须靠种植（收割只能应急）。
+    Plantless,
+    /// 常规型。
+    Standard,
+}
+
+impl Strategy {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Strategy::MaterialFirst => "先建材型（开局零建材）",
+            Strategy::MaterialFirst => "先建材型（开局零建材）",
+            Strategy::Suffocate => "憋死型（可站区域只有一行高）",
+            Strategy::NearSurface => "近地表型（到地表很近）",
+            Strategy::RichOxygen => "富氧型（附近有氧石）",
+            Strategy::RichOre => "富矿型（附近有煤与铜）",
+            Strategy::Plantless => "无植物型（食物只能靠种植）",
+            Strategy::Standard => "常规型",
+        }
+    }
+}
+
+/// 开局世界事实（由 CLI 从游戏采集后传入）。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorldFacts {
+    pub dupes: usize,
+    /// 官方可达集大小（很小 = 复制人被封住）。
+    pub reachable_cells: usize,
+    /// 可站区域的高度跨度（行数）。1 = 走廊型。
+    pub base_row_span: i32,
+    /// 到地表需要挖的格数（None = 未知）。
+    pub surface_distance: Option<usize>,
+    pub oxy_rock_near: usize,
+    pub coal_near: usize,
+    pub copper_near: usize,
+    pub iron_near: usize,
+    pub clay_near: usize,
+    pub plants_near: usize,
+    /// 基地下方是否有水（深挖会淹）。
+    pub water_below: bool,
+    /// 基地下方是否有大量 CO₂（深挖会放毒）。
+    pub co2_below: bool,
+    pub food_kcal: f64,
+    /// 地上可用的建材总量（砂岩/泥土/藻类/沙/黏土）。
+    ///
+    /// 零建材时任何建造都必然失败（梯子/砖也要建材），
+    ///   所以第一目标必须是采建材，而不是直接开竖井或建厕所。
+    pub building_materials_kg: f64,
+}
+/// 搜索某元素/名称在地图上的匹配数（用于 brief 的资源统计）。
+fn count_matches(session: &McpSession, q: &str) -> i64 {
+    session
+        .call_text(
+            "world_editor",
+            serde_json::json!({
+                "command": "read",
+                "path": format!("oni://world/search?query={q}&kinds=cells"),
+                "confirm": true,
+                "task": format!("自动规划: 搜索 {q}")
+            }),
+        )
+        .ok()
+        .and_then(|t| {
+            let f = t.rfind("```json")?;
+            let rel = t[f + 7..].find('{').map(|i| f + 7 + i)?;
+            let end = t[rel..].rfind('}')?;
+            let v: serde_json::Value = serde_json::from_str(&t[rel..=rel + end]).ok()?;
+            v.get("matched").and_then(|m| m.as_i64())
+        })
+        .unwrap_or(0)
+}
+/// **采集本局世界事实**（开局规划 brief 的主体）。
+/// 只采**事实**：可达区/行跨度/资源距离/基底下水与CO₂/食物/建材。
+///   否则"CLI 看到的"和"代理看到的"会不一致。
+pub fn collect_facts(session: &McpSession, snap: &crate::sense::Snapshot) -> WorldFacts {
+    // ---- 官方可达集（去重！）----
+    let mut reach_set: std::collections::BTreeSet<(i32, i32)> = std::collections::BTreeSet::new();
+    if let Ok(text) = session.call_text(
+        "world_editor",
+        serde_json::json!({
+            "command": "read", "path": "/active/dupes/reachability.md",
+            "radius": 16, "sampleLimit": 200, "confirm": true,
+            "task": "自动规划: 官方可达集"
+        }),
+    ) {
+        if let Some(f) = text.rfind("```json") {
+            if let Some(rel) = text[f + 7..].find('{').map(|i| f + 7 + i) {
+                if let Some(end) = text[rel..].rfind('}') {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[rel..=rel + end]) {
+                        if let Some(items) = v.get("items").and_then(|x| x.as_array()) {
+                            for it in items {
+                                if let Some(ss) = it.get("samples").and_then(|x| x.as_array()) {
+                                    for c in ss {
+                                        let x = c.get("x").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+                                        let y = c.get("y").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+                                        if x >= 0 && y >= 0 {
+                                            reach_set.insert((x, y));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ys: Vec<i32> = reach_set.iter().map(|c| c.1).collect();
+    let row_span = if ys.is_empty() {
+        1
+    } else {
+        ys.iter().max().unwrap() - ys.iter().min().unwrap() + 1
+    };
+    let base_min_y = ys.iter().copied().min().unwrap_or(0);
+
+    // ---- 地图（找基地下方的水与 CO₂）----
+    let (mut water_below, mut co2_below) = (false, false);
+    if let Ok(text) = session.call_text(
+        "world_editor",
+        serde_json::json!({
+            "command": "read", "path": "/active/map/viewport.md",
+            "format": "edit", "compact": false, "confirm": true,
+            "task": "自动规划: 读取地图（找下方水与 CO₂）"
+        }),
+    ) {
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix('|') else { continue };
+            let cols: Vec<&str> = rest.split('|').map(|c| c.trim()).collect();
+            if cols.len() < 5 { continue; }
+            let y: i32 = match cols[0].trim_matches('`').parse() { Ok(v) => v, Err(_) => continue };
+            if y >= base_min_y { continue; }
+            let element = cols[4].trim_matches('`');
+            let kind = cols[3].trim_matches('`');
+            if kind == "liq" && matches!(element, "Water" | "SewageWater" | "DirtyWater") {
+                water_below = true;
+            }
+            if element == "CarbonDioxide" {
+                co2_below = true;
+            }
+        }
+    }
+
+    WorldFacts {
+        dupes: snap.dupes.len(),
+        reachable_cells: reach_set.len(),
+        base_row_span: row_span,
+        surface_distance: None,
+        oxy_rock_near: count_matches(session, "OxyRock") as usize,
+        coal_near: count_matches(session, "Carbon") as usize,
+        copper_near: count_matches(session, "Cuprite") as usize,
+        iron_near: count_matches(session, "IronOre") as usize,
+        clay_near: count_matches(session, "Clay") as usize,
+        plants_near: (count_matches(session, "米虱木")
+            + count_matches(session, "淤泥根")
+            + count_matches(session, "诱人荆棘")) as usize,
+        water_below,
+        co2_below,
+        food_kcal: snap.food_kcal(),
+        building_materials_kg: ["SandStone", "Dirt", "Algae", "Sand", "Clay"]
+            .iter()
+            .map(|e| snap.loose_kg(e))
+            .sum(),
+    }
+}
+/// **跨局通用原则**（每局都成立的经验教训，与地图无关 → 属于系统知识）。
+///
+/// 注意区分：这些是"怎么活下来"的**规则**，不是"这一局先做什么"的**套路**。
+/// 套路（先挖地表还是先产氧、走藻类箱还是电解器）必须由 LLM 依据本局事实决定。
+pub const UNIVERSAL_PRINCIPLES: &[&str] = &[
+    "厕所必须前置：厕所排在后面 → 膀胱 100% → 随地排泄 → 污染水 → 复制人泡在里面呼吸归零 → 全灭（两次事故）。",
+    "全局气体比例会骗人：全局 O₂/(O₂+CO₂)=99% 也可能是封闭气室在闷死；换气是否达成只看「复制人真能走到的最高可达格」，且必须复核，不许声明。",
+    "厕所 2×3、床 2×2 需要连续空间：找不到落点时自动腾空间（挖开占格），不是放弃。",
+    "梯子/砖块只认建材（砂岩/泥土/藻类/黏土/沙）；发电机/电线/高级产氧要金属。开局地上零建材 → 第一步永远是采建材。",
+    "缺材料不能阻断推进：缺什么就去挖什么（自举），不要反复下注定失败的建造单。",
+    "食物预算：400 kcal/人/周期；食物续航 < 5 周期必须立刻安排食物（采集现成植物最快）。",
+    "产氧设备需要电力 → **供电节点必须排在产氧节点之前**；没有电时只考虑零耗电方案。",
+    "研究站（ResearchCenter）解锁电解器/藻类箱/烤炉——走研究路线必须有建研究站的节点。",
+    "选址避开 CO₂ 气囊与污染区：复制人在里面工作会逐步窒息（O₂ 占比 ≈ 1-非O₂质量）。",
+    "一次只下一条工单；「造出来」≠「在运转」，设备判据必须看通电/运转状态。",
+    "换气判据用「复制人真能走到的最高可达格」且必须复核——不许声明完成。",
+];
 
 /// 计划不是 AI 生的（模板/机械兜底）→ 需要 LLM 开局规划。
 pub fn opening_needed(plan_path: &str) -> bool {
@@ -228,7 +425,7 @@ pub fn validate_plan(plan: &Plan) -> Vec<String> {
 }
 
 /// 组装 LLM 的 system / user prompt。原则只放**跨局通用**的；节点结构由事实决定。
-fn build_prompts(brief_text: &str, principles: &[String]) -> (String, String) {
+fn build_prompts(brief_text: &str) -> (String, String) {
     let system = "你是《缺氧》(Oxygen Not Included) 殖民地的开局战略规划器。\
 你的任务：根据**本局世界事实**生成一份依赖图计划（JSON）。\
 地图类型千差万别（陆地/水世界/金属富集/沼泽/陨石坑…），**禁止套用固定套路**——\
@@ -243,7 +440,7 @@ fn build_prompts(brief_text: &str, principles: &[String]) -> (String, String) {
   \"nodes\": [{{\"id\": \"T1\", \"name\": \"...\", \"status\": \"todo\", \"requires\": [], \"unlocks\": [],\n\
     \"actions\": [{{\"kind\": \"auto\", \"goal\": \"...\", \"why\": \"...\"]}},\n\
     \"success_check\": {{...}}, \"success\": \"人类可读\", \"note\": \"\"]}}\n}}",
-        principles.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+        UNIVERSAL_PRINCIPLES.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
     );
     (system, user)
 }
@@ -255,9 +452,8 @@ pub fn author_opening_plan(
     brief_text: &str,
     plan_path: &str,
     fp: Option<&str>,
-    principles: &[String],
 ) -> Result<String, String> {
-    let (system, user) = build_prompts(brief_text, principles);
+    let (system, user) = build_prompts(brief_text);
     let raw = crate::slow::call_llm(cfg, &system, &user)?;
     let json_text = extract_json(&raw).ok_or("LLM 输出里没有 JSON")?;
     let mut raw_v: Value = serde_json::from_str(json_text).map_err(|e| format!("计划 JSON 解析失败: {e}"))?;
@@ -308,19 +504,6 @@ pub fn author_opening_plan(
     Ok(format!("LLM 开局规划已生成（{} 节点，判据校验通过）", plan.nodes.len()))
 }
 
-/// 从模板读跨局通用原则（作为 prompt 素材；模板的**节点图**不再被复制为计划）。
-pub fn collect_principles(template_path: &str) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(template_path) else { return Vec::new(); };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else { return Vec::new(); };
-    v.get("principles")
-        .and_then(|p| p.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// 计划是否不是 AI 生的（用于慢系统触发开局规划）。
 pub fn plan_author_is_ai(plan_text: &str) -> bool {
