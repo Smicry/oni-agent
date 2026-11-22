@@ -290,6 +290,36 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
   **重要**: 想让游戏做事就填 goal（这是你真正的执行力），别只在 reason 里写文字描述。
 - commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。";
 
+/// 读取最近的 ai_goal 决策及其执行回执，生成紧凑的"决策→结果"历史，
+/// 读 goal_outcomes.jsonl（快系统执行 ai_goal 后的权威回执），生成紧凑的决策-结果历史。
+/// 注入 prompt 让 LLM 看到自己上次的目标失败了（避免重复下同一个无效 goal）。
+fn recent_decision_history() -> String {
+    let sd = save_dir();
+    let Ok(text) = std::fs::read_to_string(sd.join("goal_outcomes.jsonl")) else {
+        return String::new();
+    };
+    let now_ts = now();
+    let mut seen = std::collections::HashSet::new();
+    let mut items: Vec<String> = Vec::new();
+    for line in text.lines().rev() {
+        let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
+        let goal = o.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if goal.is_empty() || !seen.insert(goal.clone()) { continue; }
+        let ok = o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(60).collect();
+        let ts = o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ago = (now_ts - ts).max(0);
+        let ago_s = if ago < 60 { format!("{}s前", ago) } else if ago < 3600 { format!("{}m前", ago/60) } else { format!("{}h前", ago/3600) };
+        items.push(format!("  - [{}] goal={} → {}: {}", ago_s, goal, if ok {"已执行"} else {"失败"}, detail));
+        if items.len() >= 5 { break; }
+    }
+    if items.is_empty() { return String::new(); }
+    let mut out = String::from("\n== 你最近的决策与执行结果（据此调整，别重复失败的路）==\n");
+    for i in items { out.push_str(&i); out.push('\n'); }
+    out.push_str("  注意: 某 goal 连续失败就换策略或解释为何坚持；这段是历史，不是当前指令。\n");
+    out
+}
+
 fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
     let mut p = String::from("== 当前局面 ==\n");
     let diag = snap.get("diagnostics").unwrap_or(&Value::Null);
@@ -339,7 +369,8 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
             }
         }
     }
-    p.push_str("\n输出严格JSON(choice/action/reason/commands)。");
+    p.push_str(&recent_decision_history());
+    p.push_str("\n输出严格JSON(choice/action/reason/priority/goal/commands)。");
     p
 }
 

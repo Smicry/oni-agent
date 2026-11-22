@@ -855,6 +855,23 @@ impl Agent {
                 let ok = out.ok;
                 let detail = out.results.iter()
                     .map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ");
+                // 执行结果写入单一权威来源，供慢系统 history 读取（避免 command.result 被决策理由污染）
+                {
+                    use std::io::Write;
+                    let fp = oni_mcp::save::last_seen()
+                        .map(|s| s.fingerprint).unwrap_or_else(|| "unknown".into());
+                    let sd = oni_mcp::save::save_dir(&fp);
+                    let _ = std::fs::create_dir_all(&sd);
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                        .open(sd.join("goal_outcomes.jsonl")) {
+                        let rec = serde_json::json!({
+                            "goal": goal, "ok": ok, "detail": detail,
+                            "ts": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                        });
+                        let _ = writeln!(f, "{}", rec);
+                    }
+                }
                 crate::commands::complete(c.id, &format!("ai_goal[{}] {}：{}", goal,
                     if ok { "已执行" } else { "未成功" }, detail));
                 report.notes.push(format!("🎯 慢系统目标[{}]：{} → {}", goal,
