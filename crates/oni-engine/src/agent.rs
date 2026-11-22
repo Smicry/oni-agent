@@ -255,7 +255,19 @@ impl Agent {
         let backlog = snap.pending_orders.unwrap_or(0) > 0;
         let everyone_idle = !snap.dupes.is_empty()
             && snap.truly_idle_count() == snap.dupes.len();
-        if backlog && everyone_idle {
+        // 伪忙碌卡死（效果判据，不看 chore 名字）：
+        //   ONI 的"寻找安全区域/恢复呼吸"被官方 workIdleCount 算作"在工作"，
+        //   stuck.rs 也把它列为 SELF_RESCUING —— 但当**全员聚集在同一格**且工单积压时，
+        //   这不是自救，是集体卡死（寻路反复失败）。比真空闲更糟：chore 名骗过了两层判断。
+        let all_clustered = snap.dupes.len() > 1
+            && snap.dupes.iter().all(|d| d.x == snap.dupes[0].x && d.y == snap.dupes[0].y);
+        let all_self_rescuing = !snap.dupes.is_empty() && snap.dupes.iter().all(|d| {
+            let c = d.chore.as_str();
+            c.contains("寻找安全") || c.contains("恢复呼吸") || c.contains("待命")
+        });
+        let pseudo_idle = all_clustered && all_self_rescuing;
+        let everyone_unproductive = everyone_idle || pseudo_idle;
+        if backlog && everyone_unproductive {
             // 暂停快照是**冻结的稳定状态**（世界没动），"全员闲+工单积压"
             // 就是真实死锁信号 → 不需要多轮去抖，直接拉到阈值。
             // 运行期间才需要 2 轮去抖，避免把"正走向工单"误判空闲。
@@ -267,7 +279,7 @@ impl Agent {
         } else if !snap.paused {
             self.idle_streak_unworked = 0;
         }
-        if backlog && everyone_idle && self.idle_streak_unworked >= 2
+        if backlog && everyone_unproductive && self.idle_streak_unworked >= 2
             && !self.escalation_hold
         {
             // B: 确定性自救 —— 卡住的目标锁（surface/open_chamber）先清掉换列，
