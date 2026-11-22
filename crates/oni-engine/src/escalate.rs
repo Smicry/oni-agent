@@ -53,6 +53,32 @@ impl Kind {
     }
 }
 
+/// 快系统给出的候选动作 —— 慢系统**选**，不手算坐标。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Candidate {
+    pub id: String,
+    /// 动作语义名：extend_ladder / switch_column / switch_goal / cancel_orders ...
+    pub action: String,
+    /// 动作目标（坐标或列号，语义由 action 决定）
+    pub target: Option<(i32, i32)>,
+    pub note: String,
+}
+
+/// 结构化诊断上下文 —— 快系统提供足够信息，慢系统据此决策。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EscContext {
+    /// 卡点类型：unreachable_target / dead_orders / no_material / strategy_stale ...
+    pub obstacle: String,
+    /// 当前目标（语义名）
+    pub goal: String,
+    /// 卡住的目标格
+    pub target: Option<(i32, i32)>,
+    /// 可达包络 (x1,y1,x2,y2)
+    pub reach_bounds: Option<(i32, i32, i32, i32)>,
+    /// 候选动作（慢系统选其一）
+    pub candidates: Vec<Candidate>,
+}
+
 /// 一条升级请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Escalation {
@@ -79,6 +105,9 @@ pub struct Escalation {
     /// 是否已被慢系统处理
     #[serde(default)]
     pub acked: bool,
+    /// 结构化诊断（快系统提供，慢系统据此决策）
+    #[serde(default)]
+    pub context: EscContext,
 }
 
 /// escalation 文件所在目录（按存档隔离）。
@@ -96,11 +125,23 @@ fn pending_path() -> PathBuf {
     dir().join("pending.json")
 }
 
-/// C: 放行冷静期 —— ack 后同一 kind+node 静默 N 个周期，防止误报无限重生。
-/// 为什么需要：needs_ai 的条件（如膀胱涨）在放行后依然存在，
-/// 下一轮 priority::direct() 又判 needs_ai=true → 又 raise 同一条 →
-/// escalation_hold 永远为 true → 世界反复冻结，其它看门全被压制。
-const SILENCE_CYCLES: i64 = 3;
+/// C: 放行冷静期 —— ack 后同一 kind+node 静默 N 秒，防止误报无限重生。
+///
+/// 为什么用墙钟而非 cycle：cycle 在游戏暂停/低推进时**卡住不动**，
+/// 用 cycle 做水位会让静默**永不到期** → 真危机（如膀胱94%）被永久压制。
+/// 墙钟一定前进 → 静默必然到期 → 误报不刷屏、真危机仍能重报。
+const SILENCE_SECS: i64 = 180;
+
+/// 静默条目：到期墙钟秒 + ack 时的指标基线（恶化打破用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SilenceEntry {
+    /// 到期 unix 秒
+    until: i64,
+    /// ack 时的氧气 kg（下降超阈值 = 恶化，提前打破静默）
+    oxygen_kg: f64,
+    /// ack 时的食物 kcal
+    food_kcal: f64,
+}
 
 fn silence_path() -> PathBuf {
     dir().join("silence.json")
@@ -111,19 +152,31 @@ fn silence_key(kind: Kind, node: &str) -> String {
     format!("{kind:?}|{node}")
 }
 
-/// 纯函数：当前 cycle 是否落在该 key 的静默期内。
-fn should_silence(silence: &HashMap<String, i64>, key: &str, cycle: i64) -> bool {
-    cycle < *silence.get(key).unwrap_or(&0)
+/// 指标显著恶化 → 打破静默（通用原则：静默压"重复"，不压"恶化"）。
+/// 氧气掉了 20% 或食物掉了 20% 视为恶化。
+fn deteriorated(e: &SilenceEntry, ctx: &Ctx) -> bool {
+    let oxy_worse = e.oxygen_kg > 0.0 && ctx.oxygen_kg < e.oxygen_kg * 0.8;
+    let food_worse = e.food_kcal > 0.0 && ctx.food_kcal < e.food_kcal * 0.8;
+    oxy_worse || food_worse
 }
 
-fn read_silence() -> HashMap<String, i64> {
+/// 纯函数：是否处于静默期（墙钟未到期 且 指标未恶化）。
+/// 兼容旧数据：旧 silence.json 存的是 cycle 号（很小），作为 unix 秒早已过期 → 自动失效。
+fn should_silence(silence: &HashMap<String, SilenceEntry>, key: &str, now: i64, ctx: &Ctx) -> bool {
+    match silence.get(key) {
+        None => false,
+        Some(e) => now < e.until && !deteriorated(e, ctx),
+    }
+}
+
+fn read_silence() -> HashMap<String, SilenceEntry> {
     std::fs::read_to_string(silence_path())
         .ok()
-        .and_then(|t| serde_json::from_str::<HashMap<String, i64>>(&t).ok())
+        .and_then(|t| serde_json::from_str::<HashMap<String, SilenceEntry>>(&t).ok())
         .unwrap_or_default()
 }
 
-fn write_silence(s: &HashMap<String, i64>) {
+fn write_silence(s: &HashMap<String, SilenceEntry>) {
     let _ = std::fs::write(silence_path(), serde_json::to_string_pretty(s).unwrap_or_default());
 }
 
@@ -134,8 +187,17 @@ fn history_path() -> PathBuf {
 
 /// 写一条升级请求（同一 kind+node 的未处理请求会被替换，不刷屏）。
 pub fn raise(kind: Kind, node: &str, detail: String, suggestion: String, ctx: Ctx) -> u64 {
-    // C: 放行冷静期内不再重报（返回 0 = 跳过，调用方一律 let _ = 忽略）。
-    if should_silence(&read_silence(), &silence_key(kind, node), ctx.cycle) {
+    raise_struct(kind, node, detail, suggestion, ctx, EscContext::default())
+}
+
+/// 带结构化诊断的 raise —— 快系统提供足够信息（卡点/目标/可达区/候选），
+/// 慢系统据此**选**决策，而不是手算坐标。
+pub fn raise_struct(
+    kind: Kind, node: &str, detail: String, suggestion: String,
+    ctx: Ctx, context: EscContext,
+) -> u64 {
+    // C: 放行冷静期内不再重报（墙钟 + 恶化打破；返回 0 = 跳过）。
+    if should_silence(&read_silence(), &silence_key(kind, node), now(), &ctx) {
         return 0;
     }
     let id = next_id();
@@ -151,6 +213,7 @@ pub fn raise(kind: Kind, node: &str, detail: String, suggestion: String, ctx: Ct
         food_kcal: ctx.food_kcal,
         ts: now(),
         acked: false,
+        context,
     };
     // 写历史
     if let Some(d) = dir().parent().map(|p| p.to_path_buf()) {
@@ -210,13 +273,19 @@ pub fn ack(id: u64) -> bool {
     let Some(target) = list.iter().find(|e| e.id == id) else {
         return false;
     };
-    // C: 写静默水位 —— 放行后 SILENCE_CYCLES 个周期内同一 kind+node 不再重报。
+    // C: 写静默条目 —— 墙钟到期 + ack 时指标基线（恶化可提前打破）。
     let key = silence_key(target.kind, &target.node);
-    let until = target.cycle + SILENCE_CYCLES;
+    let entry = SilenceEntry {
+        until: now() + SILENCE_SECS,
+        oxygen_kg: target.oxygen_kg,
+        food_kcal: target.food_kcal,
+    };
     let mut silence = read_silence();
-    // 取 max：多条同 key 放行时静默期不缩短。
-    let entry = silence.entry(key).or_insert(until);
-    *entry = (*entry).max(until);
+    // 到期时间取 max：多条同 key 放行时静默期不缩短。
+    let slot = silence.entry(key).or_insert_with(|| entry.clone());
+    if entry.until > slot.until {
+        *slot = entry;
+    }
     write_silence(&silence);
 
     let remaining: Vec<Escalation> = list.into_iter().filter(|e| e.id != id).collect();
@@ -306,19 +375,25 @@ mod tests {
         assert_eq!(Kind::NoFeasibleTarget.label(), "找不到任何可行目标");
     }
 
-    /// C: 放行冷静期 —— 只有同 kind+node 且在静默水位内才跳过。
+    /// C: 墙钟静默 —— 到期内静默、到期后恢复、恶化提前打破、不同 key 隔离。
     #[test]
-    fn silence_is_scoped_and_expires() {
+    fn silence_is_scoped_expires_and_breaks_on_deterioration() {
+        let ctx = Ctx { cycle: 3, dupes: 3, oxygen_kg: 100.0, food_kcal: 1000.0 };
+        let entry = SilenceEntry { until: 200, oxygen_kg: 100.0, food_kcal: 1000.0 };
         let mut s = HashMap::new();
-        s.insert(silence_key(Kind::StrategyMismatch, ""), 10);
-        s.insert(silence_key(Kind::NoProgress, ""), 10);
-        // 同 key 在静默期内 → 跳过
-        assert!(should_silence(&s, &silence_key(Kind::StrategyMismatch, ""), 9));
-        // 到期后 → 恢复上报
-        assert!(!should_silence(&s, &silence_key(Kind::StrategyMismatch, ""), 10));
-        // 不同 key 不受影响（工单积压看门不能被膀胱放行压制）
-        assert!(!should_silence(&s, &silence_key(Kind::NoProgress, "node_x"), 9));
+        s.insert(silence_key(Kind::StrategyMismatch, ""), entry.clone());
+        s.insert(silence_key(Kind::NoProgress, ""), entry.clone());
+        let key = silence_key(Kind::StrategyMismatch, "");
+        // 墙钟未到期 → 静默
+        assert!(should_silence(&s, &key, 100, &ctx));
+        // 墙钟到期 → 恢复上报（即使 cycle 仍卡在 3）
+        assert!(!should_silence(&s, &key, 200, &ctx));
+        // 指标恶化 → 未到期也打破静默
+        let bad = Ctx { cycle: 3, dupes: 3, oxygen_kg: 70.0, food_kcal: 1000.0 };
+        assert!(!should_silence(&s, &key, 100, &bad), "氧气掉20%应打破静默");
+        // 不同 key 不受影响
+        assert!(!should_silence(&s, &silence_key(Kind::NoProgress, "node_x"), 100, &ctx));
         // 空表 → 不静默
-        assert!(!should_silence(&HashMap::new(), &silence_key(Kind::StrategyMismatch, ""), 9));
+        assert!(!should_silence(&HashMap::new(), &key, 100, &ctx));
     }
 }

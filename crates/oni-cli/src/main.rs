@@ -417,6 +417,18 @@ fn cmd_escalations(args: &[String]) -> anyhow::Result<()> {
                     "     快照: 周期{} 人口{} 氧气{:.0}kg 食物{:.0}kcal",
                     e.cycle, e.dupes, e.oxygen_kg, e.food_kcal
                 );
+                // 结构化诊断：慢系统据此**选**决策，不手算坐标。
+                let c = &e.context;
+                if !c.obstacle.is_empty() || !c.candidates.is_empty() {
+                    println!("     诊断: 卡点={} 目标={} 坐标={:?} 可达区={:?}",
+                        c.obstacle, c.goal, c.target, c.reach_bounds);
+                    for cand in &c.candidates {
+                        println!("       候选[{}] {}{}：{}", cand.id, cand.action,
+                            cand.target.map(|t| format!("@{},{}", t.0, t.1)).unwrap_or_default(),
+                            cand.note);
+                    }
+                    println!("     决策: oni resolve <id> '选候选X：<理由>'（选一个候选后快系统继续）");
+                }
             }
             println!();
             println!("处理完用: oni escalations ack <id>");

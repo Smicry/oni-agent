@@ -293,14 +293,57 @@ impl Agent {
             self.escalation_hold = true;
             self.escalation_since = Some(Instant::now());
             self.idle_streak_unworked = 0;
-            let _ = crate::escalate::raise(
+            // 结构化诊断：快系统提供卡点类型/目标/可达区/候选，慢系统**选**而非手算坐标。
+            let target = self.locked_goal_target();
+            let mut candidates = vec![
+                crate::escalate::Candidate {
+                    id: "dig_access".into(), action: "dig_access_path".into(),
+                    target, note: "沿可达区朝目标铺梯子/挖通路".into(),
+                },
+                crate::escalate::Candidate {
+                    id: "cancel_orders".into(), action: "cancel_dead_orders".into(),
+                    target: None, note: "撤销够不到的工单，让引擎重规划".into(),
+                },
+                crate::escalate::Candidate {
+                    id: "switch_goal".into(), action: "switch_goal".into(),
+                    target: None, note: "改目标（如断粮时先采食），放弃当前卡点".into(),
+                },
+            ];
+            // 断粮时把"改采食"标为首选（快系统算得出的确定性事实）。
+            if snap.food_kcal() < 400.0 * snap.dupes.len() as f64 * 5.0 {
+                candidates[2].note = "★首选：食物续航<5周期，先采食再换气".into();
+            }
+            let context = crate::escalate::EscContext {
+                obstacle: "dead_orders_unreachable".into(),
+                goal: "surface/open_chamber".into(),
+                target,
+                reach_bounds: snap.reach_bounds,
+                candidates,
+            };
+            let _ = crate::escalate::raise_struct(
                 crate::escalate::Kind::NoProgress, "", detail.clone(),
-                "AI: dead orders unreachable? dig access path / cancel / replan".into(),
+                "AI: pick a candidate — dig access / cancel dead orders / switch goal".into(),
                 crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
                     oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                context,
             );
-            report.notes.push(format!("[上报AI] 工单积压+全员闲：{detail}"));
+            report.notes.push(format!("[上报AI] 工单积压+全员闲(带结构化候选)：{detail}"));
         }
+    }
+
+    /// 读当前卡住的目标锁坐标（surface/open_chamber），作为结构化诊断的 target。
+    fn locked_goal_target(&self) -> Option<(i32, i32)> {
+        let path = oni_mcp::save::save_file("goal_lock.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        for key in ["surface", "open_chamber"] {
+            if let Some(g) = v.get(key) {
+                let x = g.get("x")?.as_i64()? as i32;
+                let y = g.get("y")?.as_i64()? as i32;
+                return Some((x, y));
+            }
+        }
+        None
     }
 
     /// B: 清除卡住的目标锁，让 PLANNER 下一轮换列重算。
