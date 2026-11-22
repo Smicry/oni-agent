@@ -25,10 +25,12 @@ button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
 .msg-ai{background:#434c5e;border-left:3px solid #a3be8c}
 .msg-fast{background:#4c566a;border-left:3px solid #ebcb8b}
 .msg-result{background:#3b4252;border-left:3px solid #b48ead}
+.msg-circuit{background:#4c566a;border-left:3px solid #bf616a}
 .msg .who{font-size:11px;color:#88c0d0;margin-bottom:3px}
 .msg-ai .who{color:#a3be8c}
 .msg-fast .who{color:#ebcb8b}
 .msg-result .who{color:#b48ead}
+.msg-circuit .who{color:#bf616a}
 .msg .body{white-space:pre-wrap;word-break:break-word}
 .msg .result{margin-top:5px;font-size:11px;color:#ebcb8b;border-top:1px dashed #4c566a;padding-top:4px}
 .badge{font-size:10px;padding:1px 5px;border-radius:3px;margin-left:6px}
@@ -80,7 +82,7 @@ async function refresh(){
   document.getElementById('dupes').innerHTML=(s.dupes||[]).map(function(d){
     return '<div class="dupe">'+esc(d.name)+' @('+d.x+','+d.y+') '+esc(d.chore)+' 膀胱'+Math.round(d.bladder)+' 呼吸'+Math.round(d.breath)+'</div>';}).join('')||'<div class="small">无数据</div>';
   var conv=document.getElementById('conv');
-  var roleUi={'user':['你','msg-user'],'assistant':['慢系统','msg-ai'],'fast':['快系统·卡点','msg-fast'],'result':['快系统·反馈','msg-result']};
+  var roleUi={'user':['你','msg-user'],'assistant':['慢系统','msg-ai'],'fast':['快系统·卡点','msg-fast'],'result':['快系统·反馈','msg-result'],'circuit':['熔断闸门','msg-circuit']};
   conv.innerHTML=(s.conversation||[]).map(function(m){
     var ui=roleUi[m.role]||roleUi['assistant'];
     var label=m.status_label||(m.status==='success'?'完成':m.status==='fail'?'失败':'待处理');

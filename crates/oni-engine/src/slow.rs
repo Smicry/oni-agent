@@ -292,6 +292,73 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
   **重要**: 想让游戏做事就填 goal（这是你真正的执行力），别只在 reason 里写文字描述。
 - commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。";
 
+/// 失败熔断阈值：同一 goal 连续失败达到此次数 → 禁止再选，强制换策略。
+const FAIL_CIRCUIT_THRESHOLD: usize = 3;
+/// 熔断冷却：最近一次失败后多少秒内不再允许该 goal（超时后允许重试一次）。
+const FAIL_CIRCUIT_COOLDOWN_SECS: i64 = 1800;
+
+/// 单个 goal 的整局成败统计。
+#[derive(Debug, Clone)]
+struct GoalStatus {
+    goal: String,
+    /// 自上次成功以来的连续失败次数（成功清零）。
+    fails_since_success: usize,
+    total_fail: usize,
+    total_ok: usize,
+    last_fail_ts: i64,
+    last_detail: String,
+}
+
+/// 纯函数：从 goal_outcomes 的 jsonl 行计算每个 goal 的状态。
+/// 按时间正序处理：成功清零连续计数，失败累加。
+fn compute_goal_status(lines: &[&str]) -> Vec<GoalStatus> {
+    use std::collections::HashMap;
+    let mut order: Vec<String> = Vec::new();
+    let mut m: HashMap<String, GoalStatus> = HashMap::new();
+    for line in lines {
+        let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
+        let goal = o.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if goal.is_empty() { continue; }
+        let ok = o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ts = o.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+        let detail: String = o.get("detail").and_then(|v| v.as_str()).unwrap_or("")
+            .chars().take(60).collect();
+        if !m.contains_key(&goal) {
+            order.push(goal.clone());
+            m.insert(goal.clone(), GoalStatus {
+                goal: goal.clone(), fails_since_success: 0, total_fail: 0, total_ok: 0,
+                last_fail_ts: 0, last_detail: String::new(),
+            });
+        }
+        let e = m.get_mut(&goal).unwrap();
+        if ok {
+            e.total_ok += 1;
+            e.fails_since_success = 0;
+        } else {
+            e.total_fail += 1;
+            e.fails_since_success += 1;
+            e.last_fail_ts = ts;
+            e.last_detail = detail;
+        }
+    }
+    order.into_iter().filter_map(|g| m.remove(&g)).collect()
+}
+
+/// 读当前存档的 goal 状态快照。
+fn goal_status_snapshot() -> Vec<GoalStatus> {
+    let Ok(text) = std::fs::read_to_string(save_dir().join("goal_outcomes.jsonl")) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    compute_goal_status(&lines)
+}
+
+/// 该 goal 当前是否处于熔断状态（连续失败≥阈值 且 未过冷却）。
+fn is_circuit_broken(s: &GoalStatus, now_ts: i64) -> bool {
+    s.fails_since_success >= FAIL_CIRCUIT_THRESHOLD
+        && (now_ts - s.last_fail_ts) < FAIL_CIRCUIT_COOLDOWN_SECS
+}
+
 /// 读取最近的 ai_goal 决策及其执行回执，生成紧凑的"决策→结果"历史，
 /// 整局记忆系统：滑动窗口(最近决策) + 持久教训(失败模式统计)。
 /// 上下文可控：窗口6条 + 教训5条，约1500字符。
@@ -330,11 +397,32 @@ fn recent_decision_history() -> String {
         out.push_str("\n持久教训(整局统计):\n");
         for l in lessons.iter().take(5) { out.push_str(l); out.push('\n'); }
     }
-    out.push_str("\n历史仅供参考,非当前指令。\n");
+    out.push_str("\n失败历史是开头「失败熔断」的硬依据：连续失败≥3次的目标本轮禁止再选。\n");
     out
 }
 fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
-    let mut p = String::from("== 当前局面 ==\n");
+    let mut p = String::new();
+    // 🔴 失败熔断：最高优先级硬约束（见开头），逼迫换策略而非重复失败目标。
+    let statuses = goal_status_snapshot();
+    let now_ts = now();
+    let broken: Vec<&GoalStatus> = statuses.iter()
+        .filter(|s| is_circuit_broken(s, now_ts)).collect();
+    if !broken.is_empty() {
+        p.push_str("== 🔴 失败熔断（硬性约束，非建议）==\n");
+        p.push_str("以下 goal 连续失败≥3次且未过冷却，本轮严禁再选；重复选会被系统拒绝并记入对话：\n");
+        for s in &broken {
+            p.push_str(&format!("  - {}: 连续失败{}次/成功{}次，最近原因「{}」\n",
+                s.goal, s.fails_since_success, s.total_ok, s.last_detail));
+        }
+        let working: Vec<&str> = statuses.iter()
+            .filter(|s| s.total_ok > 0 && !is_circuit_broken(s, now_ts))
+            .map(|s| s.goal.as_str()).collect();
+        if !working.is_empty() {
+            p.push_str(&format!("  - 有成功记录的可用目标（证据支持）: {}\n", working.join(" / ")));
+        }
+        p.push_str("  - 本轮必须换策略：选上述可用目标之一，或用 commands 下精确工单。\n\n");
+    }
+    p.push_str("== 当前局面 ==\n");
     let diag = snap.get("diagnostics").unwrap_or(&Value::Null);
     p.push_str(&format!("周期={} 暂停={} 食物={}kcal 氧气={}kg\n",
         snap.get("cycle").unwrap_or(&Value::Null),
@@ -443,8 +531,29 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
 
 fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String {
     let mut log = Vec::new();
-    // B方案：语义目标写进 commands.jsonl，快系统用 autoact 翻译成工单执行。
-    if push_ai_goal(&dec.goal, &dec.reason) {
+    // 🔴 代码级熔断：prompt 是软约束，LLM 可能无视；这里是硬闸门。
+    // 连续失败≥3次且未过冷却的 goal 绝不入队，并写一条 circuit_break 留痕进对话。
+    let statuses = goal_status_snapshot();
+    let now_ts = now();
+    let broken = statuses.iter().find(|s| s.goal == dec.goal.trim()
+        && is_circuit_broken(s, now_ts));
+    if let Some(s) = broken {
+        let note = format!("goal={} 连续失败{}次/成功{}次，最近「{}」→ 拒绝入队，强制换策略",
+            s.goal, s.fails_since_success, s.total_ok, s.last_detail);
+        log.push(format!("⛔ 熔断拒绝 {}", note));
+        let sd = save_dir();
+        let rec = serde_json::json!({
+            "id": now_ts, "ts": now_ts,
+            "goal": s.goal, "fails": s.fails_since_success,
+            "detail": s.last_detail, "reason": note,
+        });
+        // 独立文件：不污染 decisions.jsonl 的「最近决策」，避免淹没真实决策。
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(sd.join("circuit_breaks.jsonl")) {
+            let _ = writeln!(f, "{}", rec);
+        }
+    } else if push_ai_goal(&dec.goal, &dec.reason) {
+        // B方案：语义目标写进 commands.jsonl，快系统用 autoact 翻译成工单执行。
         log.push(format!("ai_goal[{}]:已入队(快系统执行)", dec.goal));
     }
     for c in &dec.commands {
@@ -575,6 +684,23 @@ fn build_conversation() -> Vec<Value> {
         }
     }
 
+    // 5) 熔断拒绝（circuit_breaks.jsonl）—— 系统硬闸门拦下重复失败目标
+    if let Ok(text) = std::fs::read_to_string(sd.join("circuit_breaks.jsonl")) {
+        let clines: Vec<&str> = text.lines().rev().take(6).collect();
+        for line in clines.iter().rev() {
+            let Ok(b) = serde_json::from_str::<Value>(line) else { continue };
+            let goal = b.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+            let fails = b.get("fails").and_then(|v| v.as_u64()).unwrap_or(0);
+            let detail: String = b.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(50).collect();
+            msgs.push(serde_json::json!({
+                "role": "circuit",
+                "text": format!("goal={} 连续失败{}次 → 拒绝重复，强制换策略：{}", goal, fails, detail),
+                "status": "fail", "status_label": "已熔断",
+                "result": "", "ts": b.get("ts").and_then(|v| v.as_i64()).unwrap_or(0),
+            }));
+        }
+    }
+
     // 按时间排序 → 按角色配额截断（保留各类最近若干条）→ 再按时间排序
     msgs.sort_by_key(|m| m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0));
     let take_role = |role: &str, n: usize| -> Vec<Value> {
@@ -588,6 +714,7 @@ fn build_conversation() -> Vec<Value> {
     out.extend(take_role("assistant", 12));
     out.extend(take_role("fast", 8));
     out.extend(take_role("result", 8));
+    out.extend(take_role("circuit", 5));
     out.sort_by_key(|m| m.get("ts").and_then(|v| v.as_i64()).unwrap_or(0));
     out
 }
@@ -820,6 +947,44 @@ pub fn run(cfg: SlowConfig, once: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn circuit_breaker_counts_consecutive_failures_and_resets_on_success() {
+        let lines = [
+            r#"{"goal":"oxygen","ok":false,"detail":"fail1","ts":100}"#,
+            r#"{"goal":"material","ok":true,"detail":"ok","ts":101}"#,
+            r#"{"goal":"oxygen","ok":false,"detail":"fail2","ts":102}"#,
+            r#"{"goal":"oxygen","ok":false,"detail":"fail3","ts":103}"#,
+            r#"{"goal":"oxygen","ok":false,"detail":"fail4","ts":104}"#,
+            r#"{"goal":"material","ok":false,"detail":"m-fail","ts":105}"#,
+        ];
+        let st = compute_goal_status(&lines);
+        let o = st.iter().find(|s| s.goal == "oxygen").unwrap();
+        assert_eq!(o.fails_since_success, 4);
+        assert_eq!(o.total_fail, 4); assert_eq!(o.total_ok, 0);
+        assert_eq!(o.last_fail_ts, 104);
+        // 连续失败≥3 且最近失败在冷却内 → 熔断
+        assert!(is_circuit_broken(o, 104 + 100));
+        // 冷却过期 → 允许重试
+        assert!(!is_circuit_broken(o, 104 + FAIL_CIRCUIT_COOLDOWN_SECS + 1));
+        // material 只有 1 次失败（且此前成功过）→ 不熔断
+        let m = st.iter().find(|s| s.goal == "material").unwrap();
+        assert_eq!(m.fails_since_success, 1);
+        assert_eq!(m.total_ok, 1);
+        assert!(!is_circuit_broken(m, 200));
+        // 失败后出现成功 → 连续计数清零
+        let lines2 = [
+            r#"{"goal":"oxygen","ok":false,"detail":"f","ts":100}"#,
+            r#"{"goal":"oxygen","ok":false,"detail":"f","ts":101}"#,
+            r#"{"goal":"oxygen","ok":false,"detail":"f","ts":102}"#,
+            r#"{"goal":"oxygen","ok":true,"detail":"ok","ts":103}"#,
+        ];
+        let st2 = compute_goal_status(&lines2);
+        let o2 = st2.iter().find(|s| s.goal == "oxygen").unwrap();
+        assert_eq!(o2.fails_since_success, 0);
+        assert_eq!(o2.total_ok, 1);
+        assert!(!is_circuit_broken(o2, 200));
+    }
 
     #[test]
     fn decode_preserves_real_utf8_and_decodes_escapes() {
