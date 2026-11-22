@@ -58,9 +58,9 @@ cargo build --release
 
 ## 7. 冻结纪律
 
-- 用户手动暂停 = 最高优先级，代理绝不越权恢复；暂停所有权持久化在 `saves/<fp>/control.json`。
-- 恢复按 owner 校验；未知来源保守判 user；`oni window` 是用户授权代理恢复的信号。
-- 主 agent 改代码前 `oni hold`，改完 `oni release`。
+- **唯一的用户停止信号 = AI 总开关**（Web「停止 AI」= `oni hold`，落盘 owner=hold）：冻结世界 + 代理待命，重载/重启后保持，直到「启动 AI」(`oni release` + window)。
+- AI 开启时，游戏的暂停/运行**完全由代理自主决定**：任何非 hold 的暂停（owner=agent/none/user）都视为可恢复，代理直接清 owner + resume + 开施工窗口，长线任务不被打断。用户不再需要单独暂停游戏。
+- 主 agent 改代码前 `oni hold`，改完 `oni release`（与 AI 总开关同一机制）。
 - 紧急态（有人倒地/呼吸<35）：占空比冻 20s → 跑 120s；暂停只冻结倒计时，救不了窒息的人。
 - 卡住时不停世界：只本轮不下新工单，让已有工单继续做。
 - 空闲即冻结（无待办且无施工）；窗口到期按"有活续窗 / 空闲冻回"。

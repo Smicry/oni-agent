@@ -26,7 +26,8 @@ pub struct AgentConfig {
     pub plan_path: String,
     /// 紧急暂停后的冷却秒数（冷却期内只记录，不重复暂停）
     pub pause_cooldown: u64,
-    /// 手动暂停是否自动恢复（**默认 false：绝不越权恢复用户的暂停**）
+    /// 已废弃：仅保留兼容 CLI 参数，不再参与逻辑。
+    /// 现在唯一的"用户停止"信号是 hold（AI 总开关），其余暂停代理一律自主恢复。
     pub auto_resume_manual: bool,
     /// 「施工窗口」秒数：只有在这个窗口里游戏才跑；窗口结束立刻冻回去
     pub work_window_secs: u64,
@@ -114,7 +115,7 @@ pub struct Agent {
     last_danger: String,
     /// 当前施工窗口的截止时间（None = 不在窗口内，游戏应保持暂停）
     window_until: Option<Instant>,
-    /// 用户手动暂停（代理不得越权恢复）
+    /// 用户手动暂停（已废弃：恒为 false；唯一停止信号是 hold，见 hold_active()）
     user_paused: bool,
     /// 当前这一段运行是代理自己开的施工窗口（到期由代理冻回）
     window_owned_by_us: bool,
@@ -148,7 +149,7 @@ pub struct Agent {
     /// **因「等慢系统」而冻结世界**（有 pending escalation / 待处理用户指令）。
     ///
     /// 与其它暂停标志严格区分：
-    ///   - user_paused   = 用户手动暂停 → 代理**绝不**恢复；
+    ///   - user_paused   = 已废弃（恒 false）；唯一停止信号是 hold；
     ///   - frozen        = 施工窗口正常到期 → 可自持续窗；
     ///   - idle_stopped  = 空跑停机 → 不得自动恢复；
     ///   - escalation_hold = 等慢系统 → 只能由慢系统 ack 或看门狗解除。
@@ -526,14 +527,10 @@ impl Agent {
         //    铁律：**世界不跑 ⇒ 不下工单、不累计进展、不熔断。**
         // =====================================================================
         let observed_running = !snap.paused;
-        // 暂停所有权恢复：
-        //   守护进程换二进制重启后内存标志全清零，但 control.json 还在。
-        //   若持久化的 owner=User（hook/用户暂停）→ 恢复 user_paused，绝不越权恢复；
-        //   否则不臆造"用户暂停"。
+        // 暂停所有权：唯一的用户停止信号是 hold（AI 总开关关），
+        //   在下方 hold_active() 早退处理。其它 owner 一律由代理自主恢复。
+        //   （旧逻辑把 owner=User 判成"用户暂停→绝不恢复"，与 AI 总开关重复且致死锁。）
         let ctl = crate::control::read();
-        if ctl.owner == crate::control::Owner::User {
-            self.user_paused = true;
-        }
         // 上一轮结束时世界在跑吗？→ 这一轮世界有没有真的动过（决定能不能比指纹）
         let world_advanced = self.left_running;
         self.left_running = observed_running;
@@ -687,11 +684,19 @@ impl Agent {
             //   - 有 hold 标记（主 agent 改代码中）→ 上面已早退，不会走到这里
             //   - 连续自持上限 RHYTHM_MAX：即使误判也不会长期越权暂停用户的游戏
             const RHYTHM_MAX: usize = 4;
+            // ★ 有未完成的长线目标/在建工单 → 视为"有活"，续窗不消耗自持额度，
+            //   让竖井/研究这类跨多窗口任务能持续到完成（原来4次后必停 = 长线任务夭折）。
+            let has_pending_goal = !crate::commands::ai_goals_pending().is_empty()
+                || crate::escalate::has_pending();
+            let work_pending = has_pending_goal
+                || snap.pending_orders.unwrap_or(0) > 0
+                || snap.under_construction > 0;
+            if work_pending { self.rhythm_streak = 0; }
             let rhythm_due = self.auto_rhythm
                 && self.frozen
                 && !self.user_paused
                 && !self.idle_stopped
-                && self.rhythm_streak < RHYTHM_MAX
+                && (work_pending || self.rhythm_streak < RHYTHM_MAX)
                 && self
                     .resume_at
                     .map(|t| Instant::now() >= t)
@@ -726,17 +731,28 @@ impl Agent {
                 self.last_danger.clear();
                 can_execute = true;
                 report.notes.push("▶ 危急已解除 → 开施工窗口".into());
-            } else if ctl.owner == crate::control::Owner::Agent {
-                // ★ 死锁修复：世界是代理自己冻的（needs_ai / 窗口到期），不是用户暂停。
-                //   绝不标成 user_paused，否则下面「慢系统已处理 → 解冻」会被
-                //   「绝不越权恢复用户暂停」挡死 → 慢系统 ack 后世界永久冻住。
-                report.notes.push(
-                    "⏸ 代理冻结中（owner=agent）→ 等慢系统/看门狗解冻，不标用户暂停".into(),
-                );
             } else {
-                self.user_paused = true;
+                // ★ 统一恢复：AI 开启时，游戏的运行/暂停由代理自主决定。
+                //   唯一的用户停止信号是 hold（已在上方早退）；
+                //   其余 owner（agent/none/user/escalation）的暂停一律视为可恢复，
+                //   直接清 owner + resume 游戏 + 开施工窗口，长线任务继续执行。
+                crate::control::clear();
+                self.frozen = false;
+                self.auto_rhythm = false;
+                self.idle_stopped = false;
+                self.user_paused = false;
+                self.rhythm_streak = 0;
+                self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
+                self.window_owned_by_us = true;
+                let _ = self.session.call_text(
+                    "game_control",
+                    serde_json::json!({ "domain": "speed", "action": "resume",
+                                       "task": format!("代理: AI自主恢复（原 owner={:?}）开施工窗口", ctl.owner) }),
+                );
+                self.left_running = true;
+                can_execute = true;
                 report.notes.push(
-                    "⏸ 用户手动暂停中 → 代理只观察待命，绝不越权恢复".into(),
+                    format!("⏸→▶ 代理自主恢复（原 owner={:?}）→ 开施工窗口，长线任务继续", ctl.owner),
                 );
             }
         }
@@ -1089,14 +1105,16 @@ impl Agent {
                         "🔇 semantic 决策处于放行冷静期 → 不冻结、不重报（继续自主运行）".into(),
                     );
                 } else {
-                    if observed_running {
-                        self.pause("semantic decision needed → freeze for AI");
-                    }
+                    // ★ 长线任务优化：语义决策不再冻结世界。
+                    //   冻结会打断正在执行的施工窗口/竖井工单，且制造
+                    //   "owner=none + 暂停"的不一致状态 → 快系统判用户暂停 → 永久停摆。
+                    //   按 AGENTS.md §7：卡住时不停世界，只本轮不下新工单，
+                    //   已下的长线工单照常执行，慢系统改方向后下一轮接着干。
                     self.escalation_hold = true;
                     self.escalation_since = Some(Instant::now());
-                    self.window_until = None;
-                    self.window_owned_by_us = false;
-                    report.notes.push("⏸ semantic decision escalated to AI; no local action".into());
+                    report.notes.push(
+                        "⏸ semantic decision escalated to AI; 本轮不下新工单（世界继续跑，长线工单照常执行）".into(),
+                    );
                     return report;
                 }
             } else {
@@ -1799,9 +1817,7 @@ impl Agent {
             {
                 let who: Vec<String> = sustained.iter().map(|(n, c)| format!("{n}({c}轮)")).collect();
                 let detail = format!("Sustained individual idleness [{}] while goals remain; assign work or replan", who.join(", "));
-                self.pause("individual idle → freeze for AI work assignment");
-                self.window_until = None;
-                self.window_owned_by_us = false;
+                // ★ 不冻结世界：空闲上报只停"下新工单"，世界继续跑（避免长线工单被冻死）。
                 self.escalation_hold = true;
                 self.escalation_since = Some(Instant::now());
                 let _ = crate::escalate::raise(
@@ -1843,9 +1859,7 @@ impl Agent {
         if self.idle_streak >= 2 && !snap.paused {
             // Idle may mean "plan done" or "goals exist but nobody executes".
             // The fast system cannot judge which - freeze and escalate to AI.
-            self.pause("all dupes idle → freeze for AI judgment");
-            self.window_until = None;
-            self.window_owned_by_us = false;
+            // ★ 不冻结世界：全员空闲只上报慢系统（它会主动规划补 goal），世界继续跑。
             self.idle_streak = 0;
             self.escalation_hold = true;
             self.escalation_since = Some(Instant::now());

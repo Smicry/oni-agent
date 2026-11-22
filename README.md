@@ -69,7 +69,7 @@ handoff so the colony never freezes forever.
 - **Effect criteria**: success checks use end-state metrics (oxygen, food, population, reachable cells), not intermediate stock.
 - **Semantic actions**: plans contain intents (`surface`, `open_chamber`, `element:X`, `material`), not hardcoded coordinates.
 - **Preflight before write**: every dig/build goes through preflight + dry-run + apply + re-read.
-- **Pause ownership**: pauses are explicit (`owner`, `reason`, `since`) and survive process restarts; resume is owner-checked.
+- **Single control switch (AI on/off)**: the user controls the agent, not the game clock. `stop` (hold) is the *only* user stop signal — it freezes the world and stands the agent down, surviving reloads/restarts. While AI is on, the agent owns game pause/resume entirely: any non-hold pause is auto-resumed with a fresh work window, so long-running jobs (shafts, research) are never stranded by a stale "user paused" flag. Old per-pause owners (`agent`/`none`/`user`) are all treated as resumable now; only `hold` is authoritative.
 - **Decision record**: each slow-system decision is logged with rationale and expected outcome (see `decisions.jsonl`).
 - **Structured failure feedback**: every goal execution writes `goal_outcomes.jsonl` with a
   `fail_kind` (`no_target`/`no_material`/`research_locked`/`preflight`/`rejected`/`no_placement`/`bad_goal`).
