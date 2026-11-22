@@ -97,6 +97,10 @@ cargo build --release
 
 ## 11. 快慢分工（最终架构）
 
-快系统只做「确定性计算 + 指标看门 + 执行」；所有需要权衡的语义决策（建厕所/产氧方向/救援落点/禁止扩张）用 `needs_ai` 标记 → 冻结世界 + escalation 上报 AI，不在本地决断。
-唯一例外：倒地救援（downed）保留快系统占空比（冻20s→跑120s）——倒地不可自愈，冻结会阻断恢复。
-AI 慢系统通过 `oni status/escalations/decision` 读局面，改 locked plan 决策，`oni decision` 留痕。
+**完整契约见 `docs/FAST_SLOW_CONTRACT.md`（唯一权威，代码与之不符时改代码）。**
+
+核心：**慢系统决定"往哪走"，快系统决定"现在怎么活下来"；慢系统从不阻塞快系统。**
+- 快系统每轮必做保命动作（救援/建厕所/产氧/换气/清污），`needs_ai` 只上报 AI 做战略参考、**绝不停手/冻结**。
+- AI 开启时世界默认运行；暂停只允许：hold（用户关总开关）、紧急态占空比（冻20s→跑120s）、施工窗口到期自持。
+- "等慢系统"不是暂停理由；`escalation_hold` 已废除。急症只跳"扩张类"goal，保命/续航 goal 照常执行。
+- AI 慢系统通过 `oni status/escalations/decision` 读局面，改 locked plan / ai_goals，`oni decision` 留痕。

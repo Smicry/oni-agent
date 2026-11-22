@@ -50,18 +50,20 @@ The fast system publishes escalations and a shared snapshot; the slow system wri
 goals (`ai_goals.jsonl`) and precise orders. No duplicate MCP collection: the daemon is the only
 sampler. See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](docs/dual-system.md).
 
-The slow system is **not purely reactive**: besides escalations / user commands, a 60s
-*proactive-planning heartbeat* makes it re-read the strategic plan and push the next milestone even
-when nothing is wrong — so a safe, idle colony still progresses instead of stalling. It reads
-`plan.json` (AI-owned, `locked:true`) each cycle and injects a progress summary (done milestones +
-next actionable nodes) into the prompt. An endgame meta-decision detects a wiped colony (no living
-dupes) and stops burning LLM calls, advising a rollback instead.
+**The authoritative fast/slow contract is [`docs/FAST_SLOW_CONTRACT.md`](docs/FAST_SLOW_CONTRACT.md).**
+In short: the slow system decides *where to go*, the fast system decides *how to survive right now* —
+the slow system **never blocks** the fast system. `escalations` are FYI reports for strategy, not
+approval gates; the fast system keeps executing life-saving actions while the LLM thinks.
 
-The handoff is **synchronous + throttled**: on a stuck point the fast system freezes the world and
-waits; a silence key of `kind|node|category` (category = semantic problem class) suppresses repeat
-reports of the same issue within 180s while letting a different problem or a real deterioration
-(oxygen/food −20%, breath −15, bladder +15) break through. A 300s watchdog downgrades a stalled
-handoff so the colony never freezes forever.
+The slow system is **not purely reactive**: besides escalations, a 60s *proactive-planning heartbeat*
+re-reads the strategic plan and pushes the next milestone even when nothing is wrong. It reads
+`plan.json`（AI-owned, `locked:true`) and injects a progress summary into the prompt. An endgame
+meta-decision detects a wiped colony and advises rollback instead of burning LLM calls.
+
+Escalation dedup uses a `kind|node|category` silence key (180s) with deterioration override
+(oxygen/food −20%, breath −15, bladder +15) so the same issue doesn't spam while real decline breaks
+through. On life-red-line emergencies the fast system skips only *expansion* goals — survival goals
+(toilet/oxygen/material) always run.
 
 ## Key mechanisms
 

@@ -140,15 +140,6 @@ pub struct Agent {
     last_pop: usize,
     /// 保命节点连续失败次数
     survival_failures: usize,
-    /// **因「等慢系统」而冻结世界**（有 pending escalation / 待处理用户指令）。
-    ///
-    /// 与其它暂停标志严格区分：
-    ///   - frozen        = 施工窗口正常到期 → 可自持续窗；
-    ///   - idle_stopped  = 空跑停机 → 不得自动恢复；
-    ///   - escalation_hold = 等慢系统 → 只能由慢系统 ack 或看门狗解除。
-    escalation_hold: bool,
-    /// 因「等慢系统」冻结的起点（看门狗用：太久没人处理就降级继续，避免殖民地饿死）
-    escalation_since: Option<Instant>,
     /// **卡住去抖计数**：同一 kind 连续命中几轮（瞬时状态不升级）。
     ///
     /// 为什么需要：
@@ -194,10 +185,6 @@ fn strip_stuck_locks(v: &mut Value) -> usize {
 }
 
 impl Agent {
-    /// **看门狗**：等慢系统超过这么多秒还没处理 → 降级解除冻结（避免殖民地饿死）。
-    ///
-    /// 慢系统可能离线/崩溃/被打断；没有看门狗 → 世界永远冻着 → 殖民地慢慢死。
-    const ESCALATION_WATCHDOG_SECS: u64 = 300;
     pub fn new(session: McpSession, catalog: Catalog, cfg: AgentConfig) -> Self {
         Self {
             session,
@@ -220,8 +207,6 @@ impl Agent {
             last_pop: 0,
             survival_failures: 0,
             space_failures: 0,
-            escalation_hold: false,
-            escalation_since: None,
             stuck_streak: std::collections::HashMap::new(),
             replan_cooldown: 0,
             last_fingerprint: String::new(),
@@ -287,9 +272,7 @@ impl Agent {
         } else if !snap.paused {
             self.idle_streak_unworked = 0;
         }
-        if backlog && everyone_unproductive && self.idle_streak_unworked >= 2
-            && !self.escalation_hold
-        {
+        if backlog && everyone_unproductive && self.idle_streak_unworked >= 2 {
             // B: 确定性自救 —— 卡住的目标锁（surface/open_chamber）先清掉换列，
             //    只有换列也救不回来（第二次达阈值）才上报 AI。
             let cleared = self.clear_stuck_goal_locks();
@@ -304,14 +287,7 @@ impl Agent {
             let detail = format!(
                 "{} work orders pending but all {} dupes idle — dead orders or unreachable target?",
                 snap.pending_orders.unwrap_or(0), snap.dupes.len());
-            // 世界本就被 hook 冻住时不要越权改 owner；只在运行时主动冻结。
-            if !snap.paused {
-                self.pause("work backlog + all idle → freeze for AI judgment");
-                self.window_until = None;
-                self.window_owned_by_us = false;
-            }
-            self.escalation_hold = true;
-            self.escalation_since = Some(Instant::now());
+            // ★ 契约：工单积压+全员闲只上报慢系统，不冻结世界（保命/执行不阻塞）。
             self.idle_streak_unworked = 0;
             // 结构化诊断：快系统提供卡点类型/目标/可达区/候选，慢系统**选**而非手算坐标。
             let target = self.locked_goal_target();
@@ -708,7 +684,7 @@ impl Agent {
                 ));
             } else if self.frozen || self.idle_stopped {
                 report.notes.push("🔒 已冻回暂停（等新窗口请求）".into());
-            } else if self.paused_by_us && !self.escalation_hold {
+            } else if self.paused_by_us {
                 // 上轮紧急暂停、条件已解除 → 开一个短窗口，而不是一直跑
                 // **等慢系统期间不能在这里恢复**。
                 //   旧逻辑：paused_by_us 就恢复 → 下一轮「等慢系统」又冻回
@@ -790,45 +766,8 @@ impl Agent {
         // A: 观测前移 —— 空闲看门在闸门之前跑，hook 暂冻世界时也能发现"有活没人干"。
         self.watch_backlog_idle(&snap, &mut report);
 
-        // =====================================================================
-        // 2.6) 慢系统交接收尾：pending 清空后自动解冻 + 看门狗兜底
-        //   ★ 死锁修复：这段必须在执行闸门(3)之前！
-        //     旧代码把它放在闸门之后，世界暂停时闸门提前 return →
-        //     慢系统 ack 后无人解冻（owner=agent 又被误判成用户暂停）→
-        //     慢系统无事件 → idle → 循环彻底停摆。
-        // =====================================================================
-        {
-            let pending_esc = crate::escalate::has_pending();
-            let pending_cmd = !crate::commands::pending().is_empty();
-            let agent_owner = ctl.owner == crate::control::Owner::Agent;
-            if self.escalation_hold && !pending_esc && !pending_cmd {
-                // 慢系统已处理（pending 清空）→ 解冻
-                self.escalation_hold = false;
-                self.escalation_since = None;
-                report.notes.push("✅ 慢系统已处理 → 解除冻结，快系统继续自主运行".into());
-                if agent_owner && !observed_running {
-                    self.resume("慢系统已处理，恢复施工");
-                    self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
-                    self.window_owned_by_us = true;
-                }
-            } else if self.escalation_hold {
-                let since = *self.escalation_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_secs(Self::ESCALATION_WATCHDOG_SECS) {
-                    self.escalation_hold = false;
-                    self.escalation_since = None;
-                    crate::escalate::note_unhandled("看门狗超时，慢系统未处理");
-                    report.notes.push(format!(
-                        "⏱ 等慢系统已 {}s 无人处理 → 看门狗降级：解除冻结，继续自主运行",
-                        since.elapsed().as_secs()
-                    ));
-                    if agent_owner && !observed_running {
-                        self.resume("看门狗超时，恢复施工");
-                        self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
-                        self.window_owned_by_us = true;
-                    }
-                }
-            }
-        }
+        // ★ 契约：不再有"等慢系统→冻结/解冻/看门狗"逻辑。
+        //   慢系统只是参谋，从不暂停世界。保留 control owner 的自主恢复（状态机处）。
 
         // =====================================================================
         // 3) 执行闸门：世界不跑 ⇒ 只观察
@@ -906,14 +845,23 @@ impl Agent {
             || snap.min_breath().map(|b| b < crate::priority::URGENT_BREATH).unwrap_or(false)
             || (snap.max_bladder() > crate::priority::BLADDER_CRITICAL
                 && snap.building("toilets") < snap.dupes.len() as i64);
-        if urgent_guard {
-            report.notes.push(
-                "🚨 生命红线告急 → 本轮跳过长线 goal，工单额度让给紧急抢占".into(),
-            );
-        }
+        // ★ 只跳"扩张类" goal（会和保命抢工单额度）；
+        //   保命类（material/build toilet/oxygen/element:X）恰恰是解急症的手段，必须照常执行。
+        let is_expansion_goal = |g: &str| {
+            matches!(g, "expand" | "scout" | "surface" | "open_chamber")
+        };
         {
             // ★ 从独立 ai_goals.jsonl 读（不再从 commands.jsonl 过滤 source）
-            let ai_goals: Vec<_> = if urgent_guard { Vec::new() } else { crate::commands::ai_goals_pending() };
+            let mut ai_goals: Vec<_> = crate::commands::ai_goals_pending();
+            if urgent_guard {
+                let before = ai_goals.len();
+                ai_goals.retain(|c| !is_expansion_goal(c.text.trim()));
+                if ai_goals.len() < before {
+                    report.notes.push(
+                        "🚨 生命红线告急 → 跳过扩张类 goal，保命类 goal 照常执行".into(),
+                    );
+                }
+            }
             for c in ai_goals {
                 let goal = c.text.trim();
                 if crate::autoact::parse_goal(goal).is_none() {
@@ -957,74 +905,16 @@ impl Agent {
             }
         }
 
-        // ---- 快慢分工：慢系统有未处理的升级请求时，**快系统主动停手** ----
-        //   例外：有人倒地需要立刻救人 → 救援优先（紧急态允许继续动作）。
-        //   其它情况：等慢系统改完计划再继续，避免带病施工浪费周期。
-        // ---- 快慢交接：等慢系统期间**冻结世界**（不只是"不施工"）--------
-        //   为什么必须冻结：慢系统分析 + 翻译指令要花几分钟；这段时间若世界照跑，
-        //   复制人可能在毒气区继续干活 → 局势恶化 → 等慢系统接手时已经晚了。
-        //   ONI 暂停会冻结倒计时 → 暂停期间人不耗氧、不被毒气伤害 → 冻结是安全的。
-        //   例外：**有人倒地**（downed）→ 暂停会阻断救援（倒地的只能靠环境改善恢复）
-        //     → 这种情况下走紧急态占空比，由上面的 Danger 分支处理。
-        let downed = judgment.danger_keys.iter().any(|k| k == "downed");
+        // ---- 快慢交接（契约 docs/FAST_SLOW_CONTRACT.md）----
+        // ★ "等慢系统"不再是暂停/停手理由：escalation 只是上报给慢系统做战略参考，
+        //   快系统的保命与执行**永不因此阻塞**。慢系统照常 resolve（清 pending/写静默），
+        //   但快系统每轮照常干活——这是"慢系统不审批急症"的核心。
+        //   旧的 60 行 waiting_slow 停手逻辑已删除（它曾导致膀胱爆表却没人建厕所）。
         let pending_esc = crate::escalate::has_pending();
         let pending_cmd = !crate::commands::pending().is_empty();
-        let waiting_slow = pending_esc || pending_cmd;
-        if waiting_slow && !downed {
-            let since = *self.escalation_since.get_or_insert_with(Instant::now);
-            let waited = since.elapsed();
-            // 看门狗：慢系统可能离线/崩溃 → **不能让殖民地永远冻死**。
-            //   超时未处理 → 降级解除冻结，继续自主运行（问题仍留在清单里等人看）。
-            if waited >= Duration::from_secs(Self::ESCALATION_WATCHDOG_SECS) {
-                self.escalation_hold = false;
-                self.escalation_since = None;
-                crate::escalate::note_unhandled("看门狗超时，慢系统未处理");
-                report.notes.push(format!(
-                    "⏱ 等慢系统已 {}s 无人处理 → 看门狗降级：解除冻结，继续自主运行（问题仍留在清单）",
-                    waited.as_secs()
-                ));
-            } else {
-                // **不要为了等慢系统把世界冻住**。
-                //   冻结的代价是整段游戏时间白烧：复制人不干活、空气照旧消耗、
-                //   膀胱照旧涨 → 反而制造新危机。
-                //   正确做法：**不下新工单**（等慢系统改计划），但世界继续跑，
-                //   让已有工单做完；窗口到期仍按「有活续窗 / 空闲冻回」处理。
-                if observed_running {
-                    report.notes.push(
-                        "⏸ 等慢系统处理 → 本轮不下新工单（世界继续跑，已有工单照常执行）".into(),
-                    );
-                }
-                self.escalation_hold = true;
-                // 保留施工窗口（不要 window_until=None）：世界继续跑，
-                //   到点仍按「有活续窗 / 空闲冻回」处理 → 不会白烧周期。
-                self.window_owned_by_us = true;
-                if self.window_until.is_none() {
-                    self.window_until =
-                        Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
-                }
-                report.notes.push(format!(
-                    "⏸ 等慢系统处理 → 世界已冻结（已等 {}s；看门狗 {}s 后降级继续）",
-                    waited.as_secs(),
-                    Self::ESCALATION_WATCHDOG_SECS
-                ));
-                if pending_cmd {
-                    report.notes.push(crate::commands::summary());
-                }
-                if pending_esc {
-                    report.notes.push(crate::escalate::summary());
-                }
-                return report;
-            }
-        }
-        // 无待处理 → 解除「等慢系统」的冻结（慢系统 ack 后快系统自动继续干活）。
-        if self.escalation_hold {
-            self.escalation_hold = false;
-            self.escalation_since = None;
-            report.notes.push("✅ 慢系统已处理 → 解除冻结，快系统继续自主运行".into());
-            // 开一个施工窗口让快系统真正动起来
-            self.resume("慢系统已处理，恢复施工");
-            self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
-            self.window_owned_by_us = true;
+        if pending_esc || pending_cmd {
+            if pending_cmd { report.notes.push(crate::commands::summary()); }
+            if pending_esc { report.notes.push(crate::escalate::summary()); }
         }
 
         // ---- 决策 + 执行 ----
@@ -1074,51 +964,28 @@ impl Agent {
 
         // Semantic decision → freeze + escalate, never act on it locally.
         // The fast system only watches indicators; judgment belongs to the AI slow system.
-        // C: 先 raise 再决定是否冻结 —— raise 返回 0 表示处于放行冷静期（同一误报
-        //    已被 ack），此时**不冻结、不占 escalation_hold**，否则一条误报会
-        //    无限重生、把世界反复冻住并压制其它看门。
+        // raise 返回 0 = 同类上报在静默期内（不重复打扰 AI）；无论如何快系统继续自主处理。
         if directive.needs_ai {
-            let first_time = !self.escalation_hold;
-            if first_time {
-                // ★ 语义指纹去重：category = 建议动作的 Debug 名（Rescue/BuildToilet/
-                //   ProduceOxygen…），呼吸低与膀胱告急是不同问题，互不压制；
-                //   Ctx 带上 breath/bladder 基线，真恶化时提前打破静默。
-                let category = format!("{:?}", directive.action);
-                let esc_id = crate::escalate::raise_categorized(
-                    crate::escalate::Kind::StrategyMismatch,
-                    "",
-                    format!("AI decision required: {}", directive.reason),
-                    "Slow system: review situation and decide; world is frozen".into(),
-                    crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(),
-                        breath: snap.min_breath().unwrap_or(0.0),
-                        bladder: snap.max_bladder(), },
-                    &category,
-                    crate::escalate::EscContext::default(),
-                );
-                if esc_id == 0 {
-                    // 放行冷静期内：当 Watch 处理，记日志继续自主运行，不打扰 AI。
-                    report.notes.push(
-                        "🔇 semantic 决策处于放行冷静期 → 不冻结、不重报（继续自主运行）".into(),
-                    );
-                } else {
-                    // ★ 长线任务优化：语义决策不再冻结世界。
-                    //   冻结会打断正在执行的施工窗口/竖井工单，且制造
-                    //   "owner=none + 暂停"的不一致状态 → 快系统判用户暂停 → 永久停摆。
-                    //   按 AGENTS.md §7：卡住时不停世界，只本轮不下新工单，
-                    //   已下的长线工单照常执行，慢系统改方向后下一轮接着干。
-                    self.escalation_hold = true;
-                    self.escalation_since = Some(Instant::now());
-                    // ★ 意外不等慢系统：已上报 AI，但继续往下走 Urgent 抢占逻辑，
-                    //   让快系统本轮就执行保命动作（救援/产氧/建厕所）。
-                    //   长线 goal 已在"紧急闸门"处跳过（见 907 行附近）。
-                    report.notes.push(
-                        "🚨 semantic decision 已上报 AI；快系统同时执行紧急抢占（意外不等慢系统）".into(),
-                    );
-                }
+            // ★ 契约：语义决策只上报慢系统做战略参考，**绝不停手/冻结**。
+            //   escalation 自带 category 静默去重（同类急症窗内不重复打扰 AI）；
+            //   无论上报结果如何，快系统继续往下走 Urgent 抢占 + 保命执行。
+            let category = format!("{:?}", directive.action);
+            let esc_id = crate::escalate::raise_categorized(
+                crate::escalate::Kind::StrategyMismatch,
+                "",
+                format!("AI decision required: {}", directive.reason),
+                "Slow system FYI: fast system is handling it autonomously".into(),
+                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(),
+                    breath: snap.min_breath().unwrap_or(0.0),
+                    bladder: snap.max_bladder(), },
+                &category,
+                crate::escalate::EscContext::default(),
+            );
+            if esc_id == 0 {
+                report.notes.push("🔇 semantic 上报静默期内（不重复打扰 AI）".into());
             } else {
-                // 已在冷静期/等待中：不重复上报，但仍走抢占，意外照常处理。
-                report.notes.push("⏸ semantic 决策等待慢系统；快系统继续紧急抢占".into());
+                report.notes.push("📡 semantic 已上报 AI（FYI）；快系统自主处理，不停手".into());
             }
         }
 
@@ -1501,17 +1368,14 @@ impl Agent {
                         .join("；");
                     report.notes.push(format!("🆘 卡住检测：{}", confirmed_summary));
                     // 二次修正：
-                    //   旧逻辑：stuck → pause 冻结世界 + escalation_hold=true → 下一轮
-                    //   守护进程见暂停又判「用户手动暂停」→ 谁都不恢复 → 只能手动 resume,
-                    //   然后节点又失败又冻结 —— 无限循环，膀胱涨到 100%。
+                    //   旧逻辑：stuck → 冻结世界 + 等慢系统 → 谁都不恢复 → 无限循环（已废除）。
                     //   正解：**卡住时世界继续跑**（已有工单做完、膀胱/呼吸照常演化），
                     //   只在本轮不下新工单 + 升级给慢系统（问题仍在清单里）。
                     //   冻结只留给：真红线紧急态占空比 / 主 agent 的 hold。
-                    if !rep.needs_running_world() && !self.escalation_hold {
-                        self.escalation_hold = true;
-                        self.escalation_since = Some(Instant::now());
+                    // ★ 契约：卡住只上报慢系统，不停手——世界继续跑，保命动作照常。
+                    if !rep.needs_running_world() {
                         report.notes.push(
-                            "⏸ 卡住待慢系统 → 本轮不下新工单（世界继续跑，避免膀胱/空气红线恶化）".into(),
+                            "⏸ 卡住已上报慢系统 → 世界继续跑，保命动作照常执行".into(),
                         );
                     }
                 }
@@ -1812,13 +1676,10 @@ impl Agent {
                 && snap.pending_orders.unwrap_or(0) == 0
                 && snap.under_construction == 0
                 && snap.truly_idle_count() < snap.dupes.len()
-                && !self.escalation_hold
             {
                 let who: Vec<String> = sustained.iter().map(|(n, c)| format!("{n}({c}轮)")).collect();
                 let detail = format!("Sustained individual idleness [{}] while goals remain; assign work or replan", who.join(", "));
-                // ★ 不冻结世界：空闲上报只停"下新工单"，世界继续跑（避免长线工单被冻死）。
-                self.escalation_hold = true;
-                self.escalation_since = Some(Instant::now());
+                // ★ 契约：空闲只上报慢系统，不停手——世界继续跑。
                 let _ = crate::escalate::raise(
                     crate::escalate::Kind::NoProgress, "", detail.clone(),
                     "AI: assign work to idle dupes or replan".into(),
@@ -1860,8 +1721,6 @@ impl Agent {
             // The fast system cannot judge which - freeze and escalate to AI.
             // ★ 不冻结世界：全员空闲只上报慢系统（它会主动规划补 goal），世界继续跑。
             self.idle_streak = 0;
-            self.escalation_hold = true;
-            self.escalation_since = Some(Instant::now());
             let todo: Vec<&str> = plan.nodes.iter().filter(|n| n.status == "todo")
                 .map(|n| n.id.as_str()).collect();
             let detail = if todo.is_empty() {

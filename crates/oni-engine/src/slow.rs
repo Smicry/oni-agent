@@ -716,7 +716,7 @@ fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String
         log.push(format!("$ oni {}: {}", c, run_oni(&parts)));
     }
     // 只要有 escalation 就 resolve —— 慢系统看过即解冻，不管选了什么动作。
-    // 尤其 wait：若不 resolve，escalation_hold 不解除，世界会永久冻结（残留 bug）。
+    // 只要看过就 resolve，保持 pending 队列干净（慢系统不阻塞快系统）。
     if !escs.is_empty() {
         for e in escs {
             let id = e.get("id").and_then(|v| v.as_u64()).unwrap_or(0);

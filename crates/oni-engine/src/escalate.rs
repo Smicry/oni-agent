@@ -370,32 +370,6 @@ pub fn clear() {
     let _ = std::fs::remove_file(pending_path());
 }
 
-/// 记录一条「升级请求未被处理」的备注（看门狗降级时用）。
-pub fn note_unhandled(reason: &str) {
-    // 把「超时未处理」写进**历史**（pending 里的 Escalation 没有 result 字段）
-    if let Some(d) = dir().parent().map(|p| p.to_path_buf()) {
-        let _ = std::fs::create_dir_all(&d);
-    }
-    let _ = std::fs::create_dir_all(dir());
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path())
-    {
-        let line = serde_json::json!({
-            "id": 0,
-            "kind": "WatchdogTimeout",
-            "node": "",
-            "detail": reason,
-            "suggestion": "看门狗降级：冻结已解除，代理继续自主运行；该问题仍在待处理清单里",
-            "ts": now(),
-            "acked": true,
-        });
-        let _ = writeln!(f, "{line}");
-    }
-}
-
 /// 是否有待处理的升级请求。
 pub fn has_pending() -> bool {
     !read_pending().is_empty()
