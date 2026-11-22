@@ -408,18 +408,27 @@ fn collect_state(cfg: &SlowConfig) -> SlowView {
 }
 
 fn decode_unicode_escapes(s: &str) -> String {
-    // commands.jsonl 里 text 存的是 \uXXXX 字面串，还原成中文
+    // 兼容两种输入：
+    //   1) Web 输入框提交的**真实 UTF-8**（优先）—— 原样返回，绝不能逐字节拆
+    //   2) 旧 commands.jsonl 里的 \uXXXX **字面串** —— 只解码这种
+    // 旧实现逐字节 b[i] as char 把 UTF-8 中文拆成 Latin-1（æµè¯...），已修。
+    if !s.contains("\\u") {
+        return s.to_string();
+    }
     let mut out = String::new();
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if i + 6 <= b.len() && b[i] == 0x5c && b[i+1] == b'u' {
-            let hex = std::str::from_utf8(&b[i+2..i+6]).unwrap_or("");
-            if let Ok(cp) = u32::from_str_radix(hex, 16) {
-                if let Some(ch) = char::from_u32(cp) { out.push(ch); i += 6; continue; }
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' && it.peek() == Some(&'u') {
+            it.next(); // consume 'u'
+            let hex: String = it.by_ref().take(4).collect();
+            if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                if let Some(ch) = char::from_u32(cp) { out.push(ch); continue; }
             }
+            // 解析失败 → 原样拼回
+            out.push('\\'); out.push('u'); out.push_str(&hex);
+        } else {
+            out.push(c);
         }
-        out.push(b[i] as char); i += 1;
     }
     out
 }
@@ -566,5 +575,23 @@ pub fn run(cfg: SlowConfig, once: bool) {
         if summary != "idle" { eprintln!("[slow] {}", summary); }
         if once { break; }
         std::thread::sleep(Duration::from_secs(cfg.interval_secs));
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_preserves_real_utf8_and_decodes_escapes() {
+        // Web 输入框的真实 UTF-8：必须原样，不能被逐字节拆成 Latin-1
+        assert_eq!(decode_unicode_escapes("优先采集食物"), "优先采集食物");
+        // 旧 jsonl 的 \uXXXX 字面串：必须解码
+        assert_eq!(decode_unicode_escapes(r"\u4f18\u5148"), "优先");
+        // 混合
+        assert_eq!(decode_unicode_escapes(r"abc\u4f18"), "abc优");
+        // 反斜杠非 \u：原样
+        assert_eq!(decode_unicode_escapes("a\\b"), "a\\b");
     }
 }
