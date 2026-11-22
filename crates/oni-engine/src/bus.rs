@@ -93,16 +93,13 @@ pub struct Event {
     pub kind: Kind,
     pub priority: Priority,
     /// 时效（秒）：超过就自动失效（持续卡住的旧报告没意义）
-    #[serde(default)]
     pub ttl_secs: i64,
     pub node: String,
     pub detail: String,
     /// 上下文（人口/氧气/食物等）
-    #[serde(default)]
     pub payload: Value,
     pub state: State,
     /// 解决/确认时的备注
-    #[serde(default)]
     pub note: String,
 }
 

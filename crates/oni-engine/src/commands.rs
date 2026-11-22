@@ -33,10 +33,8 @@ pub struct Command {
     pub source: String,
     pub ts: i64,
     /// 是否已由慢系统处理
-    #[serde(default)]
     pub done: bool,
     /// 慢系统的回执（怎么做的 / 为什么没做）
-    #[serde(default)]
     pub result: String,
 }
 

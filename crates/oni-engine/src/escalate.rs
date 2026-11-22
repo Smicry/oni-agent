@@ -86,12 +86,10 @@ pub struct Escalation {
     pub id: u64,
     pub kind: Kind,
     /// 涉及的节点（如果有）
-    #[serde(default)]
     pub node: String,
     /// 人话描述：慢系统要读懂这句话
     pub detail: String,
     /// 快系统给出的**建议**（慢系统可采纳也可否决）
-    #[serde(default)]
     pub suggestion: String,
     /// 当前周期
     pub cycle: i64,
@@ -102,21 +100,16 @@ pub struct Escalation {
     /// 食物 kcal
     pub food_kcal: f64,
     /// 最低呼吸值（静默恶化判定用）
-    #[serde(default)]
     pub breath: f64,
     /// 最高膀胱值（静默恶化判定用）
-    #[serde(default)]
     pub bladder: f64,
     /// 升级时的 unix 秒
     pub ts: i64,
     /// 是否已被慢系统处理
-    #[serde(default)]
     pub acked: bool,
     /// 结构化诊断（快系统提供，慢系统据此决策）
-    #[serde(default)]
     pub context: EscContext,
     /// 语义问题类别（来自 fast 的 Action，用于静默去重）
-    #[serde(default)]
     pub category: String,
 }
 
@@ -148,16 +141,12 @@ struct SilenceEntry {
     /// 到期 unix 秒
     until: i64,
     /// ack 时的氧气 kg（下降超阈值 = 恶化，提前打破静默）
-    #[serde(default)]
     oxygen_kg: f64,
     /// ack 时的食物 kcal
-    #[serde(default)]
     food_kcal: f64,
     /// ack 时的最低呼吸值（下降超过阈值 = 恶化，提前打破静默）
-    #[serde(default)]
     breath: f64,
     /// ack 时的最高膀胱值（上升超过阈值 = 恶化，提前打破静默）
-    #[serde(default)]
     bladder: f64,
 }
 
