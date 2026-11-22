@@ -990,6 +990,21 @@ impl Agent {
                 return report;
             }
         };
+        // ★ **复核 done 节点**：done 必须有证据。
+        //   计划里的 status=done 可能来自 AI 直接写的计划（未经判据校验）。
+        //   实测本局：E1「地表换气」done 但可达上界只有 194（判据要 216）、
+        //   B1「床位」done 但 beds=0 → 依赖图以为"换气与床位都完成了"
+        //   → 再没有任何节点要求产氧 → 基地慢慢耗尽。
+        //   每轮用同一套判据复核，不成立就打回 todo。
+        {
+            let bad = recheck_done_nodes(&self.cfg.plan_path, &snap);
+            if !bad.is_empty() {
+                report.notes.push(format!(
+                    "🔎 复核 done 节点：{} 的成功判据当前**不成立** → 打回 todo（done 必须有证据）",
+                    bad.join(", ")
+                ));
+            }
+        }
         let d: Decision = decide(&plan);
         // 死锁解锁：所有节点被熔断、图停摆时，decide() 复活了一个 blocked 节点。
         //   立刻把它写回 todo 并重新载入 plan，避免"依赖图里没有可执行目标"刷屏。
@@ -1530,14 +1545,21 @@ impl Agent {
                 if let Some(ok) = check_success(&snap, &v) {
                     if ok {
                         mark_node_done(&self.cfg.plan_path, &node.id);
+                        clear_node_stall(&self.cfg.plan_path, &node.id);
                         report.notes.push(format!(
                             "[{}] 成功判据达成 → 标记 done，下一轮换下一个目标",
                             node.id
                         ));
                     } else {
+                        // ★ 连续没达成 → 累加 stall：
+                        //   达到 decide::STALL_LIMIT 就把这个节点让给别人。
+                        //   旧逻辑只写 note 就继续选它 → 一个"每轮都能做点什么"
+                        //   的节点会**永久霸占**执行位 → 其它节点（供电）0 次被选中。
+                        let stall = node.stall.unwrap_or(0) + 1;
+                        mark_node_stall(&self.cfg.plan_path, &node.id, stall);
                         report.notes.push(format!(
-                            "[{}] 动作已执行但成功判据未达成 → 下一轮继续",
-                            node.id
+                            "[{}] 动作已执行但成功判据未达成 → 下一轮继续（连续 {} 轮未达成，达 {} 轮让位）",
+                            node.id, stall, crate::decide::STALL_LIMIT
                         ));
                     }
                 }
@@ -1939,6 +1961,18 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         //   读顶层永远拿不到 → 这个判据一直是假的。
         "power_operational" => Some(snap.power_int("generatorOperational") > 0),
         "oxygen_min" => Some(snap.oxygen_kg() >= v.get("kg")?.as_f64().unwrap_or(0.0)),
+        // ★ **产氧设备在运转**（不是"造出来了"）。
+        //   实测本局铁证：氧气扩散器建成了（制氧1），但
+        //   power/summary 显示 generatorCount=0、consumerOperational=0、
+        //   netActiveWatts=-120 → **设备通电量为 0、根本没在产氧**，
+        //   而基地氧气照常被消耗 → 慢慢耗尽。
+        //   判据只看建筑数量（prefab_min）会把"造出来但不运转"当成完成。
+        "oxygen_producing" => {
+            let producers = snap.building("oxygenProducers");
+            let powered = snap.power_int("consumerOperational") > 0;
+            let has_generator = snap.power_int("generatorOperational") > 0;
+            Some(producers > 0 && powered && has_generator)
+        }
         // 地上散装资源够不够（建造前先确认材料够）
         "loose_min" => {
             let el = v.get("element")?.as_str()?;
@@ -2079,6 +2113,71 @@ pub fn mark_node_deferred(plan_path: &str, id: &str, reason: &str, cycle: u64) {
     let _ = std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default());
 }
 
+/// 记录节点「连续未达成判据」的轮数（stall 计数）。
+///
+/// ★ 为什么需要（实测事故）：
+///   依赖图按 (priority, unlocks 数, 文件顺序) 选节点，
+///   一个"解锁下游多"的节点（AIR unlocks=5）只要每轮都能"做点什么"
+///   （下了一格挖掘工单）就**永远压住**解锁数少的节点（P1 供电 unlocks=3）。
+///   实测本局 P1 被选中 **0 次**（AIR 166 次 / T1 139 次）→
+///   供电节点从没跑 → 氧气扩散器建成了但**没有电**（净 -120W、consumerOperational=0）
+///   → 造出来 ≠ 在产氧 → 基地耗尽。
+///   正解：连续没达成的节点计数累加，超限就让位（见 decide::STALL_LIMIT）。
+pub fn mark_node_stall(plan_path: &str, id: &str, stall: u64) {
+    let Ok(text) = std::fs::read_to_string(plan_path) else { return; };
+    let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return; };
+    if let Some(nodes) = v.get_mut("nodes").and_then(|n| n.as_array_mut()) {
+        for n in nodes.iter_mut() {
+            if n.get("id").and_then(|i| i.as_str()) == Some(id) {
+                if let Some(o) = n.as_object_mut() {
+                    o.insert("stall".into(), Value::from(stall));
+                }
+            }
+        }
+    }
+    let _ = std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
+/// 清零节点的 stall 计数（达成判据时）。
+pub fn clear_node_stall(plan_path: &str, id: &str) {
+    mark_node_stall(plan_path, id, 0);
+}
+
+/// **复核已 done 的节点**：判据现在不成立 → 打回 todo。
+///
+/// ★ 为什么必须有（实测本局两个铁证）：
+///   1) E1「地表换气（无限空气，替代被锁的电解器）」status=done，
+///      判据 surface_open(minY=216)，而实际可达上界只有 194 → **从来没通过过**；
+///   2) B1「床位」status=done，判据 building_min(beds>=2)，
+///      而 diagnostics.buildings.beds = 0 → **也是假的**。
+///   也就是说：plan 里的 status=done 可以**未经任何校验**就存在（AI 写的计划自带）。
+///   快系统信任它 → 依赖图认为"换气已完成、氧气有着落"
+///   → **再没有任何节点要求产氧** → 基地慢慢耗尽。
+///   正解：done 必须有**证据**。每轮用同一套判据复核，不成立就打回。
+pub fn recheck_done_nodes(plan_path: &str, snap: &crate::sense::Snapshot) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(plan_path) else { return Vec::new(); };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return Vec::new(); };
+    let Some(nodes) = v.get("nodes").and_then(|n| n.as_array()) else { return Vec::new(); };
+    let mut bad = Vec::new();
+    for n in nodes {
+        if n.get("status").and_then(|s| s.as_str()) != Some("done") {
+            continue;
+        }
+        let Some(id) = n.get("id").and_then(|i| i.as_str()) else { continue; };
+        let Some(check) = n.get("success_check") else { continue; };
+        // 只复核**机器可判**的判据；人工判据（kind=manual）跳过。
+        match check_success(snap, check) {
+            Some(false) => bad.push(id.to_string()),
+            _ => {}
+        }
+    }
+    for id in &bad {
+        mark_node_todo(plan_path, id);
+        clear_node_stall(plan_path, id);
+    }
+    bad
+}
+
 /// 解除节点的暂缓状态。
 pub fn clear_node_deferred(plan_path: &str, id: &str) {
     let Ok(text) = std::fs::read_to_string(plan_path) else { return; };
@@ -2117,6 +2216,33 @@ pub fn mark_node_done(plan_path: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
+/// ★ **done 必须有证据**：判据现在不成立的 done 节点要被打回 todo。
+    ///
+    /// 实测本局铁证：E1「地表换气」done 但可达上界只有 194（判据要 216）、
+    /// B1「床位」done 但 beds=0 → 依赖图以为"换气与床位都完成"
+    /// → 再没有节点要求产氧 → 基地慢慢耗尽。
+    #[test]
+    fn done_node_with_failing_criterion_is_reopened() {
+        let tmp = std::env::temp_dir().join(format!("oni_recheck_{}.json", std::process::id()));
+        let plan = serde_json::json!({
+            "nodes": [
+                {"id": "E1", "status": "done", "success_check": {"kind": "oxygen_min", "kg": 999999.0}},
+                {"id": "T1", "status": "done", "success_check": {"kind": "dupe_min", "n": 0}}
+            ]
+        });
+        std::fs::write(&tmp, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+        let snap = crate::sense::Snapshot::default();
+        let bad = super::recheck_done_nodes(tmp.to_str().unwrap(), &snap);
+        assert_eq!(bad, vec!["E1".to_string()], "判据不成立的 done 节点应被打回");
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+        let st = after["nodes"][0]["status"].as_str().unwrap();
+        assert_eq!(st, "todo", "E1 应被打回 todo");
+        let st2 = after["nodes"][1]["status"].as_str().unwrap();
+        assert_eq!(st2, "done", "判据成立的 done 节点应保持");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     /// 动作指纹提取：从 detail 里认出"对哪个目标动了手"。
     #[test]
     fn action_fingerprint_extracts_target_from_detail() {

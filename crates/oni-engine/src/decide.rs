@@ -53,6 +53,17 @@ pub struct Node {
     /// 暂缓发生的**轮次**（用于冷却期计算，避免"暂缓-恢复"抖动）。
     #[serde(default)]
     pub deferred_at: Option<u64>,
+    /// **连续未达成判据的轮数**（"做了但没达成"）。
+    ///
+    /// ★ 为什么需要（实测：本局 P1 供电节点 0 次被选中）：
+    ///   依赖图按 (priority, unlocks 数, 文件顺序) 选节点，
+    ///   一个"解锁下游多"的节点（AIR unlocks=5）会**永久压住**解锁数少的节点（P1 unlocks=3），
+    ///   只要它每轮都能"做点什么"（下了一格挖掘工单）就永远轮不到别人。
+    ///   结果：供电节点从没被选中 → 氧气扩散器建成了但**没有电**（净 -120W、consumerOperational=0）
+    ///   → 造出来 = 不产氧 → 基地耗尽。
+    ///   正解：连续没达成的节点**降权让位**，让别的节点有机会。
+    #[serde(default)]
+    pub stall: Option<u64>,
 }
 
 impl Node {
@@ -119,6 +130,12 @@ pub fn load_plan(path: &Path) -> Result<Plan, String> {
     serde_json::from_str(&text).map_err(|e| format!("计划文件格式错误: {e}"))
 }
 
+/// **连续未达成判据多少轮后，本节点让位给别人**。
+///
+/// 3 轮 = "做了三件事都没达成" → 换方案（多半是这个节点的判据/路径本身不成立）。
+/// 太短会被正常施工误伤（挖地表本来就慢）；太长会饿死其它节点（实测 P1 供电 0 次被选中）。
+pub const STALL_LIMIT: u64 = 3;
+
 fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(String, String)>) {
     // revive 模式下：blocked 节点视为"已尝试过"，依赖它的下游可以往下走。
     let done: BTreeMap<&str, bool> = plan
@@ -179,13 +196,59 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
             None => best = Some(n),
             Some(b) => {
                 // P0-54：先比显式 priority，再比 unlocks。
-                let nk = (n.priority_rank(), n.unlocks.len());
-                let bk = (b.priority_rank(), b.unlocks.len());
+                // ★ 再比 **stall**（连续未达成判据的轮数）：
+                //   同一 priority 下，连续"做了但没达成"的节点要让位。
+                //   实测事故：AIR（unlocks=5）每轮都能下几格挖掘工单 → 永远选它
+                //   → P1 供电（unlocks=3）**一次都没被选中**
+                //   → 氧气扩散器建成了但没电（consumerOperational=0）→ 不产氧 → 全灭。
+                //   解法：stall 高的排后面；stall 达到上限直接本轮跳过。
+                // ★ 顺序很重要：**stall 比 unlocks 数量优先**。
+                //   否则"解锁下游多但连续没达成"的节点仍然赢 →
+                //   供电节点（解锁少）永远轮不到（实测 P1 被选中 0 次）。
+                let nk = (n.priority_rank(), std::cmp::Reverse(n.stall.unwrap_or(0)), n.unlocks.len());
+                let bk = (b.priority_rank(), std::cmp::Reverse(b.stall.unwrap_or(0)), b.unlocks.len());
                 if nk > bk {
                     best = Some(n);
                 }
             }
         }
+    }
+    // stall 超限的节点本轮**完全排除**（不是排在后面）：
+    //   排在后面仍然可能被选中（ready 里只剩它时）→ 饿死依旧。
+    let mut skipped_stalled: Vec<&Node> = Vec::new();
+    let mut ready: Vec<&Node> = ready
+        .into_iter()
+        .filter(|n| {
+            if n.stall.unwrap_or(0) >= STALL_LIMIT {
+                skipped_stalled.push(n);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let mut best: Option<&Node> = None;
+    for n in &ready {
+        match best {
+            None => best = Some(n),
+            Some(b) => {
+                // ★ 顺序很重要：**stall 比 unlocks 数量优先**。
+                //   否则"解锁下游多但连续没达成"的节点仍然赢 →
+                //   供电节点（解锁少）永远轮不到（实测 P1 被选中 0 次）。
+                let nk = (n.priority_rank(), std::cmp::Reverse(n.stall.unwrap_or(0)), n.unlocks.len());
+                let bk = (b.priority_rank(), std::cmp::Reverse(b.stall.unwrap_or(0)), b.unlocks.len());
+                if nk > bk {
+                    best = Some(n);
+                }
+            }
+        }
+    }
+    // 全部节点都 stall 超限 → 放行 stall 最小的那个（总比整轮空转强）
+    if best.is_none() && !skipped_stalled.is_empty() {
+        best = skipped_stalled
+            .iter()
+            .min_by_key(|n| n.stall.unwrap_or(0))
+            .copied();
     }
     let chosen = best.map(|n| (*n).clone());
     (chosen, ready.iter().map(|n| n.id.clone()).collect(), blocked)
@@ -210,6 +273,7 @@ mod tests {
             priority: None,
             deferred: if deferred { Some("暂缓".into()) } else { None },
             deferred_at: None,
+            stall: None,
         }
     }
 
@@ -245,6 +309,74 @@ mod tests {
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert!(chosen.is_none(), "暂缓节点本轮不应被选中");
+    }
+
+/// ★ **饿死防护**：连续没达成的节点必须让位。
+    ///
+    /// 实测事故：AIR（unlocks=5）每轮都能下几格挖掘工单 → 永远压住
+    /// P1 供电（unlocks=3）→ P1 被选中 **0 次** → 氧气扩散器建了没电 → 全灭。
+    #[test]
+    fn stalled_node_yields_to_other_ready_node() {
+        let mut stalled = mk("AIR", &[], false);
+        stalled.unlocks = vec!["b".into(), "c".into(), "d".into(), "e".into()];
+        stalled.stall = Some(2); // 连续 2 轮没达成
+        let mut fresh = mk("P1", &[], false);
+        fresh.unlocks = vec!["x".into(), "y".into(), "z".into()]; // 解锁数更少
+        let plan = Plan {
+            nodes: vec![stalled, fresh],
+            survival_node: None,
+            author: None,
+            locked: false,
+        };
+        let (chosen, _ready, _blocked) = decide_inner(&plan, false);
+        assert_eq!(
+            chosen.map(|n| n.id),
+            Some("P1".to_string()),
+            "连续未达成的节点应让位给别的 ready 节点（否则供电节点永远轮不到）"
+        );
+    }
+
+    /// stall 达到上限 → 本轮**完全排除**（不是排在后面）。
+    #[test]
+    fn stalled_node_at_limit_is_excluded() {
+        let mut stalled = mk("AIR", &[], false);
+        stalled.unlocks = vec!["b".into(), "c".into(), "d".into(), "e".into()];
+        stalled.stall = Some(STALL_LIMIT);
+        let mut fresh = mk("P1", &[], false);
+        fresh.unlocks = vec!["x".into()];
+        let plan = Plan {
+            nodes: vec![stalled, fresh],
+            survival_node: None,
+            author: None,
+            locked: false,
+        };
+        let (chosen, _ready, _blocked) = decide_inner(&plan, false);
+        assert_eq!(
+            chosen.map(|n| n.id),
+            Some("P1".to_string()),
+            "stall 超限的节点本轮应被排除"
+        );
+    }
+
+    /// 全部节点都 stall 超限 → 仍要放行一个（总比整轮空转强）。
+    #[test]
+    fn all_stalled_still_picks_one() {
+        let mut a = mk("A", &[], false);
+        a.stall = Some(STALL_LIMIT + 2);
+        let mut b = mk("B", &[], false);
+        b.stall = Some(STALL_LIMIT + 5);
+        let plan = Plan {
+            nodes: vec![a, b],
+            survival_node: None,
+            author: None,
+            locked: false,
+        };
+        let (chosen, _ready, _blocked) = decide_inner(&plan, false);
+        assert_eq!(
+            chosen.map(|n| n.id),
+            Some("A".to_string()),
+            "全部 stall 超限时放行 stall 最小的那个"
+        );
     }
 
     /// P0-54：显式 priority 优先于 unlocks 数量。

@@ -134,6 +134,7 @@ fn node(
         priority: None,
         deferred: None,
         deferred_at: None,
+        stall: None,
     }
 }
 
@@ -233,7 +234,9 @@ pub fn build_plan(f: &WorldFacts) -> (Plan, Strategy) {
                     " 附近有氧石 → 先产氧（运行时探测哪个产氧件现在能造，不要写死 prefabId）",
                 )],
             ),
-            json!({"kind": "prefab_min", "prefab": "MineralDeoxidizer", "n": 1}),
+            // ★ 判据是"**在产氧**"而不是"造出来了"：
+            //   造出来但没电 = 不产氧 = 白建（实测本局：制氧1 但 netActiveWatts=-120）。
+            json!({"kind": "oxygen_producing"}),
         ),
         Strategy::RichOre => with_check(
             node(
@@ -311,28 +314,36 @@ pub fn build_plan(f: &WorldFacts) -> (Plan, Strategy) {
     nodes.push(a3);
 
     // ---- A4 产氧 ----
+    // ★ 判据是"**在产氧**"而不是"造出来了"：
+    //   实测本局铁证：氧气扩散器建成了（制氧1），但 power/summary 显示
+    //   generatorCount=0 / consumerOperational=0 / netActiveWatts=-120
+    //   → **设备造出来了却没通电，一点氧都不产**，而基地氧气照常被消耗 → 慢慢耗尽。
+    //   prefab_min 只数建筑数量 → 会把"造出来但不运转"当成完成 → 依赖图永远不推进。
     let a4 = with_check(
         node(
             "A4",
             "产氧：氧气扩散器/电解器（运行时探测哪个能造）",
-            &["A3"],
+            &["A5"],
             &["A5", "A6", "A7"],
             vec![auto(
                 "oxygen",
                 " 产氧件的研究锁因存档而异 → 运行时问 mod「现在能不能造」，不要写死 prefabId",
             )],
         ),
-        json!({"kind": "prefab_min", "prefab": "MineralDeoxidizer", "n": 1}),
+        json!({"kind": "oxygen_producing"}),
     );
     nodes.push(a4);
 
     // ---- A5 供电 ----
+    // ★ 供电必须排在**产氧之前**：耗电产氧件（氧气扩散器/电解器）没电就是一堆废铁。
+    //   旧顺序（A4 产氧 → A5 供电）会造出"没电的产氧机"，实测本局就是这么死的。
+    //   现在：产氧节点依赖供电节点 → 依赖图保证先有电、再有产氧。
     let a5 = with_check(
         node(
             "A5",
             "供电：发电机 + 接线（造出来 ≠ 有电）",
-            &["A4"],
-            &["A6", "A7"],
+            &["A3"],
+            &["A4", "A6", "A7"],
             vec![auto(
                 "power",
                 " 四步：挖空间 → 铺地板砖 → 建发电机 → 接线到耗电建筑",
