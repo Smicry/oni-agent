@@ -1337,49 +1337,70 @@ fn cmd_reach_cells(args: &[String]) -> anyhow::Result<()> {
 ///   实测：E1「地表换气」done 但可达上界只有 194（判据要 216）、
 ///   B1「床位」done 但 beds=0 → 依赖图以为这些都完成了
 ///   → 再没有任何节点要求产氧 → 基地慢慢耗尽。
-/// 用法：oni plan-check
+/// 用法：oni plan-check [fix]
 ///       oni plan-check             （只打印，不改）
 fn cmd_plan_check(args: &[String]) -> anyhow::Result<()> {
     let path = "plan.json";
-    let fix = args.first().map(|s| s == "check").unwrap_or(false);
+    // 用法：oni plan-check        （只体检）
+    //       oni plan-check fix    （并把假 done 打回 todo）
+    let fix = args.first().map(|s| s == "fix").unwrap_or(false);
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("读不到 {path}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("计划格式错误: {e}"))?;
     let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-    println!("{:<6} {:<9} {:<8} {:<7} {}", "id", "status", "stall", "判据", "说明");
-    let mut fake_done = Vec::new();
+
+    // ★ **真复核**：连游戏取一份快照，逐个 done 节点跑同一套判据。
+    //   只有静态打印等于"我看到这里写着 done"，那正是本局翻车的根源
+    //   （E1「地表换气」done 但可达上界只有 194 / B1「床位」done 但 beds=0）。
+    let snap = match connect() {
+        Ok(sess) => Some(oni_engine::sense::sense(&sess)),
+        Err(e) => {
+            eprintln!("（连不上游戏，跳过判据复核：{e}）");
+            None
+        }
+    };
+
+    println!("{:<6} {:<9} {:<7} {:<7} {}", "id", "status", "stall", "判据", "复核");
+    let mut fake_done: Vec<String> = Vec::new();
+    let mut unverifiable: Vec<String> = Vec::new();
     for n in &nodes {
         let id = n.get("id").and_then(|i| i.as_str()).unwrap_or("?");
         let status = n.get("status").and_then(|s| s.as_str()).unwrap_or("todo");
         let stall = n.get("stall").and_then(|s| s.as_u64()).unwrap_or(0);
         let check = n.get("success_check").cloned().unwrap_or(serde_json::Value::Null);
-        let note = match check.as_object() {
-            Some(o) => o.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string(),
-            None => String::new(),
-        };
-        let mut flag = String::new();
+        let kind = check.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+        let mut verdict = String::new();
         if status == "done" {
-            // 静态体检：判据字段本身能否被机器判
-            let kind = check.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-            if kind.is_empty() {
-                flag = "⚠ 无机器判据（done 无法复核）".into();
-            } else {
-                flag = "判据待运行时复核".into();
+            match snap.as_ref().and_then(|sn| oni_engine::agent::check_success(sn, &check)) {
+                Some(true) => verdict = "✅ 判据成立".into(),
+                Some(false) => {
+                    verdict = "❌ **判据不成立 → 假 done**".into();
+                    fake_done.push(id.to_string());
+                }
+                None => {
+                    verdict = "⚠ 无机器判据（done 无法复核）".into();
+                    unverifiable.push(id.to_string());
+                }
             }
+        } else if !kind.is_empty() {
+            verdict = "待达成".into();
         }
-        println!("{:<6} {:<9} {:<8} {:<7} {}", id, status, stall, note, flag);
-        if status == "done" {
-            fake_done.push(id.to_string());
-        }
+        println!("{:<6} {:<9} {:<7} {:<7} {}", id, status, stall, kind, verdict);
     }
-    println!("→ 共 {} 个节点，其中 done {} 个", nodes.len(), fake_done.len());
+    println!("→ 共 {} 个节点", nodes.len());
     if !fake_done.is_empty() {
-        println!("  done 节点：{}（done 必须有证据：运行时每轮复核，不成立就打回 todo）", fake_done.join(", "));
+        println!("  ❌ 假 done（判据不成立）：{}", fake_done.join(", "));
+        println!("     done 必须有证据：快系统每轮自动复核并打回 todo（契约不变量 7）");
     }
-    if fix {
-        println!();
-        println!("（体检命令不联网复核判据；真实复核由快系统每轮自动执行）");
+    if !unverifiable.is_empty() {
+        println!("  ⚠ 无机器判据的 done：{}（无法自动复核）", unverifiable.join(", "));
+    }
+    if fix && !fake_done.is_empty() {
+        if let Some(sn) = snap.as_ref() {
+            let reopened = oni_engine::agent::recheck_done_nodes(path, sn);
+            println!("→ 已打回 todo：{}", reopened.join(", "));
+        }
     }
     Ok(())
 }
