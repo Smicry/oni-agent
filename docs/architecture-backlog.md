@@ -140,6 +140,70 @@
 
 ---
 
+---
+
+# 第二轮架构迭代（2026-11-23 · 拉德多/科斯姆星 全灭复盘）
+
+> 上一轮（讨人厌的实验室）修的是"**动作层**能不能做对"；
+> 这一轮暴露的是"**依赖图层**让不让它有机会做"——两类问题互不替代。
+
+## P0-3 依赖图饿死：一个节点永久霸占执行位
+
+**现象**
+* serve 日志：`节点=AIR` 166 次、`节点=T1` 139 次、**`节点=P1`（供电）0 次**。
+* 结果：氧气扩散器造出来了却**没通电**（`generatorCount=0`、`consumerOperational=0`、
+  `netActiveWatts=-120`）→ 一点氧都不产 → 基地氧气 240kg→154kg → 三人全灭。
+
+**根因**
+* 选点排序 = (priority, unlocks 数, 文件顺序)。
+  AIR 每轮都能"下几格挖掘工单"（有动作、有进展的样子），
+  但**判据从未达成** → 它一直 ready → unlocks 多的它永远赢 → P1 永远排不上。
+
+**建议做法（已落地）**
+1. 节点加 `stall`（连续未达成判据的轮数）；
+2. 排序键改为 **(priority, stall↓, unlocks 数)** —— stall 权重高于 unlocks；
+3. stall ≥ 3 的节点本轮**完全排除**（排在后面仍可能被选中 → 饿死依旧）；
+4. 全部 stall 超限时放行 stall 最小的那个（总比整轮空转强）。
+
+**验收**：`stalled_node_yields_to_other_ready_node` / `stalled_node_at_limit_is_excluded`
+/ `all_stalled_still_picks_one`。
+
+## P0-4 假 done：依赖图带着一份自欺的完成清单
+
+**现象**
+* plan.json：E1「地表换气（无限空气，替代被锁的电解器）」status=done，
+  判据 `surface_open(minY=216)`，而**实际可达上界只有 194** → 从没通过过；
+* B1「床位」status=done，判据 `building_min(beds>=2)`，而 `buildings.beds = 0`。
+
+**根因**
+* `status=done` 可以**未经任何判据校验**就存在（AI 写的计划自带）。
+* 快系统信任 status → 依赖图以为"换气与床位都完成了"
+  → **再没有任何节点要求产氧** → 基地慢慢耗尽，而且日志看起来一切正常。
+
+**建议做法（已落地）**
+* 每轮用**同一套判据**复核所有 done 节点，不成立 → 打回 todo。
+* done 只代表"曾经达成过"，不代表"现在还成立"。
+* 新增 `oni plan-check` 做静态体检（列出每个节点的 status/判据/假 done 清单）。
+
+**验收**：`done_node_with_failing_criterion_is_reopened`。
+
+## P0-5 造出来 ≠ 在运转
+
+**现象**：`制氧1`（氧气扩散器已建成），但 `power/summary` 显示
+`consumerOperational=0` → 设备**通电量为 0** → 一点氧都不产。
+
+**根因**：判据用 `prefab_min`（只数建筑数量）→ "造出来了"被当成"在产氧"。
+另外 planner 的依赖顺序也反了：**产氧 A4 排在供电 A5 之前** → 先造耗电产氧机。
+
+**建议做法（已落地）**
+1. 新增判据 `oxygen_producing`：产氧设备在运转 **且** 有发电机；
+2. planner 产氧节点改用它；
+3. **供电节点排到产氧节点之前**（耗电产氧件没电就是一堆废铁）。
+
+**验收**：契约不变量 9、10。
+
+---
+
 ## 已完成（本轮已落地并有单测）
 
 | 能力 | 单测 |
@@ -151,4 +215,16 @@
 | 2 周期食物不抢占主线 | moderate_food_does_not_preempt_main_plan |
 | CO₂ 环境里呼吸 <95 即抢占救援 | breather_in_co2_with_falling_breath_triggers_rescue |
 
-共 **42 项测试全绿**。
+### 2026-11-23 追加（拉德多局）
+
+| 能力 | 单测 |
+|---|---|
+| 依赖图饿死防护（stall 让位） | stalled_node_yields_to_other_ready_node |
+| stall 超限节点本轮排除 | stalled_node_at_limit_is_excluded |
+| 全 stall 超限仍放行一个 | all_stalled_still_picks_one |
+| 假 done 节点打回 todo | done_node_with_failing_criterion_is_reopened |
+| 可站性对齐游戏 navmesh | walkable_requires_immediate_floor |
+| 幻影建筑格不承重 | phantom_building_is_not_a_floor |
+| 竖井梯子链自下而上连续 | ladder_step_fills_chain_bottom_up |
+
+共 **78 项测试全绿**。
