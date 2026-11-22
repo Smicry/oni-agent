@@ -126,6 +126,9 @@ pub struct LlmDecision {
     pub choice: String,
     pub action: String,
     pub reason: String,
+    /// 本次决策针对的目标层级 P0-P4（P0保命/P1续航/P2自给/P3扩张/P4目标）
+    #[serde(default)]
+    pub priority: String,
     #[serde(default)]
     pub commands: Vec<String>,
 }
@@ -248,18 +251,36 @@ fn mock_decision(prompt: &str, has_escalation: bool, has_command: bool) -> LlmDe
     if has_command {
         LlmDecision { choice: "custom".into(), action: "command".into(),
             reason: "mock: 用户指令优先，已记录并恢复自主".into(),
-            commands: vec!["window 90".into()] }
+            priority: "P3".into(), commands: vec!["window 90".into()] }
     } else if has_escalation {
         let c = if prompt.contains("食物") && prompt.contains("switch_goal") { "switch_goal" } else { "dig_access" };
         LlmDecision { choice: c.into(), action: "resolve".into(),
-            reason: "mock: 选合理候选，验证闭环".into(), commands: vec![] }
+            reason: "mock: 选合理候选，验证闭环".into(), priority: "P1".into(), commands: vec![] }
     } else {
         LlmDecision { choice: "none".into(), action: "wait".into(),
-            reason: "mock: 无待处理事项".into(), commands: vec![] }
+            reason: "mock: 无待处理事项".into(), priority: "P0".into(), commands: vec![] }
     }
 }
 
-const SYSTEM_PROMPT: &str = "你是缺氧殖民地慢系统决策者。快系统每10秒采集局面，遇卡点上报结构化诊断(含候选)。从候选中选一个，或对用户指令决策。原则:1)先死因优先(食物/氧气续航短) 2)可达性问题让快系统自救 3)改目标说明依据 4)用户指令优先(世界已暂停)。输出严格JSON: {choice,action,reason,commands[]}，action∈{resolve,command,wait,custom}。commands只能是可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply'、'order 挖 土@(127,197):9')或留空[]，绝不能是自然语言描述。";
+const SYSTEM_PROMPT: &str = "你是缺氧殖民地慢系统决策者，目标是让这局游戏持续变好，不是维持现状。快系统每10秒采局面，遇卡点上报结构化诊断(含候选)。
+
+== 目标阶梯（每次决策必须选最高可改进的层级，priority 填 P0-P4）==
+P0 保命：有人倒地/窒息/膀胱爆/污染水淹没 → 立即消除，不可协商。
+P1 续航：食物/氧气的『还能撑几周期』最大化。用续航比较，不用绝对存量。当前谁短就先解决谁（如食物9周期<氧气21周期 → 先采食物）。
+P2 自给：从『坐吃存量』转向持续产出（种田/制氧/可持续食物/农场）。
+P3 扩张：领打印舱新人(劳动力)、扩建空间、研究解锁、改善床位厕所电力。
+P4 目标：完成本局胜利条件（火箭/本局目标）。
+
+== 决策纪律 ==
+1. 你的默认动作是推进主线，不是等待。选 wait 前必须能论证：所有 P0-P4 都健康且当下无任何可执行改进——否则就是失职。
+2. 用户指令：只有明确、可执行的指令才优先执行；乱码/测试/无法转成 oni 命令的指令 → 忽略它，继续自主推进，绝不因它停下。
+3. 可达性/落脚点等确定性问题交给快系统自救（选对应候选即可），别手算坐标。
+4. 改目标/放弃路线是重大决策，必须说明依据；但断粮/窒息这类先死因优先于既有计划。
+
+输出严格 JSON（不要Markdown）: {choice,action,reason,priority,commands[]}。
+- action ∈ {resolve,command,wait,custom}；priority ∈ {P0,P1,P2,P3,P4}
+- reason 用1-2句说明『这提升了哪个P级、为什么』
+- commands 只能是可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply'、'order 挖 土@(127,197):9')或留空[]，绝不能是自然语言描述。";
 
 fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value) -> String {
     let mut p = String::from("== 当前局面 ==\n");
@@ -331,10 +352,12 @@ fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String
         if parts.is_empty() { continue; }
         log.push(format!("$ oni {}: {}", c, run_oni(&parts)));
     }
-    if dec.action == "resolve" {
-        if let Some(e) = escs.first() {
+    // 只要有 escalation 就 resolve —— 慢系统看过即解冻，不管选了什么动作。
+    // 尤其 wait：若不 resolve，escalation_hold 不解除，世界会永久冻结（残留 bug）。
+    if !escs.is_empty() {
+        for e in escs {
             let id = e.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-            let note = format!("慢系统({})选[{}]: {}", dec.choice, dec.choice, dec.reason);
+            let note = format!("慢系统[{}]决策({})：{}", dec.priority, dec.action, dec.reason);
             log.push(format!("resolve#{}:{}", id, run_oni(&["resolve", &id.to_string(), &note])));
         }
     }
@@ -470,9 +493,9 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     };
 
     let log = execute_decision(&decision, &escs, &cmds);
-    let summary = format!("[{}] choice={} action={} reason={} | {}",
+    let summary = format!("[{}][{}] choice={} action={} reason={} | {}",
         if cfg.is_mock() { "mock" } else { &cfg.model },
-        decision.choice, decision.action, decision.reason, log);
+        decision.priority, decision.choice, decision.action, decision.reason, log);
 
     // 写决策留痕
     let sd = save_dir();
@@ -480,7 +503,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         "id": now(), "ts": now(),
         "cycle": snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
         "source": "slow_service", "choice": decision.choice,
-        "action": decision.action, "reason": decision.reason,
+        "action": decision.action, "priority": decision.priority, "reason": decision.reason,
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
         .open(sd.join("decisions.jsonl")) {
