@@ -483,57 +483,6 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     summary
 }
 
-const PAGE: &str = r#"<!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8"><title>ONI 慢系统控制台</title>
-<style>
-body{font-family:-apple-system,sans-serif;background:#1a1d24;color:#d8dee9;margin:0;padding:20px;font-size:13px}
-h1{font-size:18px;color:#88c0d0}h2{font-size:14px;color:#81a1c1;border-bottom:1px solid #3b4252;padding-bottom:4px}
-.card{background:#2e3440;border-radius:6px;padding:12px;margin:10px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
-.kv{background:#3b4252;padding:8px;border-radius:4px}.kv b{color:#88c0d0}
-.dupe{padding:4px 0;border-bottom:1px solid #3b4252}
-.esc{background:#3b4252;padding:8px;margin:6px 0;border-radius:4px;border-left:3px solid #ebcb8b}
-.cand{background:#4c566a;padding:4px 8px;margin:4px 0;border-radius:3px;cursor:pointer}
-.cand:hover{background:#5e81ac}
-input,button{font-size:13px;padding:6px 10px;border-radius:4px;border:1px solid #4c566a;background:#3b4252;color:#d8dee9}
-button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
-#cmd{width:60%}.small{color:#a3be8c;font-size:11px}
-</style></head><body>
-<h1>ONI 慢系统控制台 <span id="mode" class="small"></span></h1>
-<div class="card"><div class="grid" id="stats"></div></div>
-<h2>复制人</h2><div class="card" id="dupes"></div>
-<h2>待决策卡点 <span class="small" id="esccount"></span></h2><div id="escs"></div>
-<h2>用户指令（输入后世界暂停，慢系统处理后恢复自主）</h2>
-<div class="card"><input id="cmd" placeholder="输入指令，如：优先采食物"><button onclick="sendCmd()">下发</button></div>
-<div id="cmds"></div>
-<h2>最近决策</h2><div class="card" id="decisions"></div>
-<script>
-function esc(t){return String(t).replace(/</g,'&lt;');}
-async function refresh(){var r=await fetch('/api/state');var s=await r.json();
-document.getElementById('mode').textContent='['+s.mode+'] 更新 '+new Date(s.updated_at*1000).toLocaleTimeString();
-document.getElementById('stats').innerHTML=
- '<div class="kv"><b>周期</b><br>'+s.cycle+'</div>'+
- '<div class="kv"><b>世界</b><br>'+(s.paused?'暂停':'运行')+'</div>'+
- '<div class="kv"><b>食物</b><br>'+Math.round(s.food_kcal)+' kcal</div>'+
- '<div class="kv"><b>氧气</b><br>'+Math.round(s.oxygen_kg)+' kg</div>'+
- '<div class="kv"><b>可呼吸格</b><br>'+s.breathable_cells+'</div>';
-document.getElementById('dupes').innerHTML=s.dupes.map(function(d){
- return '<div class="dupe">'+esc(d.name)+' @('+d.x+','+d.y+') '+esc(d.chore)+' 膀胱'+Math.round(d.bladder)+'</div>';}).join('');
-document.getElementById('esccount').textContent=s.escalations.length+' 条';
-document.getElementById('escs').innerHTML=s.escalations.map(function(e){
- var c=e.context||{};var cands=(c.candidates||[]).map(function(x){
-  return '<div class="cand" onclick="decide('+e.id+',''+x.id+'')">候选['+x.id+'] '+esc(x.action)+': '+esc(x.note||'')+'</div>';}).join('');
- return '<div class="esc">#'+e.id+' '+esc(e.detail)+'<div class="small">卡点='+esc(c.obstacle||'-')+'</div>'+cands+'</div>';}).join('');
-document.getElementById('cmds').innerHTML=s.commands.map(function(c){
- return '<div class="small">#'+c.id+' '+esc(c.text)+'</div>';}).join('');
-document.getElementById('decisions').innerHTML='<div class="small">'+esc(s.last_decision)+'</div>'+
- s.recent_decisions.slice(0,5).map(function(d){return '<div class="small">['+esc(d.source||'慢系统')+'] '+esc(d.action||'')+': '+esc(d.reason||'')+'</div>';}).join('');
-}
-async function sendCmd(){var t=document.getElementById('cmd').value;if(!t)return;
- await fetch('/api/command',{method:'POST',body:t});document.getElementById('cmd').value='';refresh();}
-async function decide(id,choice){await fetch('/api/decide',{method:'POST',body:JSON.stringify({id:id,choice:choice})});refresh();}
-refresh();setInterval(refresh,2000);
-</script></body></html>"#;
 
 fn json_response(stream: &mut TcpStream, status: &str, body: &str, content_type: &str) {
     let resp = format!("HTTP/1.1 {}\r\nContent-Type: {}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -559,8 +508,11 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
         let path = parts.get(1).copied().unwrap_or("/");
         let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
         match (method, path) {
-            ("GET", "/") | ("GET", "/index.html") =>
-                json_response(&mut stream, "200 OK", PAGE, "text/html"),
+            ("GET", "/") | ("GET", "/index.html") => {
+                let page = std::fs::read_to_string("web/index.html")
+                    .unwrap_or_else(|_| "<h1>web/index.html not found</h1>".into());
+                json_response(&mut stream, "200 OK", &page, "text/html");
+            }
             ("GET", "/api/state") => {
                 let v = view.lock().map(|g| serde_json::to_string(&*g).unwrap_or_default()).unwrap_or_default();
                 json_response(&mut stream, "200 OK", &v, "application/json");
@@ -576,6 +528,22 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
                 let choice = v.get("choice").and_then(|x| x.as_str()).unwrap_or("");
                 let out = run_oni(&["resolve", &id.to_string(), &format!("web pick [{}]", choice)]);
                 json_response(&mut stream, "200 OK", &serde_json::json!({"ok":true,"out":out}).to_string(), "application/json");
+            }
+            (m, p) if m == "POST" && p.starts_with("/api/ctl/") => {
+                let op = &p[9..]; // after "/api/ctl/"
+                let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let out = match op {
+                    "pause" => run_oni(&["pause", "web 暂停"]),
+                    "resume" => run_oni(&["resume", "web 继续"]),
+                    "window" => run_oni(&["window", "120"]),
+                    "speed" => {
+                        let level = v.get("speed").and_then(|x| x.as_u64()).unwrap_or(1);
+                        run_oni(&["call", "game_control",
+                            &format!("{{\"domain\":\"speed\",\"action\":\"set_speed\",\"speed\":{},\"task\":\"web 调速\"}}", level)])
+                    },
+                    _ => "unknown op".into(),
+                };
+                json_response(&mut stream, "200 OK", &serde_json::json!({"ok":true,"op":op,"out":out}).to_string(), "application/json");
             }
             _ => json_response(&mut stream, "404 Not Found", "not found", "text/plain"),
         }
