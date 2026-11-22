@@ -126,8 +126,18 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
     let last = save::last_seen();
 
     // 同一存档：只刷新进程内的当前存档指针
+    //
+    // ★★ 2026-11-22（陨石坑局实测）：**计划文件里的指纹才是权威**。
+    //   旧逻辑要求 meta 的 last_seen **和** 计划指纹同时匹配才算「同一局」；
+    //   meta 一旦丢了（换机器 / 换存档读档 / 手改 plan.json 没打指纹）就会误报
+    //   「检测到换存档（旧指纹 → 新指纹，**两个值一模一样**）」→ 归档 + 刷屏，
+    //   让人以为计划被重置（实际只是补了个指纹）。
+    if plan_fp.as_deref() == Some(new.fingerprint.as_str()) {
+        save::set_current(new);
+        return None;
+    }
     if let Some(l) = &last {
-        if l.fingerprint == new.fingerprint && plan_fp.as_deref() == Some(new.fingerprint.as_str()) {
+        if l.fingerprint == new.fingerprint {
             save::set_current(new);
             return None;
         }

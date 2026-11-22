@@ -236,10 +236,18 @@ impl Agent {
         self.paused_by_us = true;
         self.left_running = false;
         self.pause_until = Instant::now() + Duration::from_secs(self.cfg.pause_cooldown);
+        // ★ 暂停所有权：代理暂停 → 落盘 owner=Agent，跨重启保留
+        crate::control::pause(crate::control::Owner::Agent, why);
         eprintln!("⛔ 已暂停游戏：{why}");
     }
 
     fn resume(&mut self, why: &str) {
+        // ★ 暂停所有权：只有 agent 自己暂停的世界才能由 agent 恢复。
+        //   若 owner=User（hook/用户手动）却被 agent 恢复 = 越权 → 拒绝。
+        if !crate::control::resume(crate::control::Owner::Agent) {
+            eprintln!("⛔ 代理恢复被拒（owner 不是 agent）：{why}");
+            return;
+        }
         let _ = self.session.call_text(
             "game_control",
             serde_json::json!({ "domain": "speed", "action": "resume", "task": format!("代理: {why}") }),
@@ -359,6 +367,14 @@ impl Agent {
         //    铁律：**世界不跑 ⇒ 不下工单、不累计进展、不熔断。**
         // =====================================================================
         let observed_running = !snap.paused;
+        // ★★ 暂停所有权恢复（2026-11-22 死锁根治）：
+        //   守护进程换二进制重启后内存标志全清零，但 control.json 还在。
+        //   若持久化的 owner=User（hook/用户暂停）→ 恢复 user_paused，绝不越权恢复；
+        //   否则不臆造"用户暂停"（旧逻辑靠排除法推断 → 重启即死锁）。
+        let ctl = crate::control::read();
+        if ctl.owner == crate::control::Owner::User {
+            self.user_paused = true;
+        }
         // 上一轮结束时世界在跑吗？→ 这一轮世界有没有真的动过（决定能不能比指纹）
         let world_advanced = self.left_running;
         self.left_running = observed_running;
@@ -538,8 +554,13 @@ impl Agent {
                 ));
             } else if self.frozen || self.idle_stopped {
                 report.notes.push("🔒 已冻回暂停（等新窗口请求）".into());
-            } else if self.paused_by_us {
+            } else if self.paused_by_us && !self.escalation_hold {
                 // 上轮紧急暂停、条件已解除 → 开一个短窗口，而不是一直跑
+                // ★★ 2026-11-22（陨石坑局实测）：**等慢系统期间不能在这里恢复**。
+                //   旧逻辑：paused_by_us 就恢复 → 下一轮「等慢系统」又冻回 →
+                //   两个分支每 10s 互相打架 → 世界一半在跑、一半冻住 →
+                //   殖民地零进展（实测 10 分钟只挖了 1 格，竖井一动不动）。
+                //   现在：等慢系统时保持冻结，由看门狗（300s）统一解冻。
                 self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
                 self.window_owned_by_us = true;
                 self.resume("危急已解除 → 开施工窗口");
@@ -556,6 +577,9 @@ impl Agent {
 
         // ---- 显式施工窗口请求（由代理拥有 → 到点由代理冻回）----
         if let Some(secs) = read_window_request() {
+            // ★ 用户显式 `oni window` = 授权代理恢复：先清掉 user/hook 的暂停所有权。
+            //   不清的话，下一轮守护进程读到 owner=User 又会判"用户暂停"→ 死锁。
+            crate::control::clear();
             if judgment.verdict != Verdict::Danger {
                 self.window_until = Some(Instant::now() + Duration::from_secs(secs));
                 self.window_owned_by_us = true;
@@ -687,12 +711,24 @@ impl Agent {
                     waited.as_secs()
                 ));
             } else {
+                // ★★★ 2026-11-22（陨石坑局实测）：**不要为了等慢系统把世界冻住**。
+                //   冻结的代价是整段游戏时间白烧：复制人不干活、空气照旧消耗、
+                //   膀胱照旧涨 → 反而制造新危机（上一局就是这么死的）。
+                //   正确做法：**不下新工单**（等慢系统改计划），但世界继续跑，
+                //   让已有工单做完；窗口到期仍按「有活续窗 / 空闲冻回」处理。
                 if observed_running {
-                    self.pause("等慢系统处理：冻结世界（避免分析期间局势恶化）");
+                    report.notes.push(
+                        "⏸ 等慢系统处理 → 本轮不下新工单（世界继续跑，已有工单照常执行）".into(),
+                    );
                 }
                 self.escalation_hold = true;
-                self.window_until = None;
-                self.window_owned_by_us = false;
+                // ★ 保留施工窗口（不要 window_until=None）：世界继续跑，
+                //   到点仍按「有活续窗 / 空闲冻回」处理 → 不会白烧周期。
+                self.window_owned_by_us = true;
+                if self.window_until.is_none() {
+                    self.window_until =
+                        Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
+                }
                 report.notes.push(format!(
                     "⏸ 等慢系统处理 → 世界已冻结（已等 {}s；看门狗 {}s 后降级继续）",
                     waited.as_secs(),
@@ -785,7 +821,20 @@ impl Agent {
                     plan.nodes
                         .iter()
                         .find(|n| {
-                            if n.is_done() || n.is_blocked() {
+                            // ★★★ 2026-11-22 二次修正（陨石坑局实测）：
+                            //   旧逻辑把 done 节点一律跳过 → T1 建了 1 座厕所就 done，
+                            //   但 3 人膀胱告急时**还需要第 2/3 座** → Urgent 喊「建厕所」
+                            //   却匹配不到任何节点 → 回落常规计划 → 膀胱涨到 100% → 随地排泄
+                            //   → 污染水 → 全灭（上一局死因链原样重演）。
+                            //   正解：**膀胱告急时允许复活 done 的卫生节点**（条件已重新告急）。
+                            let is_toilet_urgent = matches!(
+                                want,
+                                crate::priority::Action::BuildToilet
+                            );
+                            if n.is_done() && !is_toilet_urgent {
+                                return false;
+                            }
+                            if n.is_blocked() {
                                 return false;
                             }
                             let tag = format!(
@@ -827,9 +876,16 @@ impl Agent {
                                     tag.contains("供电") || tag.contains("发电")
                                 }
                                 crate::priority::Action::BuildToilet => {
-                                    // ★ 膀胱告急 → 必须匹配到"卫生/厕所"节点。
-                                    //   没有厕所 → 随地排泄 → 污染水 → 差点全灭（2026-11-21 实测）。
-                                    tag.contains("厕所") || tag.contains("卫生") || tag.contains("如厕")
+                                    // ★ 膀胱告急 → 必须匹配到"卫生/厕所/旱厕"节点。
+                                    //   没有厕所 → 随地排泄 → 污染水 → 全灭（2026-11-21 实测）。
+                                    // ★ 2026-11-22：本局 T1 名字写「旱厕」而非「厕所」，旧匹配只认
+                                    //   「厕所/卫生/如厕」→ Urgent 喊建厕所却匹配不到 → 回落 → 膀胱 100%。
+                                    //   同时认 Outhouse prefab（无论节点名怎么写）。
+                                    tag.contains("厕所")
+                                        || tag.contains("卫生")
+                                        || tag.contains("如厕")
+                                        || tag.contains("旱厕")
+                                        || tag.contains("Outhouse")
                                 }
                                 crate::priority::Action::FollowPlan => false,
                             }
@@ -847,6 +903,19 @@ impl Agent {
                 "⚠ 调度[{:?}] 找不到匹配节点（动作 {:?}）→ 回落常规计划；请检查 plan 是否覆盖该场景",
                 directive.level, directive.action
             ));
+            // ★ 效果回执（2026-11-22 陨石坑局）：
+            //   Urgent 喊出"建厕所"却匹配不到节点 = 紧急态形同虚设；
+            //   旧逻辑只写一行日志 → 看着像在抢救，实际膀胱涨到 100%。
+            //   现在升级为 escalation + bus，慢系统一定能看见并处理。
+            let _ = crate::escalate::raise(
+                crate::escalate::Kind::StrategyMismatch,
+                "",
+                format!("Urgent 动作 {:?} 找不到匹配节点：{}（紧急态被静默降级）",
+                    directive.action, directive.reason),
+                "请检查 plan 是否覆盖该紧急场景（节点名/动作标签）".into(),
+                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+            );
         }
         // ★★★ 2026-11-22 修正：**Urgent 抢占必须尊重依赖图**。
         //   旧行为：膀胱告急 → 直接选中"建厕所"节点 → 但它的前置（挖空间/铺砖）
@@ -879,6 +948,17 @@ impl Agent {
             }
             cur
         });
+        // ★★★ 2026-11-22：Urgent 抢占到的是 done 节点（如 T1 建了 1 座厕所后 done，
+        //   但膀胱告急需要第 2/3 座）→ 必须把它写回 todo，否则 decide() 永远不会选它。
+        if let Some(n) = &picked_by_scheduler {
+            if n.is_done() {
+                mark_node_todo(&self.cfg.plan_path, &n.id);
+                report.notes.push(format!(
+                    "🔄 紧急需求重新告急 → 复活已完成节点 [{}]（判据已上调到 ≥人口数）",
+                    n.id
+                ));
+            }
+        }
         let chosen = if let Some(n) = picked_by_scheduler {
             Some(n)
         } else if rescue_mode {
@@ -1097,17 +1177,19 @@ impl Agent {
                         .collect::<Vec<_>>()
                         .join("；");
                     report.notes.push(format!("🆘 卡住检测：{}", confirmed_summary));
-                    // ★ 立即冻结世界：慢系统接手前，别让局势继续恶化。
-                    //   唯一例外：有人倒地 → 暂停会阻断救援 → 由紧急态占空比处理。
-                    //
-                    // ★ 只在**首次**冻结时真的 pause：卡住是持续状态，每轮都 pause
-                    //   会刷屏 + 反复调用 MCP，而且会把窗口状态搅乱。
+                    // ★★★ 2026-11-22 二次修正（陨石坑局实测死锁）：
+                    //   旧逻辑：stuck → pause 冻结世界 + escalation_hold=true → 下一轮
+                    //   守护进程见暂停又判「用户手动暂停」→ 谁都不恢复 → 只能手动 resume,
+                    //   然后节点又失败又冻结 —— 无限循环，膀胱涨到 100%（上一局全灭死因）。
+                    //   正解：**卡住时世界继续跑**（已有工单做完、膀胱/呼吸照常演化），
+                    //   只在本轮不下新工单 + 升级给慢系统（问题仍在清单里）。
+                    //   冻结只留给：真红线紧急态占空比 / 主 agent 的 hold。
                     if !rep.needs_running_world() && !self.escalation_hold {
-                        self.pause("卡住待慢系统处理：冻结世界");
                         self.escalation_hold = true;
                         self.escalation_since = Some(Instant::now());
-                        self.window_until = None;
-                        self.window_owned_by_us = false;
+                        report.notes.push(
+                            "⏸ 卡住待慢系统 → 本轮不下新工单（世界继续跑，避免膀胱/空气红线恶化）".into(),
+                        );
                     }
                 }
             }
@@ -1489,6 +1571,13 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         ),
         "power_net" => Some(snap.power_num("netActiveWatts") >= v.get("watts")?.as_f64().unwrap_or(0.0)),
         "dupe_min" => Some(snap.dupes.len() as i64 >= v.get("n")?.as_i64().unwrap_or(1)),
+        // ★ 基地扩容判据（2026-11-22 新增）：官方可达格数。
+        //   「挖通开阔气室」的真实效果 = **可达区变大**，而不是「某块石头没了」。
+        //   用格数判、不用坐标判 → 计划文件里不出现硬编码坐标。
+        "reachable_min" => {
+            let n = v.get("n")?.as_i64().unwrap_or(0);
+            Some(snap.reachable_cells as i64 >= n)
+        }
         // 任意一种建材达标（开局只知道自己挖到了什么）
         "loose_any_min" => {
             let kg = v.get("kg")?.as_f64().unwrap_or(0.0);
@@ -1684,8 +1773,10 @@ mod tests {
         let food = 16000.0;
         let dupes = 3;
         let cycles = food_runway_cycles(food, dupes);
-        assert!(cycles < 4.0, "开局续航 {cycles} 应低于 4 周期");
-        assert!(food_runway_cycles(30000.0, dupes) >= 4.0);
+        // ★ 2026-11-22 修正：ONI 官方 400 kcal/人/周期（旧测试按错误的 2000 写死 <4）。
+        //   16000 ÷ 3 ÷ 400 ≈ 13.3 周期 —— 开局粮食充裕，断粮不是红线。
+        assert!((cycles - 13.33).abs() < 0.1, "开局续航应约 13.3 周期，实际 {cycles}");
+        assert!(food_runway_cycles(30000.0, dupes) > cycles);
         assert!(food_runway_cycles(16000.0, 6) < cycles);
     }
 

@@ -8,7 +8,14 @@ pub const STRESS_CEIL: f64 = 75.0;
 pub const FOOD_FLOOR: f64 = 4000.0;
 pub const OXYGEN_FLOOR: f64 = 120.0;
 pub const REACH_FLOOR: i64 = 5;   // 开局只有十几格可达，别误报
-pub const KCAL_PER_DUPE_CYCLE: f64 = 2000.0;
+/// **每人每周期消耗的热量（kcal）**。
+///
+/// ★★ 2026-11-22 修正（陨石坑局复盘）：旧值 2000 错了 5 倍。
+///   ONI 官方：复制人**每周期吃 400 kcal**（2000 是「最多能囤多少」，不是消耗量）。
+///   旧值把开局 16000kcal 算成「只够 2.7 周期」→ 账本把「断粮」排成第一死因
+///   → 代理去抢收割节点 → surface/供电/研究全部饿死（实测）。
+///   修正后同一局是 13.3 周期 → 断粮不是红线，产氧/厕所才是。
+pub const KCAL_PER_DUPE_CYCLE: f64 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {

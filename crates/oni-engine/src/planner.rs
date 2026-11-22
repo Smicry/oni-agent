@@ -378,7 +378,7 @@ pub fn build_plan(f: &WorldFacts) -> (Plan, Strategy) {
             &[],
             vec![auto(food_goal, food_why)],
         ),
-        json!({"kind": "food_cycles_min", "cycles": 3}),
+        json!({"kind": "food_cycles_min", "cycles": 20}),
     );
     nodes.push(a7);
 

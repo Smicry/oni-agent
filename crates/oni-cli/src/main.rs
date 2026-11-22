@@ -744,6 +744,7 @@ fn cmd_hold(args: &[String]) -> anyhow::Result<()> {
     // 暂停游戏 + 写 hold 标记：主 agent 改代码/深挖期间冻结世界，保持观察权。
     let reason = args.first().cloned().unwrap_or_else(|| "主 agent 正在处理".into());
     oni_engine::agent::write_hold(&reason).map_err(|e| anyhow::anyhow!("写 hold 标记失败: {e}"))?;
+    oni_engine::control::pause(oni_engine::control::Owner::Hold, &reason);
     let s = connect()?;
     let out = s.call_text("game_control", serde_json::json!({
         "domain": "speed", "action": "pause",
@@ -758,6 +759,7 @@ fn cmd_hold(args: &[String]) -> anyhow::Result<()> {
 
 fn cmd_release() -> anyhow::Result<()> {
     oni_engine::agent::clear_hold();
+    oni_engine::control::resume(oni_engine::control::Owner::Hold);
     println!("✅ hold 已解除：代理恢复自主循环（需要时用 `oni window <秒>` 开施工窗口）");
     Ok(())
 }
@@ -925,6 +927,13 @@ fn cmd_pause_resume(args: &[String], pause: bool) -> anyhow::Result<()> {
     let out = s.call_text("game_control", serde_json::json!({
         "domain": "speed", "action": action, "task": format!("oni: {why}")
     })).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // ★ 暂停所有权：CLI 的 pause 来自用户/hook → 落盘 owner=User（跨进程重启保留）；
+    //   resume 是用户显式恢复 → 清掉 owner，代理才能接管。
+    if pause {
+        oni_engine::control::pause(oni_engine::control::Owner::User, &why);
+    } else {
+        oni_engine::control::clear();
+    }
     println!("{}", out.lines().take(3).collect::<Vec<_>>().join(" | "));
     Ok(())
 }

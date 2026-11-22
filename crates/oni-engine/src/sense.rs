@@ -78,6 +78,11 @@ pub struct Snapshot {
     /// prefabId → 数量（官方建筑索引）
     pub buildings: Value,
     pub reach_bounds: Option<(i32, i32, i32, i32)>,
+    /// **官方可达格数**（reachability 的 reachableCells）。
+    ///
+    /// ★ 用途：估算**生活区**（复制人真正待着的封闭气室）的空气量 ——
+    ///   全局氧气把殖民地根本够不到的气室也算进去 → 空气红线永远看不见。
+    pub reachable_cells: usize,
     pub latency_ms: u128,
     pub errors: Vec<String>,
     /// 官方原生空闲人数（step_facts 的 workIdleCount）—— 比"差事名"可靠得多
@@ -109,6 +114,7 @@ impl Default for Snapshot {
             inventory: Value::Null,
             buildings: Value::Null,
             reach_bounds: None,
+            reachable_cells: 0,
             latency_ms: 0,
             errors: Vec::new(),
             native_idle: None,
@@ -264,6 +270,31 @@ impl Snapshot {
             (self.breath_ratio() * 20.0).round() / 20.0
         )
     }
+    /// **生活区（复制人真正待着的封闭气室）的氧气量**估算。
+    ///
+    /// ★★ 为什么必须有这个指标（2026-11-22 陨石坑局复盘）：
+    ///   全局氧气 394kg、比例 99% —— 看着非常安全；
+    ///   但生活区是个**封闭气室**（开局只有十几格、~20kg 氧气）。
+    ///   全局指标把「殖民地根本够不到的气室」也算进去 → 空气红线**永远看不见**。
+    ///   上一局（小星2）就是这么死的：全局比例正常，人在封闭区里窒息到 0。
+    ///   口径：全局氧气密度（oxygenKgVisible / 可呼吸格）× 官方可达格数。
+    pub fn living_oxygen_kg(&self) -> Option<f64> {
+        let cells = self.reachable_cells;
+        if cells == 0 {
+            return None;
+        }
+        let breath_cells = self
+            .diagnostics
+            .get("breathableCellsVisible")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if breath_cells <= 0.0 {
+            return None;
+        }
+        let density = self.oxygen_kg() / breath_cells;
+        Some(density * cells as f64)
+    }
+
     pub fn building(&self, key: &str) -> i64 {
         self.diagnostics
             .get("buildings")
@@ -444,12 +475,26 @@ pub fn sense(session: &McpSession) -> Snapshot {
     }
 
     // 可达包络（虚拟文件）
-    let reach_bounds = session
+    // ★ 同一个文件里顺便取「可达格数」→ 用来估算生活区空气量（不额外加 MCP 压力）
+    let reach_text = session
         .call_text(
             "world_editor",
             serde_json::json!({ "command": "read", "path": "/active/dupes/reachability.md", "confirm": true, "task": "SENSE: 可达包络" }),
         )
-        .ok()
+        .ok();
+    // ★ 可达格数（官方 reachableCells，取第一处 = 全体并集）
+    let reachable_cells = reach_text
+        .as_deref()
+        .and_then(|t| {
+            let i = t.find("reachableCells")?;
+            let rest = t[i + "reachableCells".len()..].trim_start();
+            let rest = rest.strip_prefix(':')?.trim_start();
+            let end = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..end].trim().parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    let reach_bounds = reach_text
+        .as_deref()
         .and_then(|t| {
             let i = t.find("\"bounds\":[")?;
             let rest = &t[i + 10..];
@@ -524,6 +569,7 @@ pub fn sense(session: &McpSession) -> Snapshot {
         inventory: get("inventory"),
         buildings,
         reach_bounds,
+        reachable_cells,
         latency_ms: t0.elapsed().as_millis(),
         native_idle,
         pending_orders,

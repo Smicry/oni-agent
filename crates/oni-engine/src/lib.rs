@@ -14,6 +14,7 @@
 //! * **VERIFY 不过 = 没做成**：换方案，不是加轮次。
 
 pub mod agent;
+pub mod control;
 pub mod autoact;
 pub mod decide;
 pub mod live;

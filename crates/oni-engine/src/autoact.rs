@@ -413,6 +413,67 @@ fn filter_deadly_path(session: &McpSession, path: &[(i32, i32)]) -> Vec<(i32, i3
 ///   → 梯子铺了三列、哪列都没通、氧气反而在降（245→220kg）。
 ///   现在：首次算好路径存进锁，之后每轮沿同一路径推进到"第一个还没挖开的实心格"，
 ///   除非整条路径挖通或换存档，否则绝不重算。
+/// 找**最近的开阔气室**（≥8 格、氧气够、CO₂ 少、无危险气体），
+/// 返回它离基地最近的那一格（作为挖掘走廊的目标）。
+///
+/// ★ 为什么要这个语义（2026-11-22 陨石坑局实测）：
+///   竖井到地表要 19 格梯子（≈1900kg 建材 + 19 次垂直搬运），
+///   而邻近常常只隔 2~3 格砂岩就有一个**几十格的开阔气室**（几十 kg 氧气）。
+///   横向挖通它 = 一次解决「空气不够 + 2×2/2×3 建筑放不下 + 建材为零」三件事。
+///   选「最近的、最平的」：竖直代价按 3 倍计（往下挖会放 CO₂，事故 9）。
+fn best_open_chamber(
+    session: &McpSession,
+    catalog: Option<&Catalog>,
+    reach: &oni_world::preflight::Reach,
+) -> Option<(i32, i32)> {
+    let g = oni_world::graph::MapGraph::build_full(session, catalog, None, None)
+        .or_else(|_| oni_world::graph::MapGraph::build(session, catalog))
+        .ok()?;
+    let bb = reach_bbox(reach);
+    let base_y = reach.dupes.first().map(|d| d.1).unwrap_or(bb.3);
+    // (代价, -氧气, 目标格)
+    let mut best: Option<(f64, f64, (i32, i32))> = None;
+    for ch in g.chambers.iter() {
+        if ch.has_dupes || ch.cells.len() < 8 {
+            continue;
+        }
+        let o2 = ch.oxygen_kg();
+        if o2 < 15.0 {
+            continue;
+        }
+        if ch.co2_kg() > 5.0 {
+            continue;
+        }
+        if !ch.hazards().is_empty() {
+            continue;
+        }
+        let mut local: Option<(f64, (i32, i32))> = None;
+        for c in ch.cells.iter() {
+            let dx = if c.0 > bb.2 {
+                (c.0 - bb.2) as f64
+            } else if c.0 < bb.0 {
+                (bb.0 - c.0) as f64
+            } else {
+                0.0
+            };
+            let dy = ((c.1 - base_y).abs()) as f64;
+            let cost = dx + dy * 3.0;
+            if local.map(|(cc, _)| cost < cc).unwrap_or(true) {
+                local = Some((cost, *c));
+            }
+        }
+        let Some((cost, cell)) = local else { continue; };
+        let better = match &best {
+            None => true,
+            Some((bc, bo, _)) => cost < *bc - 0.5 || (cost <= *bc + 0.5 && o2 > *bo),
+        };
+        if better {
+            best = Some((cost, -o2, cell));
+        }
+    }
+    best.map(|(_, _, c)| c)
+}
+
 fn surface_target_locked(
     session: &McpSession,
     catalog: Option<&Catalog>,
@@ -543,6 +604,14 @@ fn surface_target_locked(
 pub enum Goal {
     /// 挖通到地表（永久换气）
     Surface,
+    /// **挖通最近的开阔气室**（一次解决空气 + 空间 + 建材）
+    ///
+    /// ★ 为什么需要（2026-11-22 陨石坑局实测）：
+    ///   开局基地是 14 格的封闭小房间 —— 空气不够、2×2/2×3 建筑放不下、
+    ///   竖井到地表要 19 格梯子（≈1900kg 建材 + 19 次垂直搬运）。
+    ///   而东边只隔 3 格砂岩就是一个 **37 格 / 62kg 氧气** 的开阔气室。
+    ///   ⇒ 横向挖通开阔气室 = 一次解决三件事，比硬啃竖井划算一个数量级。
+    OpenChamber,
     /// 挖到含指定元素的格（产氧/采矿）
     Element(&'static str),
     /// 挖到**任意一种建材**（梯子/砖块的合法材料）
@@ -615,6 +684,12 @@ pub fn parse_goal(s: &str) -> Option<Goal> {
     }
     if s.eq_ignore_ascii_case("expand") || s.contains("扩建") || s.contains("挖空间") {
         return Some(Goal::Expand);
+    }
+    if s.eq_ignore_ascii_case("open_chamber")
+        || s.contains("开阔气室")
+        || s.contains("扩建换气")
+    {
+        return Some(Goal::OpenChamber);
     }
     if s.eq_ignore_ascii_case("power") || s.contains("供电") || s.contains("发电") {
         return Some(Goal::Power);
@@ -876,6 +951,44 @@ pub fn compile(
             }
             None
         }
+        Goal::OpenChamber => {
+            // ★ 扩建换气：挖通**最近的开阔气室**。
+            //   目标用 goal_lock 记住（全图建图 10~15s，不能每轮重算）。
+            let reach = oni_world::preflight::load_reach(session, catalog)?;
+            let cycle = current_cycle(session);
+            let key = "open_chamber".to_string();
+            let mut locks = read_goal_locks();
+            let mut target = locks.get(&key).map(|l| (l.x, l.y));
+            if target.is_none() {
+                target = best_open_chamber(session, catalog, &reach);
+                if let Some(t) = target {
+                    locks.insert(
+                        key.clone(),
+                        GoalLock {
+                            x: t.0,
+                            y: t.1,
+                            element: "chamber".into(),
+                            cycle,
+                            path: vec![],
+                        },
+                    );
+                    write_goal_locks(&locks);
+                }
+            }
+            let Some(target) = target else {
+                return None;
+            };
+            let (x1, y1, x2, y2) = rect_toward(target, &reach, 5);
+            Some(Action::Dig {
+                rect: format!("{x1},{y1},{x2},{y2}"),
+                auto_ladder: true,
+                focus: Some(target),
+                why: format!(
+                    "扩建换气：挖通最近的开阔气室，锁定目标格 ({},{})（一次拿空气+空间+建材）",
+                    target.0, target.1
+                ),
+            })
+        }
         Goal::Expand => {
             // ★ 在可达区上方挖出"2 格高"的空间，让 2×2 建筑能建。
             //   ★ 关键：不能固定挖 anchor+1 那一行 —— 那一行可能已经是气体
@@ -934,7 +1047,36 @@ pub fn compile(
             //   被研究锁 → autoMaterialReason = "building_locked_by_research" → 跳过；
             //   缺材料 → reason 含 "no currently available material" → 跳过；
             //   第一个通过的 → 造它。
+            // ★★★ 2026-11-22（用户指出"慢系统策略不行"）：
+            //   旧逻辑按候选顺序挑——第一个 MineralDeoxidizer 要 IronOre，
+            //   造出来**要电**；但开局根本没发电机（generatorCount=0）→ 白建。
+            //   正解：**没有电就只挑不吃电的**（藻类箱 AlgaeHabitat 吃 Dirt+水，零耗电）。
+            //   「能不能造」不只是材料问题，还有"造出来能不能运转"（电/水/光照）。
+            let has_power = session
+                .read_json("oni://power/summary")
+                .ok()
+                .and_then(|v| v.pointer("/summary/generatorOperational").and_then(|x| x.as_i64()))
+                .unwrap_or(0) > 0;
             for (prefab, cn) in OXYGEN_CANDIDATES {
+                if !has_power && matches!(*prefab, "Electrolyzer" | "MineralDeoxidizer") {
+                    eprintln!("[产氧探测] 跳过 {cn}：需要电力但当前无发电机");
+                    continue;
+                }
+                // ★★ 2026-11-22（用户指出策略不行）：先过**研究锁**再挑材料。
+                //   mod 的 materials[] 只报"材料可用"，不报 unlocked ——
+                //   实测藻类箱材料 Dirt 493kg 显示可用，但 mod 落地报 "locked by research"
+                //   （reportedActions=0，看着像"指令 ok 但没生效"）。
+                //   buildability() 是检查研究锁的权威，必须先过它。
+                let buildable = crate::exec::buildability(session, prefab);
+                if !matches!(buildable, crate::exec::Buildability::Ready(_)) {
+                    let why = match buildable {
+                        crate::exec::Buildability::ResearchLocked(w) => w,
+                        crate::exec::Buildability::MissingMaterial(w) => w,
+                        crate::exec::Buildability::Ready(_) => String::new(),
+                    };
+                    eprintln!("[产氧探测] 跳过 {cn}：{why}");
+                    continue;
+                }
                 // ★ 2026-11-22 修正：mod 的 materials[] 是**目录顺序**，第一个可能地上 0kg
                 //   → 必须按真实可用量挑（与 buildability 同一把尺子）。
                 let mats = crate::exec::mod_materials_with_kg(session, prefab);
@@ -963,6 +1105,7 @@ pub fn compile(
                 .first()
                 .copied();
             for (prefab, cn) in OXYGEN_CANDIDATES {
+                if !has_power && matches!(*prefab, "Electrolyzer" | "MineralDeoxidizer") { continue; }
                 if let Some(tag) = crate::exec::bootstrap_material(session, prefab, cn, near) {
                     return Some(Action::Auto {
                         goal: format!("element:{tag}"),

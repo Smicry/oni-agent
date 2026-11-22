@@ -284,6 +284,100 @@ pub fn deadly_below_cells(
         .collect()
 }
 
+/// ★ 自动腾空间：找一块 W×H 的候选地，返回**该挖的那一格**。
+///
+/// ★ 为什么需要（2026-11-22 陨石坑局实测）：
+///   开局的打印舱占了 4×4，房间里只剩十几格 → 2×3 的厕所**根本没有现成落点**。
+///   旧逻辑直接报「找不到落点」→ 节点暂缓 → 厕所永远建不出来，
+///   而上一局（小星2）正是「没厕所 → 膀胱爆 → 随地排泄 → 污染水 → 复制人溺死」全灭。
+///   ⇒ 找不到落点时应该**先挖出空间**，而不是放弃。
+///
+/// 规则：
+///   - 占格只能是「气体」（可建）或「实心岩」（要先挖）；建筑/梯子/液体一律排除
+///   - 底边必须有实心支撑（OnFloor 要求脚下有东西）
+///   - 离复制人近的候选优先
+///   - 挖哪一格要过**统一挖掘预检**（避人 / 死亡格 / 落脚点）→ 不自己拼工单
+fn dig_space_for(
+    session: &McpSession,
+    catalog: Option<&Catalog>,
+    region: (i32, i32, i32, i32),
+    size: (i32, i32),
+    dupes: &[(i32, i32)],
+    building: &str,
+) -> Option<((i32, i32), String)> {
+    let reach = oni_world::preflight::load_reach(session, catalog)?;
+    let (w, h) = size;
+    let (rx1, ry1, rx2, ry2) = region;
+    let mut cands: Vec<((i32, i32), i32)> = Vec::new();
+    for x in rx1..=rx2 {
+        for y in ry1..=ry2 {
+            // 底边支撑：OnFloor 建筑脚下必须有实心或建筑
+            let below = (x, y - 1);
+            if !matches!(
+                reach.grid.kind(below),
+                oni_world::grid::Kind::Solid | oni_world::grid::Kind::Building
+            ) {
+                continue;
+            }
+            let mut need_dig: Vec<(i32, i32)> = Vec::new();
+            let mut ok = true;
+            for dy in 0..h {
+                for dx in 0..w {
+                    let c = (x + dx, y + dy);
+                    match reach.grid.kind(c) {
+                        oni_world::grid::Kind::Gas => {}
+                        oni_world::grid::Kind::Solid => need_dig.push(c),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok || need_dig.is_empty() {
+                continue;
+            }
+            let dist = dupes
+                .iter()
+                .map(|(dx, dy)| (dx - x).abs() + (dy - y).abs())
+                .min()
+                .unwrap_or(i32::MAX);
+            cands.push(((x, y), dist));
+        }
+    }
+    cands.sort_by_key(|(_, d)| *d);
+    for (anchor, _) in cands {
+        // 占格里的实心岩：优先挖**最低**那格（复制人站在同一层就能挖，不用梯子）
+        let mut solids: Vec<(i32, i32)> = Vec::new();
+        for dy in 0..h {
+            for dx in 0..w {
+                let c = (anchor.0 + dx, anchor.1 + dy);
+                if reach.grid.kind(c) == oni_world::grid::Kind::Solid {
+                    solids.push(c);
+                }
+            }
+        }
+        solids.sort_by_key(|c| (c.1, c.0));
+        for cell in solids {
+            // 过统一挖掘预检（避人 / 死亡格 / 落脚点）→ 复用统一管线，不自己拼工单
+            let pf = preflight_dig(session, &[cell], catalog);
+            if !pf.ok || !pf.ready.contains(&cell) {
+                continue;
+            }
+            return Some((
+                cell,
+                format!("为 {} 腾出空间：落点 ({},{}) 还差实心岩，先挖 ({},{})",
+                    building, anchor.0, anchor.1, cell.0, cell.1
+                ),
+            ));
+        }
+    }
+    None
+}
+
 pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> ExecOutcome {
     let mut results = Vec::new();
     for a in actions {
@@ -799,6 +893,34 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 let Some((anchor, pf)) =
                     oni_world::preflight::find_build_site(session, rect, (w, h), mat_ok, Some(catalog), &prefab)
                 else {
+                    // ★★★ 自动腾空间（2026-11-22 陨石坑局实测）：
+                    //   找不到落点**不等于**「没地方」 —— 常常只是**空间不够**（占格是实心岩）。
+                    //   旧逻辑直接失败 → 节点被暂缓 → 厕所/床永远建不成；
+                    //   而上一局（小星2）就是「没有厕所 → 膀胱爆 → 随地排泄 → 污染水 → 溺死」。
+                    //   新逻辑：找一块 W×H 的候选地（占格只能气体或实心岩、底边要有实心支撑），
+                    //   把其中**一格实心岩**挖掉（过统一挖掘预检：避人/死亡格/落脚点），
+                    //   下一轮再回来建造 → 空间自己长出来。
+                    let dupes = oni_world::preflight::dupe_positions(session);
+                    if let Some((cell, note)) =
+                        dig_space_for(session, Some(catalog), rect, (w, h), &dupes, &def.name)
+                    {
+                        let cmd = format!(
+                            "挖 x1={} y1={} x2={} y2={} priority=7 confirm=true",
+                            cell.0, cell.1, cell.0, cell.1
+                        );
+                        match run_order_raw(session, &cmd, false) {
+                            Ok(out) => {
+                                results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: true,
+                                    detail: format!("{note} → 已下挖掘工单 @({},{})（{}）", cell.0, cell.1,
+                                        first_line(&out).unwrap_or_default()) });
+                                return ExecOutcome { results, ok: true };
+                            }
+                            Err(e) => {
+                                results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false, detail: e });
+                                return ExecOutcome { results, ok: false };
+                            }
+                        }
+                    }
                     results.push(ActionResult { kind: "build".into(), why: why.clone(), ok: false,
                         detail: format!("{region} 内找不到能放 {} 的落点（占格/支撑/落脚点都不满足）", def.prefab_id) });
                     return ExecOutcome { results, ok: false };

@@ -80,6 +80,8 @@
 
 **规则**
 - 复制人通过进食获得热量（kcal）；野生采集只能撑过开局，长期要靠种植/养殖。[经验](https://evagamestation.com/2026/02/28/oxygen-not-included-beginners-guide/)
+- **每个复制人每周期消耗 400 kcal**（2000 是「最多能囤多少」，不是消耗量）。
+  算食物续航用 `kcal ÷ (人数 × 400)`；开局 16000kcal ÷ 3 人 ≈ **13.3 周期**。[官方: Duplicant](https://oxygennotincluded.wiki.gg/wiki/Duplicant)
 - 人口增长速度不能超过食物生产速度，否则形成粮食赤字。[经验](https://www.allinwondergame.com/news/oxygen-not-included-beginner-guide)
 
 **落地**
