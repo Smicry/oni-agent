@@ -1,0 +1,322 @@
+{
+  "objective": "★ 顺序：侦察 → 建材 → 产氧 → 换气(向上) → 深挖产氧链 → 食物 → 居住 → 供电 → 新人 → 火箭。★ 深挖必须在换气之后（深挖会释放地下CO₂）",
+  "survival_node": "O2",
+  "principles": [
+    "★★ 开局第一件事是侦察（scout）：先知道铁矿/氧石/铜矿在哪、多远，再决定挖哪里",
+    "★★ 深挖（挖铁矿等深层资源）必须在换气到地表之后：深挖会把地下CO₂释放到低层走廊",
+    "★★ 挖掘点必须避人：不要在身处不可呼吸环境的复制人附近开井",
+    "★★ downed 不可自愈：全员倒地=殖民地死锁（mod 无拖人/治疗工单），必须事前避免",
+    "★ 效果判据用终局指标（氧气/食物/人口），不用中间产物存量（氧石挖出即释氧、藻类挖出即被吃）",
+    "★ 元素搜索失败先问是不是在视野外：用 mod world search 兜底（本地网格只覆盖相机视野）",
+    "★ 目标离可达区超过一屏时，挖一条路过去（渐进走廊），不要在目标周围空挖",
+    "★ 建筑材料以 mod 权威查询为准：目录的 autoMaterial 只是首选（实测研究站其实要 IronOre 而非 Cuprite）",
+    "★ requires 是硬依赖，unlocks 只是优先级权重；unlocks=[] 的节点永远排最后",
+    "★ 挖掘/建造一次只下一条工单；缺材料时不要反复下注定失败的建造单（会触发失败→冻回空转）",
+    "★★ 判据必须用终局指标或续航：绝对值判据在新档开局往往已满足 → 节点秒 done（食物 16000kcal / 氧气 401kg）"
+  ],
+  "nodes": [
+    {
+      "id": "R0",
+      "name": "★救援：清理污染水 + 把倒地的复制人挪到有氧气的格",
+      "status": "todo",
+      "requires": [],
+      "unlocks": [
+        "S0",
+        "N0",
+        "N1",
+        "N2",
+        "O2",
+        "N4",
+        "N5",
+        "N6",
+        "N7",
+        "N8"
+      ],
+      "rescue": true,
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "mop_dirty",
+          "why": "清理污染水/污染氧 —— 人泡在里面呼吸 0、失去行动能力，是最高优先级"
+        }
+      ],
+      "success_check": {
+        "kind": "breath_min",
+        "value": 50
+      },
+      "success": "所有复制人呼吸值 > 50（无人倒地）",
+      "note": "★ 救援优先于一切。倒地的复制人不会执行任何差事。"
+    },
+    {
+      "id": "S0",
+      "name": "★开局侦察：探清关键资源分布与距离",
+      "status": "todo",
+      "requires": [
+        "R0"
+      ],
+      "unlocks": [
+        "N0",
+        "N1",
+        "N2",
+        "O2"
+      ],
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "scout",
+          "why": "开局先侦察：不知道资源在哪就深挖，会挖开地下CO2导致全灭（事故9）"
+        }
+      ],
+      "success_check": {
+        "kind": "scout_done"
+      },
+      "success": "资源侦察完成（报告见 ~/.oni-agent/scout.json）",
+      "note": "★ 事故9 的直接对策。侦察只读不改世界，安全。深埋资源会标注[在下方：深挖危险]。"
+    },
+    {
+      "id": "N0",
+      "name": "采集建材：挖通通道拿到可建造材料",
+      "status": "todo",
+      "requires": [
+        "S0"
+      ],
+      "unlocks": [
+        "N1",
+        "N2",
+        "O2",
+        "N4",
+        "N5"
+      ],
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "material",
+          "why": "采建材：梯子/砖块的合法材料（BuildableRaw）"
+        }
+      ],
+      "success_check": {
+        "kind": "loose_any_min",
+        "kg": 500,
+        "elements": [
+          "SandStone",
+          "Algae",
+          "Dirt",
+          "Clay"
+        ]
+      },
+      "success": "地上有建材 ≥ 500kg",
+      "note": "开局地上通常零建材 → 什么都造不了，第一步永远是拿建材。"
+    },
+    {
+      "id": "N1",
+      "name": "产氧：挖氧石（一次性释氧，解开局燃眉之急）",
+      "status": "todo",
+      "requires": [
+        "N0"
+      ],
+      "unlocks": [
+        "N2",
+        "O2",
+        "N4"
+      ],
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "element:OxyRock",
+          "why": "挖氧石：开局快速补氧（注意：释氧后地上不留散装，判据用oxygen_min）"
+        }
+      ],
+      "success_check": {
+        "kind": "breath_ratio_min",
+        "pct": 85
+      },
+      "success": "空气质量比例 O₂/(O₂+CO₂) ≥ 85%",
+      "note": "★ 氧石是一次性释氧 → 只能救急。★ 判据用**比例**不用绝对 kg：绝对值在新档开局就满足 → 节点秒 done（实测踩过）。"
+    },
+    {
+      "id": "N2",
+      "name": "换气：打通到地表（优先向上，不要向下深挖）",
+      "status": "todo",
+      "requires": [
+        "N1"
+      ],
+      "unlocks": [
+        "O2",
+        "N4",
+        "N5"
+      ],
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "surface",
+          "why": "挖通地表 = 无限新鲜空气。★ 向上优于向下：深挖会释放地下CO2到低层走廊（事故9）"
+        }
+      ],
+      "success_check": {
+        "kind": "surface_open",
+        "minY": 216
+      },
+      "success": "复制人能走到地表格（可达区上界 Y ≥ 216）",
+      "note": "★ 事故9：深挖（铁矿在20格外）→ 挖开CO2 → 三人全灭。所以换气排在深挖之前。"
+    },
+    {
+      "id": "O2",
+      "name": "保命-持续产氧链：挖铁矿 → 研究站 → 电解器",
+      "status": "todo",
+      "requires": [
+        "N2"
+      ],
+      "unlocks": [
+        "N4",
+        "N5",
+        "N6",
+        "N7",
+        "N8"
+      ],
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "element:IronOre",
+          "why": "★ 一切电气/产氧建筑的前提（研究站/电解器/发电机/电池/脱氧机 全要 IronOre）"
+        }
+      ],
+      "success_check": {
+        "kind": "loose_min",
+        "element": "IronOre",
+        "kg": 50
+      },
+      "success": "地上铁矿 ≥ 50kg",
+      "note": "★ survival_node。铁矿到手后再开建造子节点（研究站→电解器=吃水无限产氧）。★ 深挖排在 N2 之后。"
+    },
+    {
+      "id": "N4",
+      "name": "食物：采集现成食物 + 农业站",
+      "status": "todo",
+      "requires": [
+        "O2"
+      ],
+      "unlocks": [
+        "N5",
+        "N6"
+      ],
+      "actions": [
+        {
+          "kind": "auto",
+          "goal": "element:Algae",
+          "why": "应急食物：藻类可食又是建材（注意挖出即被吃，判据用food_min）"
+        }
+      ],
+      "success_check": {
+        "kind": "food_cycles_min",
+        "cycles": 4
+      },
+      "success": "食物续航 ≥ 4 周期",
+      "note": "★ 判据用**续航**不用绝对 kcal：开局 16000kcal 在 t=0 就满足绝对判据 → 节点秒 done、代理永远不采食物（实测踩过）。"
+    },
+    {
+      "id": "N5",
+      "name": "居住：床位 + 厕所 + 洗手盆",
+      "status": "todo",
+      "requires": [
+        "N4"
+      ],
+      "unlocks": [
+        "N6",
+        "N8"
+      ],
+      "actions": [
+        {
+          "kind": "auto_build",
+          "prefab": "Bed",
+          "region": "auto",
+          "why": "床位2x2：复制人没床睡觉会累积压力"
+        },
+        {
+          "kind": "auto_build",
+          "prefab": "Outhouse",
+          "region": "auto",
+          "why": "旱厕不需要水：膀胱满会降低效率"
+        },
+        {
+          "kind": "auto_build",
+          "prefab": "WashBasin",
+          "region": "auto",
+          "why": "洗手盆：配合厕所避免污染扩散"
+        }
+      ],
+      "success_check": {
+        "kind": "building_min",
+        "key": "beds",
+        "n": 2
+      },
+      "success": "床位 ≥ 2（空间不够时别硬凑3张）",
+      "note": "★ 走廊空间常常只放得下2张床 → 判据别写3（不可达→反复失败）。"
+    },
+    {
+      "id": "N6",
+      "name": "供电：发电机 + 蓄电池 + 电线",
+      "status": "todo",
+      "requires": [
+        "N5"
+      ],
+      "unlocks": [
+        "N7",
+        "N8"
+      ],
+      "actions": [
+        {
+          "kind": "auto_build",
+          "prefab": "Battery",
+          "region": "auto",
+          "why": "电池+发电机+电线（全部要 IronOre）"
+        }
+      ],
+      "success_check": {
+        "kind": "power_operational"
+      },
+      "success": "summary.generatorOperational > 0",
+      "note": "★ 人力发电机没有燃料槽，靠复制人操作发电 → generator_fueled 对它恒假，用 power_operational。"
+    },
+    {
+      "id": "N7",
+      "name": "新人：打印舱领奖",
+      "status": "todo",
+      "requires": [
+        "N6"
+      ],
+      "unlocks": [
+        "N8"
+      ],
+      "actions": [
+        {
+          "kind": "call",
+          "tool": "building_control",
+          "args": "{\"domain\":\"side_surface\",\"surface\":\"facility\",\"kind\":\"printing_pod\",\"action\":\"claim\",\"rewardIndex\":0,\"confirm\":true}",
+          "why": "打印舱领奖（唯一新人来源）"
+        }
+      ],
+      "success_check": {
+        "kind": "dupe_min",
+        "n": 4
+      },
+      "success": "人口 ≥ 4",
+      "note": "打印舱是唯一新人来源，有两份奖励别只领 index 0。"
+    },
+    {
+      "id": "N8",
+      "name": "火箭：完成本局目标",
+      "status": "todo",
+      "requires": [
+        "N5",
+        "N7"
+      ],
+      "unlocks": [],
+      "actions": [],
+      "success_check": {
+        "kind": "manual"
+      },
+      "success": "发射火箭",
+      "note": "本局最终目标。"
+    }
+  ]
+}

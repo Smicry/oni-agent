@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/oni-mcp", "crates/oni-world", "crates/oni-engine", "crates/oni-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ureq = { version = "2.10", default-features = false }   # 只需明文 HTTP（127.0.0.1）
+rayon = "1.10"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

@@ -1,0 +1,26 @@
+# ── Rust 构建产物 ──────────────────────────────
+/target/
+
+# ── 运行时状态（每局的计划/快照，含具体存档坐标，非工程代码）──
+/plan.json
+/plan.json.bak*
+/*.bak
+
+# ── 单局游戏记录（事故/值守/复盘/截图 —— 本地保留，不开源）──
+# 保留通用的 optimization-backlog.md（工程待办清单）
+/records/*
+!/records/optimization-backlog.md
+
+# ── 值守脚本（绑定具体局名，非通用工具）──
+/scripts/watch_slow*.py
+
+# ── 临时调试脚本 ──────────────────────────────
+/.tmp_*.py
+
+# ── 本地环境配置（国内 crates.io 镜像，非工程必需）──
+/.cargo/config.toml
+
+# ── 编辑器 / 工具状态 ─────────────────────────
+/.minimax/
+.DS_Store
+*.swp

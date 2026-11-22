@@ -1,0 +1,14 @@
+[package]
+name = "oni-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+oni-mcp = { path = "../oni-mcp" }
+oni-world = { path = "../oni-world" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+rayon = { workspace = true }

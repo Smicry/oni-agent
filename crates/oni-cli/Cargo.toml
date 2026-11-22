@@ -1,0 +1,16 @@
+[package]
+name = "oni-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "oni"
+path = "src/main.rs"
+
+[dependencies]
+oni-mcp = { path = "../oni-mcp" }
+oni-world = { path = "../oni-world" }
+oni-engine = { path = "../oni-engine" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
