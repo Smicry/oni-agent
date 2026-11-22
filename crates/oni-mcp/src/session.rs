@@ -61,38 +61,64 @@ impl McpSession {
         //   合并后同一时刻每个 URI 只打一次，其余线程直接拿结果。
         {
             let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = map.get(uri).cloned() {
-                drop(map); // 不持锁等待
-                let (lock, cv) = &*slot;
-                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                while guard.is_none() {
-                    guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-                }
-                return match guard.take() {
-                    Some(Ok(v)) => Ok(v),
-                    Some(Err(e)) => Err(McpError::Http(e)),
-                    None => Err(McpError::Http("singleflight 结果缺失".into())),
-                };
+            let existing = map.get(uri).cloned();
+            if existing.is_none() {
+                // 我是第一个 → 登记槽位并去发请求
+                map.insert(uri.to_string(), Arc::new((Mutex::new(None), Condvar::new())));
             }
-            // 我是第一个 → 登记槽位并去发请求
-            let slot = Arc::new((Mutex::new(None), Condvar::new()));
-            map.insert(uri.to_string(), slot.clone());
             drop(map);
-
-            let result = self.t.request("resources/read", Some(json!({ "uri": uri })));
+            let slot = match existing {
+                Some(s) => s,
+                None => {
+                    // leader：发请求 → 写结果 → 唤醒所有等待者
+                    let slot = self
+                        .inflight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(uri)
+                        .cloned()
+                        .expect("leader slot 刚登记");
+                    let result = self.t.request("resources/read", Some(json!({ "uri": uri })));
+                    let (lock, cv) = &*slot;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    *guard = Some(result.as_ref().map_err(|e| e.to_string()).cloned());
+                    cv.notify_all();
+                    drop(guard);
+                    // 槽位留着不删：删会有竞态（新线程可能刚加入）。
+                    // 后续读走缓存（TTL 8s），缓存过期后自然会有新的 leader。
+                    let v = result?;
+                    if let Ok(text) = serde_json::to_string(&v) {
+                        self.cache.put(uri, &text);
+                    }
+                    return Ok(v);
+                }
+            };
+            // 等待者：等结果（带超时降级 —— leader 若异常退出不至于永久卡死）
             let (lock, cv) = &*slot;
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(result.as_ref().map_err(|e| e.to_string()).cloned());
-            cv.notify_all();
-            drop(guard);
-            // 槽位用完即弃（后续读走缓存；缓存过期后再读会重新成为 leader）
-            self.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(uri);
-
-            let v = result?;
-            if let Ok(text) = serde_json::to_string(&v) {
-                self.cache.put(uri, &text);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while guard.is_none() {
+                let remain = deadline.saturating_duration_since(std::time::Instant::now());
+                if remain.is_zero() { break; }
+                let (g, _t) = cv.wait_timeout(guard, remain).unwrap_or_else(|e| e.into_inner());
+                guard = g;
             }
-            Ok(v)
+            // ★ 用 as_ref().clone() 而**不是 take()**：结果要被所有等待者共享读取，
+            //   take() 只能取一次 → 第二个等待者永远等不到（死锁：快系统线程卡死，
+            //   实测表现为"游戏十分钟没进展"）。
+            match guard.as_ref().cloned() {
+                Some(Ok(v)) => Ok(v),
+                Some(Err(e)) => Err(McpError::Http(e)),
+                // 超时降级：自己发一次（不合并），保证不卡死
+                None => {
+                    drop(guard);
+                    let v = self.t.request("resources/read", Some(json!({ "uri": uri })))?;
+                    if let Ok(text) = serde_json::to_string(&v) {
+                        self.cache.put(uri, &text);
+                    }
+                    Ok(v)
+                }
+            }
         }
     }
 
