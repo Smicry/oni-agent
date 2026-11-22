@@ -105,6 +105,11 @@ pub struct Agent {
     window_owned_by_us: bool,
     /// 连续全员空闲的轮数
     idle_streak: usize,
+    /// Per-dupe consecutive truly-idle cycles (name → count). Enables AI to see
+    /// "someone has nothing to do" before the whole colony stalls.
+    per_dupe_idle: std::collections::HashMap<String, usize>,
+    /// Consecutive cycles with pending orders but nobody working (dead-order detector).
+    idle_streak_unworked: usize,
     /// 空跑停机标记：**置位后不得自动恢复**
     idle_stopped: bool,
     /// 窗口结束冻回标记：**同样不得自动恢复**（"结束即暂停"是硬要求）
@@ -186,6 +191,8 @@ impl Agent {
             user_paused: false,
             window_owned_by_us: false,
             idle_streak: 0,
+            per_dupe_idle: std::collections::HashMap::new(),
+            idle_streak_unworked: 0,
             idle_stopped: false,
             frozen: false,
             danger_cycle: false,
@@ -1483,6 +1490,86 @@ impl Agent {
                 }
             }
             self.no_progress = 0;
+        }
+
+        // ---- Per-dupe idle watch: report sustained individual idleness to AI ----
+        // A single idle dupe is normal (walking, waiting for materials);
+        // 6+ consecutive cycles (60s) of true idleness while goals remain is not.
+        if !snap.paused {
+            let idle_names: std::collections::HashSet<&str> = snap.dupes.iter()
+                .filter(|d| {
+                    let c = d.chore.as_str();
+                    (c == "空闲" || c == "IdleChore")
+                        && !c.contains("休息") && !c.contains("睡觉")
+                })
+                .map(|d| d.name.as_str()).collect();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for name in &idle_names {
+                seen.insert((*name).to_string());
+                *self.per_dupe_idle.entry((*name).to_string()).or_insert(0) += 1;
+            }
+            self.per_dupe_idle.retain(|k, _| seen.contains(k));
+            // Report only when NOT all-idle (all-idle has its own handler below),
+            // goals remain, and no work is pending.
+            let sustained: Vec<(String, usize)> = self.per_dupe_idle.iter()
+                .filter(|(_, n)| **n >= 6)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            let todo_exists = plan.nodes.iter().any(|n| n.status == "todo");
+            if !sustained.is_empty() && todo_exists
+                && snap.pending_orders.unwrap_or(0) == 0
+                && snap.under_construction == 0
+                && snap.truly_idle_count() < snap.dupes.len()
+                && !self.escalation_hold
+            {
+                let who: Vec<String> = sustained.iter().map(|(n, c)| format!("{n}({c}轮)")).collect();
+                let detail = format!("Sustained individual idleness [{}] while goals remain; assign work or replan", who.join(", "));
+                self.pause("individual idle → freeze for AI work assignment");
+                self.window_until = None;
+                self.window_owned_by_us = false;
+                self.escalation_hold = true;
+                self.escalation_since = Some(Instant::now());
+                let _ = crate::escalate::raise(
+                    crate::escalate::Kind::NoProgress, "", detail.clone(),
+                    "AI: assign work to idle dupes or replan".into(),
+                    crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                        oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+                );
+                self.per_dupe_idle.clear();
+                report.notes.push(format!("⏸ 个体持续空闲 → 冻结并上报 AI：{detail}"));
+            }
+        }
+
+        // ---- Work backlog + everyone idle: dead orders the fast system cannot fix ----
+        // Official pending orders may sit in the queue while nobody executes them
+        // (target unreachable, chore bug, or priority issue). This is a semantic
+        // judgment for the AI: reassign, cancel, or dig an access path.
+        let backlog = snap.pending_orders.unwrap_or(0) > 0;
+        let everyone_idle = !snap.dupes.is_empty()
+            && snap.truly_idle_count() == snap.dupes.len();
+        if backlog && everyone_idle && !snap.paused {
+            self.idle_streak_unworked += 1;
+        } else {
+            self.idle_streak_unworked = 0;
+        }
+        if backlog && everyone_idle && !snap.paused && self.idle_streak_unworked >= 2
+            && !self.escalation_hold
+        {
+            let detail = format!("{} work orders pending but all {} dupes idle for {} cycles: dead orders?",
+                snap.pending_orders.unwrap_or(0), snap.dupes.len(), self.idle_streak_unworked);
+            self.pause("work backlog + all idle → freeze for AI judgment");
+            self.window_until = None;
+            self.window_owned_by_us = false;
+            self.escalation_hold = true;
+            self.escalation_since = Some(Instant::now());
+            self.idle_streak_unworked = 0;
+            let _ = crate::escalate::raise(
+                crate::escalate::Kind::NoProgress, "", detail.clone(),
+                "AI: reassign / cancel dead orders / dig access path".into(),
+                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
+                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal() },
+            );
+            report.notes.push(format!("⏸ 工单积压+全员空闲 → 冻结并上报 AI：{detail}"));
         }
 
         // ---- 空跑即停：没有人干活就立刻冻回，不烧周期 ----

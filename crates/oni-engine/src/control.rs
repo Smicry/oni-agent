@@ -114,7 +114,11 @@ pub fn pause(owner: Owner, reason: &str) {
 /// 返回是否真的解除了。
 pub fn resume(expected: Owner) -> bool {
     let st = read();
-    if st.owner != Owner::None && st.owner != expected {
+    // hold/release is a slow-system action; allow it even if a user hook pause
+    // has since overwritten the owner (both are freeze intents, not conflicting work).
+    let compatible = st.owner == Owner::None || st.owner == expected
+        || (expected == Owner::Hold && st.owner == Owner::User);
+    if !compatible {
         eprintln!("⛔ 拒绝恢复：暂停 owner={} 与请求方 {} 不匹配", st.owner.label(), expected.label());
         return false;
     }

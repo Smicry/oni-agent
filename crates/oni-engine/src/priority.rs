@@ -211,7 +211,7 @@ pub fn direct(
             ),
             action,
             forbid_expansion: action == Action::ProduceOxygen,
-            needs_ai: true,
+            needs_ai: false,
         };
     }
 
@@ -308,7 +308,7 @@ pub fn direct(
             reason: format!("🍞 食物仅够 {:.1} 周期 → 补给优先", food_cycles_left.unwrap()),
             action: Action::ForageFood,
             forbid_expansion: true,
-            needs_ai: true,
+            needs_ai: false,
         };
     }
 
@@ -325,7 +325,7 @@ pub fn direct(
             ),
             action: Action::Ventilate,
             forbid_expansion: false,
-            needs_ai: true,
+            needs_ai: false,
         };
     }
 
