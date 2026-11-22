@@ -78,6 +78,44 @@ pub fn hold_active() -> bool {
     hold_path().exists()
 }
 
+/// ★ 动作指纹：从 exec 结果里提取"这次到底对哪个目标动了手"。
+///
+/// 为什么需要指纹而不是只按节点计：节点级计数看得见"这个节点失败"，
+///   看不见"代理在同一格上反复下同样的工单"（实测：厕所每轮挖同一格，
+///   那格早已挖开 → 无限循环）。指纹让循环可被识别、被上报、被换方案。
+///
+/// 覆盖的 detail 形态（exec.rs 的稳定文案）：
+///   "已下挖掘工单 @(x,y)" / "已放置 Prefab @(x,y)" / "落点 (x,y)" / "先挖 (x,y)"
+pub fn action_fingerprint(r: &crate::exec::ActionResult) -> Option<String> {
+    let d = r.detail.as_str();
+    // 优先取"@坐标"（工单实际落点），其次取"落点 (x,y)"，再取"(x,y)"首个坐标对。
+    let pick = |s: &str| -> Option<(i32, i32)> {
+        let mut it = s.match_indices('(');
+        while let Some((i, _)) = it.next() {
+            let rest = &s[i + 1..];
+            if let Some(j) = rest.find(')') {
+                let inner = &rest[..j];
+                let mut it2 = inner.split(',');
+                if let (Some(a), Some(b)) = (it2.next(), it2.next()) {
+                    if let (Ok(x), Ok(y)) = (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                        return Some((x, y));
+                    }
+                }
+            }
+        }
+        None
+    };
+    // "@(x,y)" 优先：它是**真正下的工单位置**
+    let coord = if let Some(at) = d.find("@(") {
+        pick(&d[at + 1..])
+    } else if let Some(lp) = d.find("落点 (") {
+        pick(&d[lp + 3..])
+    } else {
+        pick(d)
+    }?;
+    Some(format!("{}@{},{}", r.kind, coord.0, coord.1))
+}
+
 /// ★ 结构化失败原因分类：把 exec 的自由文本 detail 归为稳定的类别。
 /// 慢系统据此诊断「为什么失败」，而不是盲目换目标名字
 /// （实测 oxygen 连续 8 次失败 = "语义目标找不到"，却一直被重试）。
@@ -140,6 +178,13 @@ pub struct Agent {
     last_pop: usize,
     /// 保命节点连续失败次数
     survival_failures: usize,
+    /// ★ 动作级循环账本：动作指纹 → 连续出现次数。
+    ///
+    /// 为什么需要：节点级计数（action_failures / stuck_streak）只看得见"这个节点失败了"，
+    ///   看不见"代理在同一格上反复下同样的工单"（实测厕所：每轮挖 (115,194)，
+    ///   而那格早已挖开 → 无限循环，厕所永远建不成）。
+    /// 命中阈值 → 不再重复该动作，改为上报慢系统换方案（契约：慢系统处理策略性死循环）。
+    action_loops: std::collections::HashMap<String, usize>,
     /// **卡住去抖计数**：同一 kind 连续命中几轮（瞬时状态不升级）。
     ///
     /// 为什么需要：
@@ -208,6 +253,7 @@ impl Agent {
             survival_failures: 0,
             space_failures: 0,
             stuck_streak: std::collections::HashMap::new(),
+            action_loops: std::collections::HashMap::new(),
             replan_cooldown: 0,
             last_fingerprint: String::new(),
             left_running: false,
@@ -223,6 +269,12 @@ impl Agent {
     ///   不会因为多试几次就好 → 快速暂缓比死磕 3 轮更省时间。
     ///   熔断阈值是 3（因为挖掘可能只是慢），动作失败阈值是 2（因为建造是确定性的）。
     const ACTION_FAIL_MAX: usize = 2;
+
+    /// 同一动作指纹连续出现多少次 → 判定执行层循环（升级慢系统 + 暂缓节点）。
+    ///
+    /// 为什么是 3：挖掘/建造要复制人真的走过去动手，2 轮可能是正常的慢；
+    ///   3 轮还在同一格 → 几乎必然是"选点/判据不成立"或"那格早已挖开"（实测厕所）。
+    const ACTION_LOOP_MAX: usize = 3;
 
     /// 暂缓节点的冷却期（轮）：暂缓后至少隔这么多轮才允许自动恢复。
     ///
@@ -1558,6 +1610,55 @@ impl Agent {
         } else {
             self.action_failures = 0;
         }
+
+        // ---- ★ 动作级循环检测（"循环即升级"）----
+        //   节点级计数看不见"代理在同一格上反复下同样的工单"（实测厕所：每轮挖
+        //   (115,194)，而那格早已挖开 → 无限循环，厕所永远建不成）。
+        //   这里按**动作指纹**（kind@坐标）计账：同一指纹连续出现 N 次 →
+        //   判定执行层循环 → ① 上报慢系统（带指纹/次数/失败类别/现场事实）
+        //   ② 暂缓该节点（下一轮不再选它）→ 慢系统换方案，而不是继续硬试。
+        let mut loop_hit: Option<(String, usize)> = None;
+        // 本轮出现过的动作指纹（连续性判定：本轮没出现 = 中断 → 计数归零）
+        let fps: Vec<String> = out.results.iter().filter_map(action_fingerprint).collect();
+        for fp in &fps {
+            // 保留本轮出现过的 + 上一轮累计的（上一轮没出现的已在下面清零）
+            let c = self.action_loops.entry(fp.clone()).or_insert(0);
+            *c += 1;
+            if *c >= Self::ACTION_LOOP_MAX {
+                loop_hit = Some((fp.clone(), *c));
+                break;
+            }
+        }
+        // 连续性中断的指纹（这轮没出现）→ 计数归零
+        self.action_loops.retain(|k, _| fps.contains(k));
+        if let Some((fp, times)) = loop_hit {
+            let detail = format!(
+                "执行层循环：动作 {} 连续 {} 轮重复执行仍未产生效果。{}",
+                fp, times,
+                out.results.iter().map(|r| r.detail.clone())
+                    .collect::<Vec<_>>().join(" | ")
+            );
+            let ctx = crate::escalate::Ctx {
+                cycle: snap.cycle, dupes: snap.dupes.len(),
+                oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(),
+                breath: snap.min_breath().unwrap_or(0.0),
+                bladder: snap.max_bladder(), ..Default::default()
+            };
+            crate::escalate::raise(
+                crate::escalate::Kind::NoProgress, &node.id, detail,
+                "慢系统换方案：该目标落点/判据可能不成立（选址条件过严？目标已被挖开？换个目标或放宽判据）".into(),
+                ctx,
+            );
+            // 暂缓该节点：下一轮不再选它 → 打断循环，等慢系统给新方向。
+            let _ = mark_node_deferred(&self.cfg.plan_path, &node.id, "执行层循环", snap.cycle as u64);
+            self.action_loops.clear();
+            report.notes.push(format!(
+                "🔁 执行层循环（{} 连续{}次）→ 已升级慢系统并暂缓 [{}]，不再硬试",
+                fp, times, node.id
+            ));
+            return report;
+        }
+        // 未命中循环：账本已按"本轮未见则归零"维护，无需额外清理。
         if self.action_failures >= Self::ACTION_FAIL_MAX && !research_locked {
             let is_survival = plan.survival_node.as_deref() == Some(node.id.as_str());
             if is_survival {
@@ -1981,6 +2082,26 @@ pub fn mark_node_done(plan_path: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// 动作指纹提取：从 detail 里认出"对哪个目标动了手"。
+    #[test]
+    fn action_fingerprint_extracts_target_from_detail() {
+        let mk = |kind: &str, detail: &str| crate::exec::ActionResult {
+            kind: kind.into(), why: String::new(), ok: true, detail: detail.into(),
+        };
+        // 工单落点（@ 坐标）优先
+        assert_eq!(
+            super::action_fingerprint(&mk("dig", "为 户外厕所 腾出空间：落点 (116,194) 还差实心岩，先挖 (116,195) → 已下挖掘工单 @(116,195)（ok: true）")),
+            Some("dig@116,195".to_string())
+        );
+        // 建造落点
+        assert_eq!(
+            super::action_fingerprint(&mk("build", "已放置 Outhouse @(119,194) ok")),
+            Some("build@119,194".to_string())
+        );
+        // 没有坐标 → 无指纹（不参与循环判定）
+        assert_eq!(super::action_fingerprint(&mk("scout", "侦察完成")), None);
+    }
+
     /// 结构化失败分类：把自由文本 detail 归为稳定类别，供慢系统诊断根因。
     #[test]
     fn classify_fail_maps_common_failure_modes() {
