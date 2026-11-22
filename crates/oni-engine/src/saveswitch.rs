@@ -95,11 +95,27 @@ pub fn reset_plan(plan_path: &str, fp: &str) -> bool {
 
 /// 清掉**当前存档**的局内状态（目标锁/侦察报告/趋势样本/实时快照）。
 pub fn clear_save_state() {
+    // 局内状态不只是"目标锁/侦察/快照"——决策上下文也是局内的：
+    //   decisions.jsonl（LLM 决策滑动窗口）、goal_outcomes.jsonl（熔断统计）、
+    //   ai_goals.jsonl（未完成语义目标）、circuit_breaks.jsonl（失败熔断记录）。
+    //   不清的话：回滚存档重开同一局时，上一轮的"全灭/倒地/熔断"记录
+    //   会进入 LLM 的决策窗口 → 污染新运行的决策走向
+    //   （实测缺口：上一局 oxygen fail=4 的熔断会把新局的产氧目标开局就冷却封锁）。
     for name in [
         "goal_lock.json",
         "scout.json",
         "snapshots.jsonl",
         "live_snapshot.json",
+        "decisions.jsonl",
+        "goal_outcomes.jsonl",
+        "ai_goals.jsonl",
+        "circuit_breaks.jsonl",
+        "opening_state.json",
+        "opening_brief.json",
+        "opening_brief.done",
+        "suggestions.jsonl",
+        "escalations/pending.json",
+        "escalations/silence.json",
     ] {
         let _ = std::fs::remove_file(save::save_file(name));
     }

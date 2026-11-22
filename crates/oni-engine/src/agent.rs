@@ -216,6 +216,8 @@ pub struct Agent {
     /// 又保证每个周期都有一个"世界冻结"的快照供主 agent 判断。
     danger_cycle: bool,
     pub cycles: u64,
+    /// 上一轮的周期号（回滚检测：周期回退 = 读档/重开同一局 → 清局内状态）
+    last_cycle: i64,
 }
 
 /// B: 从目标锁表里剔除最容易卡死的两类（surface / open_chamber）。
@@ -258,6 +260,7 @@ impl Agent {
             no_progress: 0,
             action_failures: 0,
             cycles: 0,
+            last_cycle: 0,
         }
     }
 
@@ -540,7 +543,17 @@ impl Agent {
             if observed_running {
                 self.pause("hold：主 agent 正在处理，冻结世界");
             }
-            self.window_until = None;
+
+        // ---- 回滚检测：周期回退 = 读档/重开同一局 → 清局内决策上下文 ----
+        //   不清的话：上一轮（往往以全灭告终）的 decisions/goal_outcomes/ai_goals/
+        //   circuit_breaks 全部残留 → LLM 决策窗口被污染、产氧目标开局即熔断
+        //   （实测缺口：回滚后 oxygen fail=4 的熔断记录直接封锁新局的产氧目标）。
+        //   阈值 2：读档通常回退多个周期；正常跨周期是 +1，不会误触。
+        if self.last_cycle > 0 && (snap.cycle as i64) + 2 <= self.last_cycle {
+            crate::saveswitch::clear_save_state();
+            report.notes.push(format!("🔁 检测到回滚（周期 {} → {}）→ 已清局内决策上下文（LLM 从零重排）", self.last_cycle, snap.cycle));
+        }
+        self.last_cycle = snap.cycle as i64;            self.window_until = None;
             self.window_owned_by_us = false;
             report.notes.push(
                 "⏸ hold 模式：主 agent 正在处理 → 代理只观察，不自动恢复（等 oni release）".into(),
