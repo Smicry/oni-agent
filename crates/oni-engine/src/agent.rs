@@ -1005,6 +1005,31 @@ impl Agent {
                 ));
             }
         }
+
+        // ★ **开局规划素材**（快慢契约 §4：快系统采事实，慢系统做战略）：
+        //   计划不是 AI 生的（模板/机械兜底）→ 采集本局世界事实
+        //   （侦察 + 结构化 facts）写盘，供慢系统 LLM 生成开局战略。
+        //   旧实现：每局计划来自 plan.template.json（硬编码 playbook）
+        //   → 换一张地图（水世界/金属星）节点图就不适用（用户指出的设计缺陷）。
+        //   只采**事实**，节点结构由慢系统决定 —— 分工不变。
+        if plan.author.as_deref() != Some("ai") {
+            let brief_path = oni_mcp::save::save_file("opening_brief.json");
+            if !std::path::Path::new(&brief_path).exists() {
+                let facts = crate::planner::collect_facts(&self.session, &snap);
+                let scout_report = crate::autoact::scout_resources(&self.session, Some(&self.catalog));
+                let rec = serde_json::json!({
+                    "facts": serde_json::to_value(&facts).unwrap_or_default(),
+                    "scout": scout_report,
+                    "cycle": snap.cycle,
+                    "population": snap.dupes.len(),
+                });
+                match std::fs::write(&brief_path, serde_json::to_string_pretty(&rec).unwrap_or_default()) {
+                    Ok(_) => report.notes.push(
+                        "📋 开局规划素材已采集（opening_brief.json）→ 慢系统将依据本局事实生成开局战略".into()),
+                    Err(e) => report.notes.push(format!("⚠ 开局规划素材采集失败: {e}")),
+                }
+            }
+        }
         let d: Decision = decide(&plan);
         // 死锁解锁：所有节点被熔断、图停摆时，decide() 复活了一个 blocked 节点。
         //   立刻把它写回 todo 并重新载入 plan，避免"依赖图里没有可执行目标"刷屏。

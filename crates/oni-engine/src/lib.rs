@@ -26,6 +26,7 @@ pub mod bus;
 pub mod commands;
 pub mod escalate;
 pub mod judge;
+pub mod opening;
 pub mod planner;
 pub mod saveswitch;
 pub mod ledger;

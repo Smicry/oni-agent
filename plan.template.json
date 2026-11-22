@@ -353,6 +353,6 @@
       "note": "本局最终目标。"
     }
   ],
-  "author": "ai",
-  "locked": true
+  "author": "template",
+  "locked": false
 }

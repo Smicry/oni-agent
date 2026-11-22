@@ -13,6 +13,7 @@
 //!   。
 
 use oni_mcp::McpSession;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::decide::{Node, Plan};
@@ -55,7 +56,7 @@ impl Strategy {
 }
 
 /// 开局世界事实（由 CLI 从游戏采集后传入）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct WorldFacts {
     pub dupes: usize,
     /// 官方可达集大小（很小 = 复制人被封住）。

@@ -176,7 +176,7 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str) -> Result<String, String> {
+pub(crate) fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str) -> Result<String, String> {
     let endpoint = cfg.endpoint.as_ref().ok_or("no endpoint")?;
     let key = cfg.api_key.as_ref().ok_or("no api key")?;
 
@@ -507,8 +507,13 @@ fn next_actionable_names(nodes: &[Value], done_ids: &std::collections::HashSet<S
 /// 慢系统以前完全不读 plan.json，只看当前快照 → 纯应激式决策，没有全局推进感。
 /// 现在每轮 prompt 开头注入战略进度，让 LLM 知道已完成里程碑与下一个可推进节点。
 fn strategy_progress() -> String {
-    let sd = save_dir();
-    let Ok(text) = std::fs::read_to_string(sd.join("plan.json")) else {
+    // ★ 修路径：快系统运行时用的是**仓库根目录**的 plan.json（cfg.plan_path，CWD 相对），
+    //   旧代码读 save_dir()/plan.json（每存档目录）——那里根本没有这个文件
+    //   → 慢系统每轮的"战略进度"是**空的**，LLM 从来没看到过计划状态
+    //   → 只能发 material/surface 这类应激目标（实测：material 32 次，power 0 次规划成功）。
+    //   两者必须读**同一个文件**，慢系统才能"看见"计划。
+    let plan_path = std::path::Path::new("plan.json");
+    let Ok(text) = std::fs::read_to_string(plan_path) else {
         return String::new();
     };
     let Ok(plan) = serde_json::from_str::<Value>(&text) else { return String::new(); };
@@ -1074,6 +1079,70 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         let summary = format!("[meta][P0] ☠️ 终局判定：{}", reason);
         if let Ok(mut v) = view.lock() { v.last_decision = summary.clone(); }
         return summary;
+    }
+
+    // ★ **开局规划**（慢系统契约 §4：战略层负责"往哪走"）：
+    //   计划不是 AI 生的（模板/机械兜底）且快系统已采好世界事实（opening_brief.json）
+    //   → 用 LLM 依据**本局事实**重新规划（author=ai，名副其实）→ 强校验 → 落盘。
+    //   旧实现：每局计划来自 plan.template.json（硬编码 playbook，自带 author=ai 假身份
+    //   把机械 planner 永久锁死）→ 换一张地图（水世界/金属星）节点图就不适用。
+    //   兜底链：LLM 失败/校验不过 → 保持模板基线继续跑 +
+    //   快系统的机械重规划建议继续走 suggestions 通道；失败冷却 30 分钟不刷屏。
+    {
+        let sd = save_dir();
+        let plan_text = std::fs::read_to_string("plan.json").unwrap_or_default();
+        let need = !crate::opening::plan_author_is_ai(&plan_text);
+        let brief = std::fs::read_to_string(sd.join("opening_brief.json")).ok();
+        let cooling = std::fs::read_to_string(sd.join("opening_state.json")).ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("last_fail_ts").and_then(|x| x.as_i64()))
+            .map(|t| now() - t < 1800)
+            .unwrap_or(false);
+        if need && !cooling {
+            if let Some(brief_text) = brief {
+                let principles = crate::opening::collect_principles("plan.template.json");
+                let fp = oni_mcp::save::last_seen().map(|s| s.fingerprint);
+                let outcome = crate::opening::author_opening_plan(
+                    cfg, &brief_text, "plan.json", fp.as_deref(), &principles);
+                match outcome {
+                    Ok(summary) => {
+                        let rec = serde_json::json!({
+                            "id": now(), "ts": now(),
+                            "cycle": snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
+                            "source": "slow_service", "choice": "opening_plan",
+                            "action": "author_plan", "priority": "P1",
+                            "reason": "开局战略由 LLM 依据本局世界事实生成（替代硬编码模板）",
+                            "goal": "", "commands": [],
+                        });
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                            .open(sd.join("decisions.jsonl")) { let _ = writeln!(f, "{}", rec); }
+                        let _ = std::fs::rename(sd.join("opening_brief.json"), sd.join("opening_brief.done"));
+                        let out = format!("[opening] 📝 {}", summary);
+                        if let Ok(mut v) = view.lock() { v.last_decision = out.clone(); }
+                        eprintln!("[slow] {}", out);
+                        return out;
+                    }
+                    Err(reason) => {
+                        let rec = serde_json::json!({
+                            "id": now(), "ts": now(),
+                            "cycle": snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
+                            "source": "slow_service", "choice": "opening_plan",
+                            "action": "fallback_template", "priority": "P1",
+                            "reason": format!("LLM 开局规划失败：{reason}；保持模板基线（机械重规划建议继续走 suggestions 通道）"),
+                            "goal": "", "commands": [],
+                        });
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                            .open(sd.join("decisions.jsonl")) { let _ = writeln!(f, "{}", rec); }
+                        let _ = std::fs::write(sd.join("opening_state.json"),
+                            serde_json::to_string(&serde_json::json!({"last_fail_ts": now()})).unwrap_or_default());
+                        let out = format!("[opening] ⚠ LLM 开局规划失败，保持模板基线：{reason}");
+                        if let Ok(mut v) = view.lock() { v.last_decision = out.clone(); }
+                        eprintln!("[slow] {}", out);
+                        // 不 return：模板基线照常执行，本轮继续正常决策
+                    }
+                }
+            }
+        }
     }
 
     // ★ 主动规划心跳：无事件时周期性唤起 LLM 推进战略，而非干等卡点。
