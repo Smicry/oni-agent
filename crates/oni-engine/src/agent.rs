@@ -690,7 +690,8 @@ impl Agent {
             // 工作节律自持：代理自己冻回后，按「冻20s → 跑120s」自动续窗。
             //   边界（必须严守）：
             //   - 只有"代理自己冻的"(frozen) 才自持；用户手动暂停时 frozen=false → 不自持
-            //   - "真没活干"（idle_stopped / 动作失败无待办）→ 不自持
+            //   - "真没活干"（idle_stopped / 动作失败且慢系统无待办目标）→ 不自持
+            //     （动作失败但 ai_goals_pending 非空 = 有活 → 走自持续窗重试）
             //   - 有 hold 标记（主 agent 改代码中）→ 上面已早退，不会走到这里
             //   - 连续自持上限 RHYTHM_MAX：即使误判也不会长期越权暂停用户的游戏
             const RHYTHM_MAX: usize = 4;
@@ -725,6 +726,24 @@ impl Agent {
                     self.rhythm_streak,
                     RHYTHM_MAX
                 ));
+            } else if (self.frozen || self.idle_stopped) && work_pending {
+                // ★ 冻结中慢系统送来了新目标（ai_goal / 升级请求 / 在建工单）→ 有活就该干，
+                //   立即续窗（契约 §7：有活续窗 / 空闲冻回）。否则慢系统在冻结期间入队的
+                //   目标会因「冻结只观察」永远不被消费 → 快慢互等死锁（2026-11-24 实测：
+                //   目标消费完才冻结，LLM 80s 后入队新目标，冻结态无人开窗，第二层死锁）。
+                self.rhythm_streak = 0;
+                self.window_until =
+                    Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
+                self.window_owned_by_us = true;
+                self.frozen = false;
+                self.idle_stopped = false;
+                self.auto_rhythm = false;
+                self.resume_at = None;
+                self.resume("慢系统有待办目标 → 冻结中续窗执行");
+                can_execute = true;
+                report.notes.push(
+                    "▶ 冻结中慢系统入队新目标 → 续开施工窗口（有活续窗）".into(),
+                );
             } else if self.frozen || self.idle_stopped {
                 report.notes.push("🔒 已冻回暂停（等新窗口请求）".into());
             } else if self.paused_by_us {
@@ -1505,18 +1524,39 @@ impl Agent {
             !r.ok && r.detail.contains("被研究锁")
         });
         if !work_now && !out.ok && !research_locked && self.window_owned_by_us {
-            // 动作失败且没有待办 → 冻回（等主 agent 介入，不空烧周期）
-            self.pause("动作失败且无待办 → 冻回暂停，等待人工/主 agent 介入");
+            // ★ 慢系统还有待办语义目标吗（ai_goal / 升级请求）？
+            //   有 → 这不是"真没活干"，是"本轮方案失败但战略还有别的路"：
+            //     走自持节律（冻 20s → 续窗重试），失败记 goal_outcomes +
+            //     熔断计数驱动慢系统换目标。绝不能进"等人工介入"死锁——
+            //     否则慢系统入队的 ai_goal 永远等不到窗口：快系统暂停只观察、
+            //     慢系统空转入队，两边互等（2026-11-24 实测死锁，世界冻死）。
+            //   无 → 真没活干 → 冻回等介入（不空烧周期）。
+            let slow_pending = !crate::commands::ai_goals_pending().is_empty()
+                || crate::escalate::has_pending();
+            let freeze_reason = if slow_pending {
+                "动作失败但慢系统有待办目标 → 冻回（20s 后自持重试）"
+            } else {
+                "动作失败且无待办 → 冻回暂停，等待人工/主 agent 介入"
+            };
+            self.pause(freeze_reason);
             self.paused_by_us = false;
             self.frozen = true;
             self.window_until = None;
             self.window_owned_by_us = false;
-            // 真没活干 → **不自持**
-            self.auto_rhythm = false;
-            self.resume_at = None;
-            report.notes.push(
-                "🔒 动作失败且没有待办工单 → 冻回暂停（等主 agent 修代码/决策，不空烧周期）".into(),
-            );
+            if slow_pending {
+                self.auto_rhythm = true;
+                self.resume_at = Some(Instant::now() + Duration::from_secs(20));
+                report.notes.push(
+                    "🔒 动作失败但慢系统有待办目标 → 冻 20s 后自持重试（熔断驱动换目标，不进互等死锁）".into(),
+                );
+            } else {
+                // 真没活干 → **不自持**
+                self.auto_rhythm = false;
+                self.resume_at = None;
+                report.notes.push(
+                    "🔒 动作失败且没有待办工单 → 冻回暂停（等主 agent 修代码/决策，不空烧周期）".into(),
+                );
+            }
         }
 
         for r in &out.results {
