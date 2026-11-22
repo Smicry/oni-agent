@@ -1,22 +1,25 @@
 <!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>ONI 慢系统控制台</title>
 <style>
-body{font-family:-apple-system,sans-serif;background:#1a1d24;color:#d8dee9;margin:0;padding:16px;font-size:13px;max-width:1100px}
-h1{font-size:18px;color:#88c0d0;margin:0 0 4px}h2{font-size:14px;color:#81a1c1;border-bottom:1px solid #3b4252;padding-bottom:4px;margin-top:16px}
+body{font-family:-apple-system,sans-serif;background:#1a1d24;color:#d8dee9;margin:0;padding:16px;font-size:13px}
+h1{font-size:18px;color:#88c0d0;margin:0 0 12px}
+h2{font-size:14px;color:#81a1c1;border-bottom:1px solid #3b4252;padding-bottom:4px;margin:0 0 8px}
 .card{background:#2e3440;border-radius:6px;padding:10px;margin:8px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px}
 .kv{background:#3b4252;padding:8px;border-radius:4px}.kv b{color:#88c0d0}
 .dupe{padding:4px 0;border-bottom:1px solid #3b4252}
-.esc{background:#3b4252;padding:8px;margin:6px 0;border-radius:4px;border-left:3px solid #ebcb8b}
-.cand{background:#4c566a;padding:4px 8px;margin:4px 0;border-radius:3px;cursor:pointer;display:inline-block;margin-right:6px}
-.cand:hover{background:#5e81ac}
 input,button{font-size:13px;padding:6px 10px;border-radius:4px;border:1px solid #4c566a;background:#3b4252;color:#d8dee9}
 button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
-#cmd{flex:1}.small{color:#a3be8c;font-size:11px}
+#cmd{flex:1;min-width:0}.small{color:#a3be8c;font-size:11px}
 .ctrl{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .inputrow{display:flex;gap:6px;align-items:center}
+/* 两栏：左主对话，右操作+态势 */
+.layout{display:flex;gap:14px;align-items:stretch}
+.main{flex:1;min-width:0;display:flex;flex-direction:column;height:calc(100vh - 72px)}
+.side{width:320px;flex-shrink:0;overflow-y:auto}
+@media(max-width:900px){.layout{flex-direction:column}.main{height:auto}.side{width:100%;overflow:visible}}
 /* 对话流 */
-#conv{max-height:420px;overflow-y:auto;background:#2e3440;border-radius:6px;padding:10px;margin:8px 0}
+#conv{flex:1;min-height:300px;overflow-y:auto;background:#2e3440;border-radius:6px;padding:10px;margin-bottom:8px}
 .msg{margin:8px 0;padding:8px 10px;border-radius:6px;line-height:1.5}
 .msg-user{background:#3b4252;border-left:3px solid #88c0d0}
 .msg-ai{background:#434c5e;border-left:3px solid #a3be8c}
@@ -32,25 +35,34 @@ button{background:#5e81ac;cursor:pointer}button:hover{background:#81a1c1}
 .badge.success{background:#a3be8c;color:#2e3440}
 .badge.fail{background:#bf616a;color:#fff}
 .badge.pending{background:#ebcb8b;color:#2e3440}
+.panel-title{color:#81a1c1;font-weight:bold;margin-bottom:8px}
 </style></head><body>
 <h1>ONI 慢系统控制台 <span id="mode" class="small"></span></h1>
-<div class="card ctrl" id="controls">
-  <button onclick="ctl('pause')">暂停</button>
-  <button onclick="ctl('resume')">继续</button>
-  <button onclick="ctl('speed',1)">1x</button>
-  <button onclick="ctl('speed',2)">2x</button>
-  <button onclick="ctl('speed',3)">3x</button>
-  <button onclick="ctl('window')">开120s窗口</button>
-  <span id="worldState" class="small"></span>
-</div>
-<div class="card"><div class="grid" id="stats"></div></div>
-<h2>复制人</h2><div class="card" id="dupes"></div>
-<h2>待决策卡点 <span class="small" id="esccount"></span></h2><div id="escs"></div>
-<h2>对话（快系统卡点 ↔ 慢系统决策 ↔ 执行反馈 ↔ 用户指令）</h2>
-<div id="conv"></div>
-<div class="card inputrow">
-  <input id="cmd" placeholder="输入指令后回车发送（世界暂停→慢系统处理→恢复自主）" onkeydown="if(event.key==='Enter')sendCmd()">
-  <button onclick="sendCmd()">下发</button>
+<div class="layout">
+  <div class="main">
+    <h2>对话（快系统卡点 ↔ 慢系统决策 ↔ 执行反馈 ↔ 用户指令）</h2>
+    <div id="conv"></div>
+    <div class="card inputrow">
+      <input id="cmd" placeholder="输入指令后回车发送（世界暂停→慢系统处理→恢复自主）" onkeydown="if(event.key==='Enter')sendCmd()">
+      <button onclick="sendCmd()">下发</button>
+    </div>
+  </div>
+  <div class="side">
+    <div class="card">
+      <div class="panel-title">操作</div>
+      <div class="ctrl" id="controls">
+        <button onclick="ctl('pause')">暂停</button>
+        <button onclick="ctl('resume')">继续</button>
+        <button onclick="ctl('speed',1)">1x</button>
+        <button onclick="ctl('speed',2)">2x</button>
+        <button onclick="ctl('speed',3)">3x</button>
+        <button onclick="ctl('window')">开120s窗口</button>
+      </div>
+      <div class="small" id="worldState" style="margin-top:8px"></div>
+    </div>
+    <div class="card"><div class="grid" id="stats"></div></div>
+    <h2>复制人</h2><div class="card" id="dupes" style="margin-top:0"></div>
+  </div>
 </div>
 <script>
 function esc(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -67,12 +79,6 @@ async function refresh(){
     '<div class="kv"><b>可呼吸格</b><br>'+s.breathable_cells+'</div>';
   document.getElementById('dupes').innerHTML=(s.dupes||[]).map(function(d){
     return '<div class="dupe">'+esc(d.name)+' @('+d.x+','+d.y+') '+esc(d.chore)+' 膀胱'+Math.round(d.bladder)+' 呼吸'+Math.round(d.breath)+'</div>';}).join('')||'<div class="small">无数据</div>';
-  document.getElementById('esccount').textContent=(s.escalations||[]).length+' 条';
-  document.getElementById('escs').innerHTML=(s.escalations||[]).map(function(e){
-    var c=e.context||{}; var cands=(c.candidates||[]).map(function(x){
-      return '<span class="cand" onclick="decide('+e.id+','+JSON.stringify(x.id)+')">'+esc(x.id)+': '+esc(x.action)+'</span>';}).join('');
-    return '<div class="esc">#'+e.id+' '+esc(e.detail)+'<div class="small">卡点='+esc(c.obstacle||'-')+'</div>'+cands+'</div>';}).join('')||'<div class="small">无待决策卡点</div>';
-  // 对话流
   var conv=document.getElementById('conv');
   var roleUi={'user':['你','msg-user'],'assistant':['慢系统','msg-ai'],'fast':['快系统·卡点','msg-fast'],'result':['快系统·反馈','msg-result']};
   conv.innerHTML=(s.conversation||[]).map(function(m){
@@ -92,6 +98,5 @@ async function ctl(op,val){
 }
 async function sendCmd(){var el=document.getElementById('cmd');var t=el.value.trim();if(!t)return;
   await fetch('/api/command',{method:'POST',body:t});el.value='';refresh();}
-async function decide(id,choice){await fetch('/api/decide',{method:'POST',body:JSON.stringify({id:id,choice:choice})});refresh();}
 refresh();setInterval(refresh,2000);
 </script></body></html>
