@@ -158,6 +158,10 @@ pub struct SlowView {
     pub last_decision: String,
     /// AI 助手是否启用（false = hold 停止状态）
     pub ai_enabled: bool,
+    /// 当前存档指纹 + 局内会话纪元：前端据此判断"换局/读档"→ 清空对话流。
+    ///   没有它，前端会把上一周期的对话一直挂着（实测用户看到 Cycle 4 的指令而这局才 Cycle 1）。
+    pub save_fingerprint: String,
+    pub session_epoch: i64,
     pub updated_at: i64,
 }
 impl Default for SlowView {
@@ -167,7 +171,8 @@ impl Default for SlowView {
             food_kcal: 0.0, oxygen_kg: 0.0, breathable_cells: 0,
             dupes: vec![], escalations: vec![], commands: vec![],
             recent_decisions: vec![], conversation: vec![], last_decision: String::new(),
-            ai_enabled: true, updated_at: 0,
+            ai_enabled: true,
+            save_fingerprint: String::new(), session_epoch: 0, updated_at: 0,
         }
     }
 }
@@ -958,6 +963,11 @@ fn collect_state(cfg: &SlowConfig) -> SlowView {
     let snap = load_json(sd.join("live_snapshot.json"), Value::Null);
     view.cycle = snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0);
     view.paused = snap.get("paused").and_then(|v| v.as_bool()).unwrap_or(true);
+    // 局内会话纪元：指纹 + 局内状态目录的创建时刻（clear_save_state 重建目录 → 纪元变化）。
+    //   前端看到纪元变了就清空对话流（换局/读档重开）。
+    view.save_fingerprint = oni_mcp::save::last_seen().map(|s| s.fingerprint).unwrap_or_default();
+    view.session_epoch = std::fs::metadata(&sd).and_then(|m| m.created()).ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
     let diag = snap.get("diagnostics").unwrap_or(&Value::Null);
     view.food_kcal = diag.get("foodKcal").and_then(|v| v.as_f64()).unwrap_or(0.0);
     view.oxygen_kg = diag.get("oxygenKgVisible").and_then(|v| v.as_f64()).unwrap_or(0.0);

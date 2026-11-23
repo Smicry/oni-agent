@@ -84,6 +84,13 @@ async function refresh(){
   document.getElementById('dupes').innerHTML=(s.dupes||[]).map(function(d){
     return '<div class="dupe">'+esc(d.name)+' @('+d.x+','+d.y+') '+esc(d.chore)+' 膀胱'+Math.round(d.bladder)+' 呼吸'+Math.round(d.breath)+'</div>';}).join('')||'<div class="small">无数据</div>';
   var conv=document.getElementById('conv');
+  // ★ 换局/读档检测：指纹或局内纪元变了 → 对话流从零开始，不把上一周期的对话挂着。
+  //   后端在 clear_save_state 时归档旧指令；这里负责前端那一半。
+  var ep=(s.save_fingerprint||'?')+'#'+(s.session_epoch||0);
+  if(window.__oniEpoch && window.__oniEpoch!==ep){
+    conv.innerHTML='<div class="small">🔁 换局/读档（'+esc(s.save_fingerprint||'')+'）→ 对话已重置</div>';
+  }
+  window.__oniEpoch=ep;
   var roleUi={'user':['你','msg-user'],'assistant':['慢系统','msg-ai'],'fast':['快系统·卡点','msg-fast'],'result':['快系统·反馈','msg-result'],'circuit':['熔断闸门','msg-circuit']};
   conv.innerHTML=(s.conversation||[]).map(function(m){
     var ui=roleUi[m.role]||roleUi['assistant'];

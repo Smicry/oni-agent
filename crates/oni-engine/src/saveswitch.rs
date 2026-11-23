@@ -101,6 +101,22 @@ pub fn clear_save_state() {
     //   不清的话：回滚存档重开同一局时，上一轮的"全灭/倒地/熔断"记录
     //   会进入 LLM 的决策窗口 → 污染新运行的决策走向
     //   （实测缺口：上一局 oxygen fail=4 的熔断会把新局的产氧目标开局就冷却封锁）。
+    // ★ 用户指令**归档**而不是删除：读档重开后旧周期的指令已不适用
+    //   （"彻底处理二氧化碳"是 Cycle 4 的事，这局才 Cycle 1），继续展示会误导人。
+    //   但指令是用户说的，不能丢——移到 commands.archive.jsonl 保留追溯，不再进对话流。
+    {
+        let src_p = save::save_file("commands.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&src_p) {
+            if !text.trim().is_empty() {
+                let dst = save::save_file("commands.archive.jsonl");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&dst) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", text.trim_end());
+                }
+                let _ = std::fs::remove_file(&src_p);
+            }
+        }
+    }
     for name in [
         "goal_lock.json",
         "scout.json",
