@@ -1210,10 +1210,10 @@ pub fn cycle(&mut self) -> CycleReport {
         //   两种情况都改为：直接执行**内置保命反射弧**（不依赖 plan 的语义动作）。
         //   命中了可执行的 plan 节点时仍走 plan（它可能有更完整的施工流程）。
         // ★ v3 协调：窗口已覆盖该红线 → 让规划器走（它有完整流程），反射弧只兜底。
-        let covered = window_covers_urgent(&plan.nodes, directive.action);
+        let covered = planner_takes_urgent(&plan.nodes, directive.level);
         if covered {
             report.notes.push(
-                format!("🪟 调度[{:?}] 已被滚动窗口覆盖 → 交给规划器执行（反射弧不抢占）", directive.action.label()),
+                format!("🪟 规划器可推进 → 交给规划器；反射弧不抢占（调度 {:?} 由规划器承接）", directive.action.label()),
             );
         }
         if directive.level >= crate::priority::Level::Urgent
@@ -2242,29 +2242,31 @@ pub fn has_unexecutable_predecessor(node: &crate::decide::Node, plan: &[crate::d
     })
 }
 
-/// v3：**安全壳与规划器的协调**——窗口是否已覆盖当前 Urgent 红线？
+/// v3：**安全壳与规划器的协调**——按红线等级判，不猜意图。
 ///
-/// 问题（实测）：膀胱 100% 触发 Urgent → 安全壳反射弧每轮抢占并 return →
-///   滚动窗口的 W1「建造厕所」**永远没机会执行**（日志里一直 `节点=-`）。
-///   反射弧只有"挖一格"的简版流程，而 W1 有完整的"挖空间 → 建"流程——
-///   两者目标一致时，**让规划器走**，它做得更好；反射弧只负责窗口没覆盖的红线。
+/// 为什么不用"窗口节点是否在建厕所"这种判据：
+///   那是拿 goal 字符串去猜 LLM 的意图——LLM 把厕所写成 expand（要先腾空间）就匹配不上，
+///   又是一条手写规则。自动驾驶从来不让 AEB 去"理解"导航在去哪，只问"导航还有效吗"。
 ///
-/// 判据（结构化，不做字符串匹配）：
-///   窗口里有节点满足 ① 现在可执行（requires 全 done、自身非 done/blocked/deferred）
-///   ② 其某个动作的语义身份与 Urgent 反射弧的语义目标一致（用 action_identity 比较）。
-pub fn window_covers_urgent(plan: &[crate::decide::Node], urgent: crate::priority::Action) -> bool {
-    let reflex = vital_reflex_actions(urgent);
-    if reflex.is_empty() {
+/// 判据（用调度器已算好的 `Level`，结构化，零关键词）：
+///   - `Rescue`（秒级致命：倒地/窒息）→ **安全壳立即接管**，规划器再好也不等。
+///   - `Urgent`（分钟级：膀胱/食物）且规划器有现在可执行的节点 → **让规划器走**。
+///     LLM 把红线排进 W1 是它的事；排得对，规划器自然处理；排得不对，滚动窗口下一轮按事实修正。
+///   - `Urgent` 且规划器卡死 → 安全壳兜底。
+pub fn planner_takes_urgent(plan: &[crate::decide::Node], level: crate::priority::Level) -> bool {
+    // 秒级致命永远不等规划器
+    if level >= crate::priority::Level::Rescue {
         return false;
     }
-    let reflex_ids: std::collections::HashSet<String> = reflex.iter().map(action_identity).collect();
+    planner_can_advance(plan)
+}
+
+/// 规划器是否有**现在可执行**的节点（requires 全 done、自身非 done/blocked/deferred）。
+pub fn planner_can_advance(plan: &[crate::decide::Node]) -> bool {
     let done: std::collections::HashSet<&str> = plan.iter().filter(|n| n.is_done()).map(|n| n.id.as_str()).collect();
     plan.iter().any(|n| {
-        if n.is_done() || n.is_blocked() || n.is_deferred() {
-            return false;
-        }
-        let ready = n.requires.iter().all(|r| done.contains(r.as_str()));
-        ready && n.actions.iter().any(|a| reflex_ids.contains(&action_identity(a)))
+        !n.is_done() && !n.is_blocked() && !n.is_deferred()
+            && n.requires.iter().all(|r| done.contains(r.as_str()))
     })
 }
 
@@ -2659,35 +2661,40 @@ mod tests {
     }
 
 
-    /// v3 协调：窗口已覆盖红线时，反射弧不得抢占规划器。
-    ///   实测事故：膀胱 100% → 反射弧每轮抢占 → W1「建造厕所」永远执行不到。
+    /// v3 协调：按红线等级判，不猜意图。
+    ///   Rescue（秒级致命）→ 安全壳永远优先；Urgent（分钟级）→ 规划器能推进就让规划器走。
     #[test]
-    fn window_covering_urgent_yields_to_planner() {
+    fn planner_takes_minute_level_urgent_only_when_it_can_advance() {
         use crate::decide::Node;
         use crate::exec::Action;
-        use crate::priority::Action as PAction;
-        let w1 = Node {
-            id: "W1".into(), name: "建造厕所".into(), status: "todo".into(),
-            requires: vec![], unlocks: vec![],
-            actions: vec![Action::Auto { goal: "toilet".into(), why: String::new() }],
-            success_check: None, success: String::new(), rescue: false, note: String::new(),
-            priority: None, deferred: None, deferred_at: None, stall: None,
+        use crate::priority::Level;
+        let mk = |id: &str, status: &str, req: Vec<&str>, goal: &str| Node {
+            id: id.into(), name: id.into(), status: status.into(),
+                requires: req.into_iter().map(|s| s.to_string()).collect(),
+                unlocks: vec![],
+                actions: vec![Action::Auto { goal: goal.into(), why: String::new() }],
+                success_check: None, success: String::new(), rescue: false, note: String::new(),
+                priority: None, deferred: None, deferred_at: None, stall: None,
         };
-        // W1 无前置、目标一致 → 窗口覆盖了「建厕所」红线 → 反射弧让位
-        assert!(super::window_covers_urgent(&[w1.clone()], PAction::BuildToilet));
-        // 但不覆盖「产氧」红线（目标不一致）→ 反射弧该上
-        assert!(!super::window_covers_urgent(&[w1.clone()], PAction::ProduceOxygen));
-        // W1 已 done → 不覆盖
-        let mut done = w1.clone(); done.status = "done".into();
-        assert!(!super::window_covers_urgent(&[done], PAction::BuildToilet));
-        // W1 被暂缓 → 不覆盖（否则规划器选不出它，反射弧又被挡 → 双重死锁）
-        let mut deferred = w1.clone(); deferred.deferred = Some("x".into());
-        assert!(!super::window_covers_urgent(&[deferred], PAction::BuildToilet));
-        // W1 有未完成前置 → 不覆盖（它现在不可执行）
-        let mut blocked_w1 = w1.clone(); blocked_w1.requires = vec!["W0".into()];
-        assert!(!super::window_covers_urgent(&[blocked_w1], PAction::BuildToilet));
-        // 空窗口 → 不覆盖
-        assert!(!super::window_covers_urgent(&[], PAction::BuildToilet));
+        // ★ 关键：W1 的 goal 是 expand（LLM 把厕所写成"腾空间"），旧的字符串匹配会漏判；
+        //   新判据只看"能推进"——照样让规划器走。
+        let w1_expand = mk("W1", "todo", vec![], "expand");
+        assert!(super::planner_takes_urgent(&[w1_expand.clone()], Level::Urgent),
+            "Urgent（分钟级）且规划器可推进 → 让规划器走，不管它 goal 写的是什么");
+        // Rescue（秒级致命）→ 安全壳永远优先，哪怕规划器能推进
+        assert!(!super::planner_takes_urgent(&[w1_expand.clone()], Level::Rescue),
+            "倒地/窒息不能等规划器");
+        // 规划器卡死：W1 被暂缓 → 反射弧兜底
+        let mut deferred = w1_expand.clone(); deferred.deferred = Some("x".into());
+        assert!(!super::planner_takes_urgent(&[deferred], Level::Urgent));
+        // 规划器卡死：W1 前置未完成 → 反射弧兜底
+        let blocked = mk("W1", "todo", vec!["W0"], "toilet");
+        assert!(!super::planner_takes_urgent(&[blocked], Level::Urgent));
+        // 空窗口 → 反射弧兜底
+        assert!(!super::planner_takes_urgent(&[], Level::Urgent));
+        // 全部 done → 反射弧兜底
+        let done = mk("W1", "done", vec![], "toilet");
+        assert!(!super::planner_takes_urgent(&[done], Level::Urgent));
     }
 
     #[test]
