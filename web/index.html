@@ -114,6 +114,7 @@ async function toggleAI(){
   refresh();
 }
 async function sendCmd(){var el=document.getElementById('cmd');var t=el.value.trim();if(!t)return;
-  await fetch('/api/command',{method:'POST',body:t});el.value='';refresh();}
+  // 发 JSON 而不是裸文本：裸 body 在后端被当 \u 转义解码会产生乱码（ä¸ºä»€ä¹ˆ…）
+  await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});el.value='';refresh();}
 refresh();setInterval(refresh,2000);
 </script></body></html>

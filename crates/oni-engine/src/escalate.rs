@@ -177,7 +177,16 @@ fn deteriorated(e: &SilenceEntry, ctx: &Ctx) -> bool {
 fn should_silence(silence: &HashMap<String, SilenceEntry>, key: &str, now: i64, ctx: &Ctx) -> bool {
     match silence.get(key) {
         None => false,
-        Some(e) => now < e.until && !deteriorated(e, ctx),
+        Some(e) => {
+            if now >= e.until { return false; }
+            // ★ 死锁/无目标是**结构性**状态：氧气自然下降不会让依赖图自己解锁，
+            //   指标恶化判定对它没有意义，只会让同一死锁每 10s 重报一次（实测连报 7 次）。
+            //   这类卡点只在依赖图真的变化时才值得重报——由快系统复活节点时显式触发。
+            if key.starts_with("Deadlock|") || key.starts_with("NoFeasibleTarget|") {
+                return true;
+            }
+            !deteriorated(e, ctx)
+        }
     }
 }
 

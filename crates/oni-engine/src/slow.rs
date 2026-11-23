@@ -516,6 +516,76 @@ fn next_actionable_names(nodes: &[Value], done_ids: &std::collections::HashSet<S
     out
 }
 
+/// ★ 当前目标（滚动窗口 W1）—— prompt 的**第一段**。
+///
+/// 为什么放第一：LLM 每 5s 决策一次，如果第一眼看到的是卡点列表，它会去"解决卡点"
+/// 而不是"推进目标"——实测在 research/scout 之间来回跳，没有一个方向持续推进超过 3 轮。
+/// 自动驾驶的对照：导航先有目的地，再算怎么绕过障碍；不是每 100ms 重新选目的地。
+///
+/// 输出：目标是什么 + 已尝试几次 + 失败原因 + **本轮该做什么**（推进/绕过/标记失败让窗口重排）。
+fn current_objective() -> String {
+    let Some(plan) = load_window_plan() else { return String::new() };
+    let done: std::collections::HashSet<&str> = plan.nodes.iter().filter(|n| n.is_done()).map(|n| n.id.as_str()).collect();
+    // W1 = 第一个"现在可执行"的节点（requires 全 done、自身非 done/blocked/deferred）
+    let Some(w1) = plan.nodes.iter().find(|n| {
+        !n.is_done() && !n.is_blocked() && !n.is_deferred()
+            && n.requires.iter().all(|r| done.contains(r.as_str()))
+    }) else {
+        // 没有可执行节点 → 窗口需要重排（慢系统的 refresh_window 会处理）
+        let first_pending = plan.nodes.iter().find(|n| !n.is_done());
+        let why = match first_pending {
+            Some(n) if n.is_blocked() => format!("W1「{}」已被熔断", n.name),
+            Some(n) if n.is_deferred() => format!("W1「{}」已暂缓：{}", n.name, n.deferred.as_deref().unwrap_or("")),
+            Some(n) => format!("W1「{}」前置未满足（requires: {:?}）", n.name, n.requires),
+            None => "窗口全部完成".to_string(),
+        };
+        return format!("== 🎯 当前目标 ==\n⚠ 滚动窗口无可执行节点：{why}\n→ 本轮决策：帮助窗口重排——用 commands 下一条能解除该阻塞的精确工单（如挖通/铺梯子/采材料），或说明为什么该目标在本局不可达。**不要换成无关目标（如 scout）**。\n\n");
+    };
+    let goal = w1.actions.iter().find_map(|a| match a {
+        crate::exec::Action::Auto { goal, .. } => Some(goal.clone()),
+        crate::exec::Action::AutoBuild { prefab, .. } => Some(format!("build:{prefab}")),
+        _ => None,
+    }).unwrap_or_default();
+    // 该 goal 最近的执行结果（已尝试几次 / 为什么失败）
+    let (attempts, last_fail) = goal_recent_outcome(&goal);
+    let status = if attempts == 0 {
+        "尚未尝试".to_string()
+    } else if last_fail.is_empty() {
+        format!("已尝试 {attempts} 次，最近一次成功")
+    } else {
+        format!("已尝试 {attempts} 次，最近失败原因：{last_fail}")
+    };
+    format!(
+        "== 🎯 当前目标（滚动窗口 W1，本轮默认推进它）==\n  目标：{}（goal: {}）\n  判据：{}\n  状态：{}\n  → 本轮决策：**推进 W1**（选同一个 goal，或下精确工单绕过障碍）。只有当你能说明它在本局**确实不可达**时，才标记它失败并解释根因，让窗口下一轮重排。**不要因为卡点就换成无关目标**（那是上一轮在 research/scout 之间来回跳的原因）。\n\n",
+        w1.name, goal,
+        w1.success.lines().next().unwrap_or(""),
+        status
+    )
+}
+
+fn load_window_plan() -> Option<crate::decide::Plan> {
+    std::fs::read_to_string("plan.json").ok().and_then(|t| serde_json::from_str(&t).ok())
+}
+
+/// 某 goal 在 goal_outcomes 里的尝试次数与最近一次失败原因。
+fn goal_recent_outcome(goal: &str) -> (usize, String) {
+    let sd = save_dir();
+    let Ok(text) = std::fs::read_to_string(sd.join("goal_outcomes.jsonl")) else { return (0, String::new()) };
+    let mut n = 0usize;
+    let mut last_fail = String::new();
+    for line in text.lines().rev() {
+        let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
+        if o.get("goal").and_then(|v| v.as_str()) != Some(goal) { continue; }
+        n += 1;
+        let ok = o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok && last_fail.is_empty() {
+            last_fail = o.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(70).collect();
+        }
+        if n >= 8 { break; }
+    }
+    (n, last_fail)
+}
+
 /// ★ 战略状态机：读 plan.json（AI 拥有的 locked plan），生成"我在哪、该往哪走"摘要。
 /// 慢系统以前完全不读 plan.json，只看当前快照 → 纯应激式决策，没有全局推进感。
 /// 现在每轮 prompt 开头注入战略进度，让 LLM 知道已完成里程碑与下一个可推进节点。
@@ -583,6 +653,7 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
         p.push_str("没有紧急事件，这正是推进战略的最佳时机。请根据下面的战略进度，主动选择一个可推进的 goal（P2自给/P3扩张优先），让殖民地持续变好。\n");
         p.push_str("不要输出 wait，不要空等卡点——那等于失职。若战略进度显示所有节点完成，选一个合理的扩张/自给目标（expand/research/power/element:X）。\n\n");
     }
+    p.push_str(&current_objective());
     p.push_str(&strategy_progress());
     // ★ 当前选址策略（慢系统可调）：让慢系统知道有哪些判据能自己改。
     {
@@ -595,7 +666,10 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
     let (streak_summary, streak, cur_goal) = recent_goal_streak();
     if !streak_summary.is_empty() { p.push_str(&streak_summary); }
     if streak >= 3 {
-        p.push_str(&format!("🔁 幂等节流：goal={} 已连续决策 {} 次却无实质进展 → 本轮禁止再选它，必须换目标/下精确工单/升级诊断。\n\n",
+        // ★ 语义修正：连续不进展**不是"换目标"的理由**，是"升级诊断"的理由。
+        //   旧文案"禁止再选它"→ LLM 跳到 scout 等无关目标 → 没有方向被持续推进（实测）。
+        //   挖矿/建厕所/研究都要 3 轮以上，"禁止"只会打断所有需要多轮的目标。
+        p.push_str(&format!("🔁 幂等节流：goal={} 已连续 {} 次无实质进展 → **不要换目标，要升级手段**：① 用 commands 下一条精确工单绕过障碍（挖通/铺梯子/换落点）；② 若判断它在本局确实不可达，说明根因并标记失败，让窗口重排。原地重选同一个 goal 而不改变手段 = 失职。\n\n",
             cur_goal, streak));
     }
     // 🔴 失败熔断：最高优先级硬约束（见开头），逼迫换策略而非重复失败目标。
@@ -1057,15 +1131,27 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     // ★ 元决策（救不回来）：全员倒地/人口0 → 跳过 LLM，直接给出回滚建议。
     //   快系统已识别并暂停不白烧；慢系统这里必须给出明确的"这局救不回来"信号，
     //   而不是继续傻选 goal（实测全灭后还在决策"改用OxyRock供氧"）。
-    let alive = snap.get("dupes").and_then(|v| v.as_array()).map(|a| {
+    // ★ 全灭判定用**结构化信号**（breath），不靠 chore 文本：
+    //   实测三人呼吸 100 却被判"全员失去行动能力→建议回滚"——chore 为"空闲"/空时
+    //   旧逻辑仍能算对，但 dupes 数组在采集中间态可能为空 → alive=0 → 误判全灭。
+    //   规则（AGENTS.md §9：人口为 0 先确认数据源没失败）：
+    //     · dupes 数组缺失/为空 → **不判全灭**（数据源可疑，交给快系统的人口检测）
+    //     · 有人 breath > 0 且 chore 不含倒地 → 算活着
+    //     · 只有全员 breath==0 或 chore 明确倒地/死亡 → 才判全灭
+    let dupes_arr = snap.get("dupes").and_then(|v| v.as_array()).cloned();
+    let dupes_known = dupes_arr.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+    let alive = dupes_arr.as_ref().map(|a| {
         a.iter().filter(|d| {
             let chore = d.get("chore").and_then(|v| v.as_str()).unwrap_or("");
-            !(chore.contains("失去行动") || chore.contains("倒地")
-              || chore.contains("Downing") || chore.contains("Unconscious")
-              || chore.contains("死亡"))
+            let downed = chore.contains("失去行动") || chore.contains("倒地")
+                || chore.contains("Downing") || chore.contains("Unconscious")
+                || chore.contains("死亡");
+            let breath = d.get("breath").and_then(|v| v.as_f64()).unwrap_or(100.0);
+            !downed && breath > 0.0
         }).count()
     }).unwrap_or(0);
-    let no_pop = snap.get("dupes").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(false);
+    // dupes 数据缺失 ≠ 人口为 0：不判终局（避免采集中间态误判全灭而放弃一局活的殖民地）
+    let no_pop = dupes_known && dupes_arr.as_ref().map(|a| a.is_empty()).unwrap_or(false);
     if no_pop || alive == 0 {
         let reason = if no_pop {
             "☠️ 人口为0：殖民地已全员死亡，代理无法自救 → 停止决策，建议回滚存档或新开一局"
@@ -1323,7 +1409,12 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
                 json_response(&mut stream, "200 OK", &v, "application/json");
             }
             ("POST", "/api/command") => {
-                let text = decode_unicode_escapes(body.trim());
+                // ★ 前端发 JSON {"text": ...}；裸 body 只作兼容回退。
+                //   乱码根因：旧实现把中文 UTF-8 当 \u 转义解码（ä¸ºä»€ä¹ˆ…），
+                //   且裸 body 经过 from_utf8_lossy 后多字节字符可能被截断在 8192 缓冲边界。
+                let text = serde_json::from_str::<Value>(body).ok()
+                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| decode_unicode_escapes(body.trim()));
                 let out = run_oni(&["command", "add", &text]);
                 json_response(&mut stream, "200 OK", &serde_json::json!({"ok":true,"out":out}).to_string(), "application/json");
             }
