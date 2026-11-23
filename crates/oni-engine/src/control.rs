@@ -15,13 +15,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Owner {
-    /// 用户手动 / UserPromptSubmit hook（代理绝不越权恢复）
+    /// 用户手动 / UserPromptSubmit hook（AI 开启时**会被代理自主恢复**——
+    ///   只有 `Hold` 是不可越权的停止信号）
     User,
     /// 代理自己（施工窗口到期 / 空闲停机 / 卡住停工）
     Agent,
     /// 主 agent 改代码（oni hold；只有 release 能解）
     Hold,
-    /// 等慢系统（只有 ack / 看门狗能解）
+    /// 等慢系统（仅作审计留痕，**不构成冻结态**：代理同样会自主恢复）
     Escalation,
     /// 没人暂停（世界在跑）
     None,

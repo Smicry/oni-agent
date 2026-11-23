@@ -38,8 +38,6 @@ pub enum Kind {
     AuditFinding,
     /// 问题已解决（正反馈）
     Resolved,
-    /// 看门狗降级
-    Watchdog,
 }
 
 impl Kind {
@@ -51,7 +49,6 @@ impl Kind {
             Kind::PlanUpdated => "计划变更",
             Kind::AuditFinding => "巡检发现",
             Kind::Resolved => "已解决",
-            Kind::Watchdog => "看门狗",
         }
     }
 }

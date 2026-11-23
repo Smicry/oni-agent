@@ -105,7 +105,7 @@ impl Cell {
         }
         let el = self.element.as_str();
         // element 为空 = **读不到数据**（batch fetch 漏格），
-        //   不能当成"安全"—— AGENTS.md §13.6：读不到数据 ≠ 数据是极值。
+        //   不能当成"安全"—— AGENTS.md §9：读不到数据 ≠ 数据是极值。
         //   代理把床建在 (131,189)正是因为那格没读到元素，
         //   element 空 -> 判"安全" -> 严格筛选失效 -> 复制人睡在 CO2 里 -> 。
         if el.is_empty() {

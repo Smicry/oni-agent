@@ -128,6 +128,10 @@ pub fn classify_fail(detail: &str) -> String {
     else if d.contains("落地失败") || d.contains("dry-run 未通过") { "rejected".into() }
     else if d.contains("落点") || d.contains("建造区域") { "no_placement".into() }
     else if d.contains("无法解析") { "bad_goal".into() }
+    // ★ 零进展（挖不动/无可下单曲）——单独归类：它既不是"找不到目标"也不是预检失败，
+    //   而是"目标存在但当前物理条件推不动"（前沿全需梯子、已有标记等）。
+    //   旧版把它归进 unknown → 慢系统看不出"该换方向"，只会重试同一个目标。
+    else if d.contains("无可下单曲") || d.contains("零进展") || d.contains("推不动") { "no_progress".into() }
     else { "unknown".into() }
 }
 
@@ -283,11 +287,21 @@ impl Agent {
     ///   又暂缓…… 代理在同一节点上空转。
     const DEFER_COOLDOWN: u64 = 8;
 
+    /// 实时查游戏是否暂停（读 oni://colony/status，该 URI 走 1s TTL 的秒级新鲜度）。
+    ///
+    /// 用途：**兜底复核**快照的 paused 判定。
+    ///   快照是批量采集的，采集与判定之间有秒级间隔；本函数在判定点重新读一次
+    ///   （1s TTL → 判定时基本必读实时值），避免用陈旧状态决定"世界在不在跑"。
     fn game_paused(&self) -> bool {
         self.session
             .read_json("oni://colony/status")
             .ok()
-            .and_then(|v| v.get("isPaused").and_then(|b| b.as_bool()))
+            .and_then(|v| {
+                let paused = v.get("isPaused").and_then(|b| b.as_bool()).unwrap_or(false);
+                let speed = v.get("gameSpeed").and_then(|s| s.as_f64()).unwrap_or(-1.0);
+                // 任一信号说停 → 判停（保守：宁可不下工单，也不可在停着的世界里下单）
+                Some(paused || (speed >= 0.0 && speed <= 0.0))
+            })
             .unwrap_or(false)
     }
 
@@ -527,7 +541,29 @@ impl Agent {
         // 2) 运行状态机：这一轮世界在不在跑
         //    铁律：**世界不跑 ⇒ 不下工单、不累计进展、不熔断。**
         // =====================================================================
-        let observed_running = !snap.paused;
+        // ★ 世界在不在跑：**实时真值**，不是过期快照。
+        //   判据三重信号（同一份 oni://colony/status，1s TTL 秒级新鲜度）：
+        //     ① isPaused = true → 停（暂停按钮被按下）
+        //     ② gameSpeed <= 0 → 停（速度 0 等于没跑；mod 出现过
+        //        isPaused=false 但 gameSpeed=0.0 的组合，只看 ① 会漏判）
+        //     ③ 任一说停 → 判停（保守：宁可少下一轮工单，也不可在世界停着时下单）
+        //   为什么不能只信快照里的 paused：拿过期值判定 → 代理以为世界在跑 →
+        //   继续下工单 → 游戏实际停着、工单永不执行 → 指纹不变 → 判零进展 →
+        //   误熔断好节点（契约 §9 铁律：世界不跑 ⇒ 不下工单、不计进展、不熔断）。
+        let speed_stopped = snap.game_speed >= 0.0 && snap.game_speed <= 0.0;
+        let mut observed_running = !snap.paused && !speed_stopped;
+        // ★ 实时复核：快照说"在跑"时，再查一次实时状态兜底。
+        //   快照是批量采集的，采集完成到判定执行之间有秒级间隔；
+        //   这段时间里游戏可能被暂停（agent 自己冻 / 用户按空格 / 窗口到期冻回）。
+        //   用陈旧的 false 去判定 → 以为世界在跑 → 继续下单 → 工单永不执行。
+        //   复核读的是同一条 URI，但走 1s TTL → 判定时基本必读实时值；
+        //   且并发读仍由 singleflight 合并，不会打爆 mod 端点。
+        if observed_running && self.game_paused() {
+            observed_running = false;
+            report.notes.push(
+                "🕐 实时复核：游戏实际已暂停（快照判定滞后）→ 本轮按世界停着处理，不下工单".into(),
+            );
+        }
         // 暂停所有权：唯一的用户停止信号是 hold（AI 总开关关），
         //   在下方 hold_active() 早退处理。其它 owner 一律由代理自主恢复。
         //   （旧逻辑把 owner=User 判成"用户暂停→绝不恢复"，与 AI 总开关重复且致死锁。）
@@ -689,7 +725,7 @@ impl Agent {
             self.danger_cycle = false;
             // 工作节律自持：代理自己冻回后，按「冻20s → 跑120s」自动续窗。
             //   边界（必须严守）：
-            //   - 只有"代理自己冻的"(frozen) 才自持；用户手动暂停时 frozen=false → 不自持
+            //   - 只有"代理自己冻的"(frozen) 才自持；hold 由用户/主 agent 掌控，不自持
             //   - "真没活干"（idle_stopped / 动作失败且慢系统无待办目标）→ 不自持
             //     （动作失败但 ai_goals_pending 非空 = 有活 → 走自持续窗重试）
             //   - 有 hold 标记（主 agent 改代码中）→ 上面已早退，不会走到这里
@@ -747,12 +783,9 @@ impl Agent {
             } else if self.frozen || self.idle_stopped {
                 report.notes.push("🔒 已冻回暂停（等新窗口请求）".into());
             } else if self.paused_by_us {
-                // 上轮紧急暂停、条件已解除 → 开一个短窗口，而不是一直跑
-                // **等慢系统期间不能在这里恢复**。
-                //   旧逻辑：paused_by_us 就恢复 → 下一轮「等慢系统」又冻回
-                //   两个分支每 10s 互相打架 → 世界一半在跑、一半冻住
-                //   殖民地零进展。
-                //   现在：等慢系统时保持冻结，由看门狗统一解冻。
+                // 上轮紧急暂停、条件已解除 → 开一个短窗口，而不是一直跑。
+                //   注：契约已废除"等慢系统→冻结"与看门狗，暂停只由 hold/紧急占空比/
+                //   施工窗口三种情形产生；这里处理的是"危险期结束 → 恢复施工窗口"。
                 self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
                 self.window_owned_by_us = true;
                 self.resume("危急已解除 → 开施工窗口");
@@ -787,7 +820,8 @@ impl Agent {
         // ---- 显式施工窗口请求----
         if let Some(secs) = read_window_request() {
             // 用户显式 `oni window` = 授权代理恢复：先清掉 user/hook 的暂停所有权。
-            //   不清的话，下一轮守护进程读到 owner=User 又会判"用户暂停"→ 死锁。
+            //   清 owner：暂停所有权必须与"谁真的在跑"一致，否则下一轮
+            //   读到残留的 owner 会得出错误的运行状态判断。
             crate::control::clear();
             if judgment.verdict != Verdict::Danger {
                 self.window_until = Some(Instant::now() + Duration::from_secs(secs));
@@ -1127,10 +1161,20 @@ impl Agent {
                             if n.is_blocked() {
                                 return false;
                             }
+                            // ★ tag 只取节点的**语义身份**（名称 + 动作的 goal/prefab），
+                            //   **不含动作的 why 文案**。
+                            //   为什么：why 是给人和 LLM 看的解释文本，里面的词是**偶然**的 ——
+                            //   实测 T1「浅层建材自举」的 why 里写了"厕所、梯子、砖块都需要建材"，
+                            //   于是 Urgent「建厕所」匹配到了 T1（采建材）而不是 T2（卫生前置：三人厕所）→
+                            //   每轮把 T1 复活成 done → T2 永远轮不上 → 厕所永远建不成。
                             let tag = format!(
-                                "{} {:?}",
+                                "{} {}",
                                 n.name,
-                                n.actions.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>().join(" ")
+                                n.actions
+                                    .iter()
+                                    .map(action_identity)
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
                             );
                             // ：禁止扩张时跳过换气/地表/挖矿类节点
                             if directive.forbid_expansion
@@ -1211,6 +1255,12 @@ impl Agent {
         //   旧行为：膀胱告急 → 直接选中"建厕所"节点 → 但它的前置（挖空间/铺砖）
         //   还没做 → 预检必不过 → 每轮失败 → 每轮升级 → 每轮冻结 → 噪声不断。
         //   正解：抢占到的节点若前置未完成 → **改为执行它的前置**（逐级回溯）。
+        // ★ 紧急抢占必须尊重依赖图 —— **但有例外**。
+        //   若被回溯到的前置**已被熔断（blocked）或暂缓（deferred）**，依赖链走不通：
+        //   继续执行它只会重复一次注定失败的施工（实测 T1 熔断 → Urgent 建厕所
+        //   变成"执行 T1" → 厕所永远建不成 → 膀胱爆表）。
+        //   此时保命**不等它** → 标记 chain_blocked，改走内置保命反射弧。
+        let mut urgent_chain_blocked = false;
         let picked_by_scheduler = picked_by_scheduler.map(|n| {
             let mut cur = n;
             let mut guard = 0;
@@ -1230,6 +1280,15 @@ impl Agent {
                 if pre.is_done() {
                     break;
                 }
+                if pre.is_blocked() || pre.is_deferred() {
+                    // 等价于 has_unexecutable_predecessor 的单点判定（保持回溯语义）
+                    urgent_chain_blocked = true;
+                    report.notes.push(format!(
+                        "⚠ 紧急抢占 [{}] 的前置 [{}] 已不可执行（熔断/暂缓）→ 保命不等它，改走内置反射弧",
+                        cur.id, pre.id
+                    ));
+                    break;
+                }
                 report.notes.push(format!(
                     "⚠ 紧急抢占 [{}] 的前置 [{}] 未完成 → 本轮先做前置",
                     cur.id, pre.id
@@ -1247,6 +1306,44 @@ impl Agent {
                     "🔄 紧急需求重新告急 → 复活已完成节点 [{}]（判据已上调到 ≥人口数）",
                     n.id
                 ));
+            }
+        }
+        // ★ 契约不变量2：保命动作不可阻塞。
+        //   Urgent（膀胱满/窒息/缺食）已判定，但**plan 走不通**时不能只报错回落：
+        //     ① 依赖链断（前置被熔断/暂缓）→ "尊重依赖图"会把保命改写成执行那个
+        //        注定失败的前置 → 保命目标永远不达成；
+        //     ② plan 里根本没有匹配节点（plan-reset 后 LLM 还没出图，0 节点）。
+        //   两种情况都改为：直接执行**内置保命反射弧**（不依赖 plan 的语义动作）。
+        //   命中了可执行的 plan 节点时仍走 plan（它可能有更完整的施工流程）。
+        if directive.level >= crate::priority::Level::Urgent
+            && (urgent_chain_blocked || picked_by_scheduler.is_none())
+        {
+            let vital = vital_reflex_actions(directive.action);
+            if !vital.is_empty() {
+                let out = execute(&self.session, &self.catalog, &vital);
+                // ★ 打印完整 detail：只打 "build:ok" 会掩盖"工单被接受但没落地"
+                //   （实测：旱厕 2×3 没空位，mod 接受工单却建不成 → 看着成功实际没进展）。
+                let detail = out.results.iter()
+                    .map(|x| format!("{} → {}", x.kind, x.detail))
+                    .collect::<Vec<_>>().join(" | ");
+                report.acted = true;
+                report.notes.push(format!(
+                    "🛡 Urgent[{}] plan 走不通（{}）→ 直执行内置保命反射弧（{}）",
+                    directive.action.label(),
+                    if urgent_chain_blocked { "依赖链断" } else { "无匹配节点" },
+                    detail
+                ));
+                // ★ 反射弧**失败**时不独占本轮 → 让 plan 继续执行。
+                //   反射弧只会"下工单"，而工单能不能被复制人执行是另一回事
+                //   （实测：旱厕 2×3 要先腾空间，反射弧挖的那格复制人够不到 → 死单）。
+                //   真正的解法往往在 plan 里（挖空间/换方向）——
+                //   若这里 return，plan 节点每轮都被抢占 → 永远轮不上 → 死锁。
+                if out.ok {
+                    return report;
+                }
+                report.notes.push(
+                    "↩ 反射弧未达成 → 本轮继续执行 plan（真正的解法在依赖图里，如挖空间/换方向）".into(),
+                );
             }
         }
         let chosen = if let Some(n) = picked_by_scheduler {
@@ -1277,6 +1374,8 @@ impl Agent {
             d.chosen.clone()
         };
         let Some(node) = chosen else {
+            // 保命反射弧已在上面处理（Urgent 且 plan 走不通时直执行）；
+            //   走到这里说明不是 Urgent，或保命动作不在反射弧覆盖范围内。
             report.notes.push("依赖图里没有可执行目标".into());
             // 快慢分工：依赖图死锁 = **规则层解不开** → 喊慢系统。
             //   慢系统要么改 plan（换顺序/拆依赖），要么改代码（补规则）。
@@ -1296,7 +1395,7 @@ impl Agent {
                         "依赖图里没有可执行目标（{} 个节点全部 done/blocked/deferred）。快系统无法自行解开。",
                         plan.nodes.len()
                     ),
-                    "建议慢系统：检查 requires 是否指向不存在的节点、或按当前局面重排依赖（oni plan-auto --keep）".into(),
+                    "建议慢系统：检查 requires 是否指向不存在的节点、或按当前局面重排依赖（可改 plan.json 后用 oni plan-check 复核）".into(),
                     ctx,
                 );
                 report.notes.push(crate::escalate::summary());
@@ -1792,8 +1891,21 @@ impl Agent {
                     ctx,
                 );
                 self.action_failures = 0;
+                // ★ 保命节点连续失败 → **暂缓**（deferred），不只"本轮停手"。
+                //   旧行为：只 return 本轮 → 下一轮 decide() 又选中同一个保命节点
+                //   → 又失败 → 又冻回 → **无限乒乓**（实测 T5/oxygen 物理上不可成功：
+                //     零氧石、零电、零藻类 → 每轮必然失败 → 游戏永远停着）。
+                //   正解：**暂缓**让快系统去执行别的目标、给慢系统换方向的空间；
+                //   deferred 有冷却期，条件变化后可自动恢复（ unlike 熔断=永久自杀）。
+                //   ★ 保命节点**禁熔断**的规则不变（不写 circuit_breaks 永久记录）。
+                mark_node_deferred(
+                    &self.cfg.plan_path,
+                    &node.id,
+                    &format!("保命节点连续 {} 次动作失败 → 暂缓换方向（禁熔断，条件变化后自动恢复）", self.survival_failures),
+                    self.cycles,
+                );
                 report.notes.push(format!(
-                    "🆘 [{}] 保命节点连续失败 → 已升级给慢系统，本轮停手（不再无限重试）",
+                    "🆘 [{}] 保命节点连续失败 → 已升级给慢系统并**暂缓**（本轮停手 + 后续几轮不再重试，等慢系统换方向；条件变化后自动恢复）",
                     node.id
                 ));
                 report.notes.push(crate::escalate::summary());
@@ -1935,7 +2047,10 @@ impl Agent {
                 crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
                     oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
             );
-            report.notes.push(format!("⏸ 全员空闲 → 冻结并上报 AI：{detail}"));
+            // 文案纠正：这里**没有冻结世界**（只是上报慢系统）——
+            //   旧文案写"冻结并上报 AI"，与实际行为不符，
+            //   读日志的人会以为世界被冻住（本次排查就被它误导过）。
+            report.notes.push(format!("⏸ 全员空闲 → 上报 AI（世界继续跑）：{detail}"));
 
         }
 
@@ -1980,19 +2095,63 @@ pub fn food_runway_cycles(food_kcal: f64, dupes: usize) -> f64 {
     food_kcal / (dupes.max(1) as f64 * crate::judge::KCAL_PER_DUPE_CYCLE)
 }
 
+/// ★ 从判据 JSON 里取阈值，**兼容 LLM 常用的多种字段名**。
+///
+/// 为什么需要：开局规划由 LLM 生成判据，而 prompt 不可能穷举每种 kind 的字段格式，
+///   LLM 只能"照相邻例子猜"——实测它把 `loose_min` 写成 `{key:"SandStone", n:50}`，
+///   而代码只认 `{element, kg}` → `v.get("element")?` 返回 None → 判据**永远无法判定**
+///   → 节点永远不算 done → 反复执行 → 零进展 → 被熔断 → 下游节点前置断链
+///   （实测 T1「采建材」砂岩 7507kg 已满足 n=50，却被熔断，连带锁死 T2「建厕所」）。
+///   这里做**别名容错**：猜错也能工作，把 LLM 的自由发挥变成可容忍的噪声。
+/// 动作的**语义身份**（用于节点匹配）：只含目标词，不含解释文案。
+///
+/// ★ 为什么不能直接用 `{:?}`（Action 的 Debug）：Debug 会把 `why` 一起打出来，
+///   而 `why` 是给人和 LLM 看的**解释文本**，里面的词是偶然的 ——
+///   实测节点 T1「浅层建材自举」的 why 写了"厕所、梯子、砖块都需要建材"，
+///   于是 Urgent「建厕所」把 T1（采建材）当成了卫生节点 → 真正该跑的
+///   T2「卫生前置：三人厕所」永远轮不上。
+pub fn action_identity(a: &crate::exec::Action) -> String {
+    use crate::exec::Action;
+    match a {
+        Action::Auto { goal, .. } => format!("goal:{goal}"),
+        Action::AutoBuild { prefab, .. } => format!("prefab:{prefab}"),
+        Action::Build { prefab, .. } => format!("prefab:{prefab}"),
+        Action::Dig { .. } => "dig".to_string(),
+        Action::Order { .. } => "order".to_string(),
+        Action::AutoConnect { from, to, .. } => format!("connect:{from}:{to}"),
+        Action::Scout { .. } => "scout".to_string(),
+        Action::Call { tool, .. } => format!("call:{tool}"),
+    }
+}
+
+fn crit_num(v: &Value, names: &[&str], default: f64) -> f64 {
+    for n in names {
+        match v.get(*n) {
+            Some(x) if x.is_number() => return x.as_f64().unwrap_or(default),
+            _ => {}
+        }
+    }
+    default
+}
+
+/// 从判据 JSON 里取标识字段（element / key / name / prefab / id 等别名）。
+fn crit_str<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|n| v.get(*n).and_then(|x| x.as_str()))
+}
+
 pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
     let kind = v.get("kind")?.as_str()?;
     match kind {
         "building_min" => {
-            let key = v.get("key")?.as_str()?;
-            Some(snap.building(key) >= v.get("n")?.as_i64().unwrap_or(1))
+            let key = crit_str(v, &["key", "building", "name"])?;
+            Some(snap.building(key) as i64 >= crit_num(v, &["n", "count", "min", "target"], 1.0) as i64)
         }
         "rooms_min" => {
             let key = v.get("key")?.as_str()?;
             Some(snap.rooms.get(key).and_then(|x| x.as_i64()).unwrap_or(0) >= v.get("n")?.as_i64().unwrap_or(1))
         }
         "storage_mass_min" => {
-            let kg = v.get("kg")?.as_f64().unwrap_or(0.0);
+            let kg = crit_num(v, &["kg", "n", "min", "target"], 0.0);
             let total: f64 = snap
                 .storage
                 .as_array()
@@ -2003,7 +2162,7 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         // 必须读 **summary 子对象**：电力字段全在 summary 里，
         //   读顶层永远拿不到 → 这个判据一直是假的。
         "power_operational" => Some(snap.power_int("generatorOperational") > 0),
-        "oxygen_min" => Some(snap.oxygen_kg() >= v.get("kg")?.as_f64().unwrap_or(0.0)),
+        "oxygen_min" => Some(snap.oxygen_kg() >= crit_num(v, &["kg", "n", "min", "target"], 0.0)),
         // ★ **产氧设备在运转**（不是"造出来了"）。
         //   实测本局铁证：氧气扩散器建成了（制氧1），但
         //   power/summary 显示 generatorCount=0、consumerOperational=0、
@@ -2018,39 +2177,48 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         }
         // 地上散装资源够不够（建造前先确认材料够）
         "loose_min" => {
-            let el = v.get("element")?.as_str()?;
-            Some(snap.loose_kg(el) >= v.get("kg")?.as_f64().unwrap_or(0.0))
+            // 字段别名容错：LLM 常写 {key, n}，规范是 {element, kg}
+            let el = crit_str(v, &["element", "key", "name", "tag"])?;
+            Some(snap.loose_kg(el) >= crit_num(v, &["kg", "n", "min", "minKg", "target"], 0.0))
         }
         // 发电机真的在发电（不是"建好了但没燃料"）
         "generator_fueled" => Some(
             snap.power_int("generatorOperational") > 0 && snap.power_int("generatorEmpty") == 0,
         ),
-        "power_net" => Some(snap.power_num("netActiveWatts") >= v.get("watts")?.as_f64().unwrap_or(0.0)),
-        "dupe_min" => Some(snap.dupes.len() as i64 >= v.get("n")?.as_i64().unwrap_or(1)),
+        "power_net" => Some(snap.power_num("netActiveWatts") >= crit_num(v, &["watts", "w", "n", "min", "target"], 0.0)),
+        "dupe_min" => Some(snap.dupes.len() as i64 >= crit_num(v, &["n", "count", "min", "target"], 1.0) as i64),
         // 基地扩容判据：官方可达格数。
         //   「挖通开阔气室」的真实效果 = **可达区变大**，而不是「某块石头没了」。
         //   用格数判、不用坐标判 → 计划文件里不出现硬编码坐标。
         "reachable_min" => {
-            let n = v.get("n")?.as_i64().unwrap_or(0);
+            let n = crit_num(v, &["n", "cells", "min", "target"], 0.0) as i64;
             Some(snap.reachable_cells as i64 >= n)
         }
         // 任意一种建材达标
         "loose_any_min" => {
-            let kg = v.get("kg")?.as_f64().unwrap_or(0.0);
-            let els = v.get("elements")?.as_array()?;
+            let kg = crit_num(v, &["kg", "n", "min", "target"], 0.0);
+            let els = v.get("elements").or_else(|| v.get("keys")).or_else(|| v.get("names"))?.as_array()?;
+            // 兼容两种写法：["SandStone","Dirt"] 与 [{"element":"SandStone","kg":50}]
             let total: f64 = els
                 .iter()
-                .filter_map(|e| e.as_str())
-                .map(|e| snap.loose_kg(e))
+                .filter_map(|e| match e {
+                    Value::String(s) => Some(snap.loose_kg(s)),
+                    Value::Object(_) => {
+                        let el = crit_str(e, &["element", "key", "name", "tag"])?;
+                        let kg = crit_num(e, &["kg", "n", "min"], 0.0);
+                        Some(snap.loose_kg(el).min(kg))
+                    }
+                    _ => None,
+                })
                 .sum();
             Some(total >= kg)
         }
         // 按 prefabId 判建筑数量（梯子/砖块/存储箱…）
         "prefab_min" => {
-            let p = v.get("prefab")?.as_str()?;
-            Some(snap.building_count(p) >= v.get("n")?.as_i64().unwrap_or(1))
+            let p = crit_str(v, &["prefab", "key", "id", "name"])?;
+            Some(snap.building_count(p) as i64 >= crit_num(v, &["n", "count", "min", "target"], 1.0) as i64)
         }
-        "food_min" => Some(snap.food_kcal() >= v.get("kcal")?.as_f64().unwrap_or(0.0)),
+        "food_min" => Some(snap.food_kcal() >= crit_num(v, &["kcal", "n", "min", "target"], 0.0)),
         // 换气完成的真实判据：复制人**能走到地表格**（可达区上界达到地表 Y）。
         //   用"地上散装煤 ≥ N kg"当判据是错的 —— 挖到煤层不等于打通了地表，
         //   会让依赖图提前放行下游节点。
@@ -2059,18 +2227,27 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         //   为什么不分开判：只判"煤"会让"发电机"节点提前放行，
         //   但铜矿还没挖到 → 建造必失败 → 循环卡死（）。
         "loose_multi_min" => {
-            let pairs = v.get("elements").and_then(|e| e.as_array());
+            let pairs = v.get("elements").or_else(|| v.get("pairs"))?.as_array();
             let Some(pairs) = pairs else { return None; };
-            let ok = pairs.iter().all(|p| {
-                let el = p.get(0).and_then(|x| x.as_str()).unwrap_or("");
-                let kg = p.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                !el.is_empty() && snap.loose_kg(el) >= kg
+            // 兼容两种写法：[["SandStone",50],...] 与 [{"element":"SandStone","kg":50}]
+            let ok = pairs.iter().all(|p| match p {
+                Value::Array(a) => {
+                    let el = a.first().and_then(|x| x.as_str()).unwrap_or("");
+                    let kg = a.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    !el.is_empty() && snap.loose_kg(el) >= kg
+                }
+                Value::Object(_) => {
+                    let el = crit_str(p, &["element", "key", "name", "tag"]).unwrap_or("");
+                    let kg = crit_num(p, &["kg", "n", "min"], 0.0);
+                    !el.is_empty() && snap.loose_kg(el) >= kg
+                }
+                _ => false,
             });
             Some(ok)
         }
         // 救援判据：所有复制人的呼吸值都高于阈值（说明都脱离了窒息区）。
         "breath_min" => {
-            let min_v = v.get("value").and_then(|x| x.as_f64()).unwrap_or(50.0);
+            let min_v = crit_num(v, &["value", "n", "min", "target"], 50.0);
             let lowest = snap.min_breath();
             match lowest {
                 Some(b) => Some(b >= min_v),
@@ -2078,7 +2255,7 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
             }
         }
         "surface_open" => {
-            let min_y = v.get("minY").and_then(|y| y.as_i64()).unwrap_or(216) as i32;
+            let min_y = crit_num(v, &["minY", "y", "n", "min", "target"], 216.0) as i32;
             Some(snap.reach_bounds.map(|(_, _, _, y1)| y1 >= min_y).unwrap_or(false))
         }
         // 开局侦察是否完成（报告落在 ~/.oni-agent/scout.json）
@@ -2087,16 +2264,67 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         ),
         // 食物续航判据（周期）：开局必然不达标 → 代理会去采食物；吃饱了才 done。
         "food_cycles_min" => {
-            let need = v.get("cycles")?.as_f64().unwrap_or(0.0);
+            let need = crit_num(v, &["cycles", "n", "min", "target"], 0.0);
             Some(food_runway_cycles(snap.food_kcal(), snap.dupes.len()) >= need)
         }
         // 空气质量判据：O₂/(O₂+CO₂) 的百分比。换气做没做成，看这个比例。
         "breath_ratio_min" => {
-            let pct = v.get("pct")?.as_f64().unwrap_or(85.0);
+            let pct = crit_num(v, &["pct", "percent", "n", "min", "target"], 85.0);
             Some(snap.breath_ratio() * 100.0 >= pct)
         }
         "manual" => None,
         _ => None,
+    }
+}
+
+/// 该节点的某条 `requires` 前置是否**已不可执行**（熔断 blocked / 暂缓 deferred）。
+///
+/// ★ 这是"保命被改成执行注定失败的前置"的判据。
+///   紧急抢占会沿 requires 回溯到未完成的前置；但若该前置已被熔断或暂缓，
+///   依赖链走不通 —— 此时保命**不能等它**，必须改走内置反射弧。
+///   实测：T2「卫生前置：三人厕所」requires T1「采建材」；T1 熔断后，
+///   Urgent 建厕所变成"执行 T1" → 厕所永远建不成 → 膀胱爆表。
+pub fn has_unexecutable_predecessor(node: &crate::decide::Node, plan: &[crate::decide::Node]) -> bool {
+    node.requires.iter().any(|r| {
+        plan.iter()
+            .find(|m| &m.id == r)
+            .map(|pre| pre.is_blocked() || pre.is_deferred())
+            .unwrap_or(false)
+    })
+}
+
+/// ★ **保命反射弧**：把 Urgent 动作翻译成**不依赖 plan 依赖图**的具体动作。
+///
+/// 为什么需要它独立于 plan：
+///   保命（膀胱爆/窒息/缺食）**不能等前置**。plan 的 requires 是战略顺序，
+///   但当 Urgent 目标的某个前置已被熔断（blocked）或暂缓（deferred）时，
+///   "尊重依赖图"会把保命动作改写成执行那个注定失败的前置 ——
+///   实测：T2「卫生前置：三人厕所」requires T1「采建材」，T1 熔断后 →
+///   Urgent 建厕所变成"执行 T1" → 厕所永远建不成 → 膀胱爆表。
+///
+/// 范围严格限定为保命最小集；供电/扩张类属战略层，不在此列。
+/// 动作本身用语义目标（如 `toilet`），由运行时探测 prefab 与落点，不写死坐标。
+pub fn vital_reflex_actions(action: crate::priority::Action) -> Vec<crate::exec::Action> {
+    match action {
+        crate::priority::Action::BuildToilet => vec![crate::exec::Action::Auto {
+            goal: "toilet".into(),
+            why: "膀胱告急 → 内置保命反射弧（语义目标 toilet，运行时选 prefab/落点）".into(),
+        }],
+        crate::priority::Action::Rescue => vec![crate::exec::Action::Auto {
+            goal: "mop_dirty".into(),
+            why: "有人受污染威胁 → 内置保命反射弧清污".into(),
+        }],
+        crate::priority::Action::ProduceOxygen | crate::priority::Action::Ventilate => {
+            vec![crate::exec::Action::Auto {
+                goal: "oxygen".into(),
+                why: "氧气红线 → 内置保命反射弧产氧".into(),
+            }]
+        }
+        crate::priority::Action::ForageFood => vec![crate::exec::Action::Auto {
+            goal: "forage".into(),
+            why: "食物告急 → 内置保命反射弧采集".into(),
+        }],
+        crate::priority::Action::Power | crate::priority::Action::FollowPlan => Vec::new(),
     }
 }
 
@@ -2284,6 +2512,133 @@ mod tests {
         let st2 = after["nodes"][1]["status"].as_str().unwrap();
         assert_eq!(st2, "done", "判据成立的 done 节点应保持");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// ★ 回归：保命动作**不能被改成执行注定失败的前置**。
+    ///   场景：T2「卫生前置：三人厕所」requires T1「采建材」，T1 被熔断（blocked）。
+    ///   旧行为：紧急抢占沿 requires 回溯 → 执行 T1 → 零进展 → 厕所永远建不成 → 膀胱爆表。
+    ///   正解：识别出前置不可执行 → 改走内置保命反射弧（不依赖 plan 依赖图）。
+    #[test]
+    fn unexecutable_predecessor_blocks_urgent_from_waiting_on_it() {
+        use crate::decide::Node;
+        let mk = |id: &str, status: &str, requires: Vec<&str>| Node {
+            id: id.into(),
+            name: id.into(),
+            status: status.into(),
+            requires: requires.into_iter().map(|s| s.to_string()).collect(),
+            unlocks: vec![],
+            actions: vec![],
+            success_check: None,
+            success: String::new(),
+            rescue: false,
+            note: String::new(),
+            priority: None,
+            deferred: None,
+            deferred_at: None,
+            stall: None,
+        };
+        let t1_blocked = mk("T1", "blocked", vec![]);
+        let t2_toilet = mk("T2", "todo", vec!["T1"]);
+        let plan = vec![t1_blocked.clone(), t2_toilet.clone()];
+        // T2 的前置 T1 已熔断 → 依赖链走不通 → 必须识别出来
+        assert!(
+            super::has_unexecutable_predecessor(&t2_toilet, &plan),
+            "前置被熔断时必须识别出依赖链走不通，否则保命会被改成执行失败的前置"
+        );
+        // T1 自己没有前置 → 不算走不通
+        assert!(!super::has_unexecutable_predecessor(&t1_blocked, &plan));
+        // 前置正常（todo）→ 不算走不通，保命仍可按依赖图推进
+        let t1_ok = mk("T1", "todo", vec![]);
+        let t2b = mk("T2", "todo", vec!["T1"]);
+        assert!(!super::has_unexecutable_predecessor(&t2b, &[t1_ok, t2b.clone()]));
+    }
+
+    /// ★ 回归：保命反射弧覆盖所有 Urgent 保命动作，且用语义目标（不写死 prefab/坐标）。
+    #[test]
+    fn vital_reflex_covers_urgent_actions_with_semantic_goals() {
+        use crate::priority::Action;
+        for (act, expect_goal) in [
+            (Action::BuildToilet, "toilet"),
+            (Action::Rescue, "mop_dirty"),
+            (Action::ProduceOxygen, "oxygen"),
+            (Action::Ventilate, "oxygen"),
+            (Action::ForageFood, "forage"),
+        ] {
+            let acts = super::vital_reflex_actions(act);
+            assert_eq!(acts.len(), 1, "每个保命动作都应有且只有一个反射弧动作");
+            match &acts[0] {
+                crate::exec::Action::Auto { goal, .. } => assert_eq!(goal, expect_goal),
+                other => panic!("反射弧必须用语义目标（不写死 prefab/坐标），实际: {other:?}"),
+            }
+            // 语义目标必须能被 parse_goal 解析，否则运行时直接失败
+            assert!(
+                crate::autoact::parse_goal(expect_goal).is_some(),
+                "反射弧的语义目标 {expect_goal} 必须可解析"
+            );
+        }
+        // 供电/扩张类不属于保命最小集 → 不做反射弧
+        assert!(super::vital_reflex_actions(Action::Power).is_empty());
+        assert!(super::vital_reflex_actions(Action::FollowPlan).is_empty());
+    }
+
+    /// ★ 回归：判据字段别名容错 —— LLM 猜错字段名也不能让判据失效。
+    ///   实测事故：LLM 把 `loose_min` 写成 `{key:"SandStone", n:50}`（照 building_min 的例子猜），
+    ///   而代码只认 `{element, kg}` → 判据永远返回 None → 节点永远不算 done →
+    ///   零进展 → 被熔断 → 下游「建厕所」节点前置断链 → 膀胱爆表。
+    #[test]
+    fn success_check_accepts_alias_field_names() {
+        use crate::sense::Snapshot;
+        let snap = Snapshot::default();
+        // 规范写法（element + kg）
+        assert_eq!(
+            super::check_success(&snap, &serde_json::json!({"kind":"loose_min","element":"SandStone","kg":50})),
+            Some(false), // 默认快照没有散装量 → 不满足，但不是 None（判据可判定）
+            "规范写法的判据必须返回 Some（可判定），不能是 None"
+        );
+        // ★ LLM 实际写法（key + n）——必须同样可判定，不能是 None
+        let alias = super::check_success(
+            &snap,
+            &serde_json::json!({"kind":"loose_min","key":"SandStone","n":50}),
+        );
+        assert!(
+            alias.is_some(),
+            "LLM 用 key/n 写的 loose_min 判据必须可判定；返回 None 会让节点永远无法 done"
+        );
+        // 其他常见别名同样要可判定
+        for v in [
+            serde_json::json!({"kind":"loose_min","name":"SandStone","min":50}),
+            serde_json::json!({"kind":"building_min","key":"toilets","n":3}),
+            serde_json::json!({"kind":"building_min","key":"toilets","count":3}),
+            serde_json::json!({"kind":"reachable_min","n":200}),
+            serde_json::json!({"kind":"reachable_min","cells":200}),
+            serde_json::json!({"kind":"oxygen_min","kg":100}),
+            serde_json::json!({"kind":"oxygen_min","n":100}),
+            serde_json::json!({"kind":"food_cycles_min","cycles":5}),
+            serde_json::json!({"kind":"food_cycles_min","n":5}),
+        ] {
+            assert!(
+                super::check_success(&snap, &v).is_some(),
+                "判据 {:?} 必须可判定（不能返回 None）",
+                v
+            );
+        }
+    }
+
+    /// ★ 回归：节点匹配的 tag **不能包含动作的 why 文案**。
+    ///   实测事故：T1「浅层建材自举」的 why 写了"厕所、梯子、砖块都需要建材"，
+    ///   Urgent「建厕所」因此把 T1（采建材）当成卫生节点 → 每轮复活它、
+    ///   真正该跑的 T2「卫生前置：三人厕所」永远轮不上。
+    #[test]
+    fn action_identity_excludes_why_text() {
+        use crate::exec::Action;
+        let a = Action::Auto {
+            goal: "material".into(),
+            why: "厕所、梯子、砖块都需要建材，先采浅层砂岩".into(),
+        };
+        let id = super::action_identity(&a);
+        assert!(id.contains("material"), "应保留动作语义目标：{id}");
+        assert!(!id.contains("厕所"), "why 里的词绝不能进入匹配 tag：{id}");
+        assert!(!id.contains("梯子"), "why 里的词绝不能进入匹配 tag：{id}");
     }
 
     /// 动作指纹提取：从 detail 里认出"对哪个目标动了手"。

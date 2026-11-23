@@ -26,6 +26,17 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(8);
 pub struct SnapshotCache {
     entries: Mutex<HashMap<String, (Instant, String)>>,
     ttl: Duration,
+    /// **per-URI TTL 覆盖**：关键状态用更短的新鲜度，其余用默认 TTL。
+    ///
+    /// 为什么需要（事件驱动查询融进 singleflight）：
+    ///   世界运行/暂停状态（`oni://colony/status`）是**判定世界在不在跑**的唯一依据，
+    ///   拿过期值会让代理在游戏已停时继续下工单 → 工单永不执行 → 判零进展 →
+    ///   熔断好节点（契约 §9 禁止的"世界不跑却下工单"）。
+    ///   而绕过缓存另开请求又会打爆 mod 端点 —— 所以**不绕过缓存**，
+    ///   而是把关键 URI 的 TTL 调到秒级：
+    ///   判定时（10s 轮询）缓存必然已过期 → 读到真值；
+    ///   同一时刻的并发读仍由 singleflight 合并成一次请求 → 不打爆端点。
+    ttl_overrides: Mutex<HashMap<String, Duration>>,
 }
 
 impl SnapshotCache {
@@ -33,14 +44,34 @@ impl SnapshotCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             ttl,
+            ttl_overrides: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 给某个 URI 设独立 TTL（秒级新鲜度）。
+    pub fn set_ttl_override(&self, key: &str, ttl: Duration) {
+        self.ttl_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), ttl);
+    }
+
+    /// 取该 key 生效的 TTL（覆盖优先）。
+    fn ttl_for(&self, key: &str) -> Duration {
+        self.ttl_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or(self.ttl)
     }
 
     /// 取缓存；未命中或已过期返回 None。
     pub fn get(&self, key: &str) -> Option<String> {
+        let ttl = self.ttl_for(key);
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(key) {
-            Some((at, v)) if at.elapsed() < self.ttl => Some(v.clone()),
+            Some((at, v)) if at.elapsed() < ttl => Some(v.clone()),
             _ => None,
         }
     }

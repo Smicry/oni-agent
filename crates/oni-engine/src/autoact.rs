@@ -661,6 +661,9 @@ pub enum Goal {
     Material,
     /// 排掉污染水/污染氧（人泡在里面会窒息）
     MopDirty,
+    /// **建厕所**：污染的一级预防（膀胱满没厕所 → 随地排泄 → 污染水）。
+    /// 运行时探测哪种厕所能造（研究锁/材料），不写死 prefab。
+    Toilet,
     /// **开局资源侦察**：探测关键资源（铁矿/氧石/铜矿/藻类）分布并落盘
     Scout,
     /// **供电**：铺地板砖 + 建人力发电机
@@ -715,6 +718,9 @@ pub fn parse_goal(s: &str) -> Option<Goal> {
     }
     if s.eq_ignore_ascii_case("mop_dirty") || s.contains("污染") {
         return Some(Goal::MopDirty);
+    }
+    if s.eq_ignore_ascii_case("toilet") || s.contains("厕所") || s.contains("旱厕") {
+        return Some(Goal::Toilet);
     }
     if s.eq_ignore_ascii_case("material") || s.contains("建材") {
         return Some(Goal::Material);
@@ -819,6 +825,43 @@ pub fn compile(
 ) -> Option<Action> {
     match goal {
         Goal::Scout => Some(Action::Scout { why: why.to_string() }),
+        Goal::Toilet => {
+            // 运行时探测哪种厕所能造（和产氧同一把尺子）：
+            //   旱厕 Outhouse 零耗电、只要建材 → 优先；抽水马桶要水电 → 次之。
+            //   被研究锁/缺材料的候选跳过，不写死 prefab。
+            let candidates: &[(&str, &str)] = &[("Outhouse", "旱厕"), ("Toilet", "抽水马桶")];
+            for (prefab, cn) in candidates {
+                let buildable = crate::exec::buildability(session, prefab);
+                if !matches!(buildable, crate::exec::Buildability::Ready(_)) {
+                    let why_not = match buildable {
+                        crate::exec::Buildability::ResearchLocked(w) => w,
+                        crate::exec::Buildability::MissingMaterial(w) => w,
+                        crate::exec::Buildability::Ready(_) => String::new(),
+                    };
+                    eprintln!("[厕所探测] 跳过 {cn}：{why_not}");
+                    continue;
+                }
+                let mats = crate::exec::mod_materials_with_kg(session, prefab);
+                let usable = mats.iter().find(|(_, kg)| *kg > 0.0).map(|(t, _)| t.clone());
+                if let Some(mat) = usable {
+                    return Some(Action::AutoBuild {
+                        prefab: prefab.to_string(),
+                        region: "auto".into(),
+                        material: mat.clone(),
+                        why: format!("{why}（运行时选了 {cn}，材料 {mat}）"),
+                    });
+                }
+            }
+            // 全部造不了 → 自举：先挖缺的建材（缺什么挖什么）
+            let near = oni_world::preflight::dupe_positions(session).first().copied();
+            if let Some(tag) = crate::exec::bootstrap_material(session, "Outhouse", "旱厕", near) {
+                return Some(Action::Auto {
+                    goal: format!("element:{tag}"),
+                    why: format!("{why}：旱厕造不了 → 先把 {tag} 挖回来"),
+                });
+            }
+            None
+        }
         Goal::Power => {
             // 两步：① 在目标位置下方铺地板砖 ② 建人力发电机。
             //   缺了第①步，第②步必报 missing_support。
@@ -1846,6 +1889,8 @@ BasicForagePlantPlanted@(131,199) PrickleGrass@(132,199) BasicSingleHarvestPlant
     fn oxygen_goal_parses() {
         assert_eq!(parse_goal("oxygen"), Some(Goal::Oxygen));
         assert_eq!(parse_goal("产氧"), Some(Goal::Oxygen));
+        assert_eq!(parse_goal("toilet"), Some(Goal::Toilet));
+        assert_eq!(parse_goal("厕所"), Some(Goal::Toilet));
         assert_eq!(parse_goal("element:Algae"), Some(Goal::Element("Algae")));
     }
 

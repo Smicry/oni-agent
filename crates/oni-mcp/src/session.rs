@@ -35,7 +35,14 @@ impl McpSession {
             })),
         )?;
         t.notify("notifications/initialized", None);
-        Ok(Self { t, cache: SnapshotCache::default(), inflight: Mutex::new(HashMap::new()) })
+        let cache = SnapshotCache::default();
+        // ★ 关键状态走**秒级新鲜度**（事件驱动查询融进 singleflight）：
+        //   世界运行/暂停是"判定世界在不在跑"的唯一依据，拿过期值会让代理
+        //   在游戏已停时继续下工单 → 工单永不执行 → 判零进展 → 误熔断好节点。
+        //   不绕过缓存（那会打爆 mod 端点），而是把这条 URI 的 TTL 调到 1s：
+        //   判定时缓存必然已过期 → 读到真值；同一时刻并发读仍由 singleflight 合并。
+        cache.set_ttl_override("oni://colony/status", std::time::Duration::from_secs(1));
+        Ok(Self { t, cache, inflight: Mutex::new(HashMap::new()) })
     }
 
     pub fn call_tool(&self, name: &str, args: Value) -> Result<Value, McpError> {

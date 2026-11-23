@@ -176,7 +176,7 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-pub(crate) fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str) -> Result<String, String> {
+pub(crate) fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str, max_tokens: u32) -> Result<String, String> {
     let endpoint = cfg.endpoint.as_ref().ok_or("no endpoint")?;
     let key = cfg.api_key.as_ref().ok_or("no api key")?;
 
@@ -185,7 +185,7 @@ pub(crate) fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str) -> Result<S
         let url = format!("{}/messages", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": cfg.model,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
         });
@@ -199,7 +199,7 @@ pub(crate) fn call_llm(cfg: &SlowConfig, system: &str, prompt: &str) -> Result<S
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
         });
         (endpoint.clone(), body)
     };
@@ -379,6 +379,14 @@ fn compute_goal_status(lines: &[&str]) -> Vec<GoalStatus> {
             });
         }
         let e = m.get_mut(&goal).unwrap();
+        // ★ 不只信 ok 字段：detail 明确说"零进展/无可下单曲/推不动"时，
+        //   即使历史上被记成 ok=true，也必须按失败计。
+        //   旧 bug：execute() 末尾硬编码 ok:true → 零进展被记成成功 →
+        //   熔断计数永不增长 → 慢系统无限重复入队推不动的目标。
+        let zero_progress = detail.contains("无可下单曲")
+            || detail.contains("零进展")
+            || detail.contains("推不动");
+        let ok = ok && !zero_progress;
         if ok {
             e.total_ok += 1;
             e.fails_since_success = 0;
@@ -1134,7 +1142,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
                             .open(sd.join("decisions.jsonl")) { let _ = writeln!(f, "{}", rec); }
                         let _ = std::fs::write(sd.join("opening_state.json"),
                             serde_json::to_string(&serde_json::json!({"last_fail_ts": now()})).unwrap_or_default());
-                        let out = format!("[opening] ⚠ LLM 开局规划失败，保持模板基线：{reason}");
+                        let out = format!("[opening] ⚠ LLM 开局规划失败，plan 保持空占位；快系统保命反射弧照常（不依赖 plan），10 分钟后重试：{reason}");
                         if let Ok(mut v) = view.lock() { v.last_decision = out.clone(); }
                         eprintln!("[slow] {}", out);
                         // 不 return：模板基线照常执行，本轮继续正常决策
@@ -1155,7 +1163,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     let decision = if cfg.is_mock() {
         mock_decision(&prompt, !escs.is_empty(), !cmds.is_empty(), proactive)
     } else {
-        match call_llm(cfg, SYSTEM_PROMPT, &prompt).and_then(|t| parse_decision(&t)) {
+        match call_llm(cfg, SYSTEM_PROMPT, &prompt, 4096).and_then(|t| parse_decision(&t)) {
             Ok(d) => d,
             Err(e) => {
                 let d = mock_decision(&prompt, !escs.is_empty(), !cmds.is_empty(), proactive);
@@ -1337,6 +1345,26 @@ mod tests {
         assert!(next.contains(&"B".to_string()), "A done → B 应可推进");
         assert!(!next.contains(&"C".to_string()), "X 未 done → C 不可推进");
         assert!(next.contains(&"D".to_string()), "无依赖节点应可推进");
+    }
+
+    #[test]
+    /// ★ 回归：detail 说"零进展"时，即使 ok=true 也必须按失败计。
+    ///   旧 bug：execute() 末尾硬编码 ok:true → 零进展被记成功 →
+    ///   熔断计数永不增长 → 慢系统无限重复入队推不动的目标 →
+    ///   快系统恢复→失败→冻回 无限乒乓（实测 material 前沿全是梯子需求）。
+    #[test]
+    fn zero_progress_counts_as_failure_even_when_ok_flagged_true() {
+        let lines = [
+            r#"{"goal":"material","ok":true,"detail":"前沿 14 格无可下单曲（全部需梯子或已有标记）→ 零进展，等梯子/复制人消化；该目标当前推不动","ts":100}"#,
+            r#"{"goal":"material","ok":true,"detail":"前沿 14 格无可下单曲（全部需梯子或已有标记）→ 零进展，等梯子/复制人消化；该目标当前推不动","ts":101}"#,
+            r#"{"goal":"material","ok":true,"detail":"前沿 14 格无可下单曲（全部需梯子或已有标记）→ 零进展，等梯子/复制人消化；该目标当前推不动","ts":102}"#,
+        ];
+        let st = compute_goal_status(&lines);
+        let m = st.iter().find(|s| s.goal == "material").unwrap();
+        assert_eq!(m.fails_since_success, 3, "零进展必须累计为连续失败");
+        assert_eq!(m.total_fail, 3);
+        assert_eq!(m.total_ok, 0, "零进展绝不能计入成功次数");
+        assert!(is_circuit_broken(m, 200), "连续3次零进展 → 必须熔断，阻止无限重试");
     }
 
     #[test]

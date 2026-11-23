@@ -66,6 +66,13 @@ pub struct Snapshot {
     pub ts: i64,
     pub cycle: i64,
     pub paused: bool,
+    /// 游戏速度（来自 oni://colony/status 的 gameSpeed）。
+    ///
+    /// 为什么需要：`isPaused` 只表示"暂停按钮"，而**速度 0 也等于停着**
+    ///   （mod 报 gameSpeed=0.0 但 isPaused=false 的组合出现过）。
+    ///   判定"世界在不在跑"要同时看这两个：任一为停 → 判停。
+    ///   两者来自同一次响应，零额外请求成本。
+    pub game_speed: f64,
     pub dupes: Vec<Dupe>,
     pub diagnostics: Value,
     pub atmos: Value,
@@ -103,6 +110,7 @@ impl Default for Snapshot {
             ts: 0,
             cycle: 0,
             paused: false,
+            game_speed: -1.0,
             dupes: Vec::new(),
             diagnostics: Value::Null,
             atmos: Value::Null,
@@ -575,6 +583,7 @@ pub fn sense(session: &McpSession) -> Snapshot {
         ts: chrono::Local::now().timestamp(),
         cycle: diagnostics.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0),
         paused: status.get("isPaused").and_then(|v| v.as_bool()).unwrap_or(false),
+        game_speed: status.get("gameSpeed").and_then(|v| v.as_f64()).unwrap_or(-1.0),
         dupes,
         diagnostics,
         atmos: get("atmos"),

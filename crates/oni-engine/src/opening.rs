@@ -38,41 +38,6 @@ pub const CHECK_KINDS: &[&str] = &[
 /// 写死坐标换个存档就废，这是"playbook 不可通用"的老坑）。
 pub const ACTION_KINDS: &[&str] = &["auto", "auto_build", "scout", "call"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strategy {
-    /// 先建材型：开局地上零建材 → 梯子/砖/厕所/床全部造不了。
-    /// → 第一目标：采建材（横向挖，低风险）；梯子本身也要建材才能挖竖井。
-    MaterialFirst,
-    /// 憋死型：可站区域只有一行高（复制人被封在走廊里）
-    /// → 第一目标：垂直竖井 + 梯子 → 开阔气室；禁止向下深挖。
-    Suffocate,
-    /// 近地表型：到地表很近 → 第一目标：打通地表（永久换气）。
-    NearSurface,
-    /// 富氧型：开局附近有氧石 → 第一目标：产氧器（氧石）。
-    RichOxygen,
-    /// 富矿型：附近有煤 + 铜 → 第一目标：供电链。
-    RichOre,
-    /// 无植物型：开局没有可食植物 → 食物必须靠种植（收割只能应急）。
-    Plantless,
-    /// 常规型。
-    Standard,
-}
-
-impl Strategy {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Strategy::MaterialFirst => "先建材型（开局零建材）",
-            Strategy::MaterialFirst => "先建材型（开局零建材）",
-            Strategy::Suffocate => "憋死型（可站区域只有一行高）",
-            Strategy::NearSurface => "近地表型（到地表很近）",
-            Strategy::RichOxygen => "富氧型（附近有氧石）",
-            Strategy::RichOre => "富矿型（附近有煤与铜）",
-            Strategy::Plantless => "无植物型（食物只能靠种植）",
-            Strategy::Standard => "常规型",
-        }
-    }
-}
-
 /// 开局世界事实（由 CLI 从游戏采集后传入）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WorldFacts {
@@ -452,18 +417,45 @@ fn build_prompts(brief_text: &str) -> (String, String) {
 地表近优先打通换气口，深埋优先竖井+梯子）。\
 只输出 JSON，不要任何其它文字、不要 markdown 栅栏。".to_string();
 
+    // ★ 判据 kind 全集 + **每种的字段格式**（必须照抄，不要自己发明字段名）。
+    //   为什么必须写清字段：LLM 看不到 check_success 的实现，只能照例子猜
+    //   （实测它把 loose_min 写成 {key,n}，而代码只认 {element,kg} → 判据永远无法判定
+    //     → 节点永远不算 done → 零进展 → 被熔断 → 下游节点前置断链 → 保命目标做不成）。
+    //   代码侧已加别名容错兜底，但 prompt 写清楚才能让 LLM 一次就写对。
     let kinds_line = format!(
-        "判据 kind 全集（只能从中选）: {}",
+        "判据 kind 全集与**字段格式**（kind 只能从中选，字段名必须照抄）:\n\
+   - building_min: {{kind, key:\"toilets|beds|...\", n:<数>}}\n\
+   - prefab_min: {{kind, prefab:\"Ladder\", n:<数>}}\n\
+   - loose_min: {{kind, element:\"SandStone\", kg:<数>}}\n\
+   - loose_any_min: {{kind, elements:[\"SandStone\",\"Dirt\"], kg:<数>}}\n\
+   - loose_multi_min: {{kind, elements:[[\"SandStone\",<kg>],[\"Cuprite\",<kg>]]}}\n\
+   - oxygen_min: {{kind, kg:<数>}}\n\
+   - food_min: {{kind, kcal:<数>}}\n\
+   - food_cycles_min: {{kind, cycles:<数>}}\n\
+   - reachable_min: {{kind, n:<数>}}\n\
+   - dupe_min: {{kind, n:<数>}}\n\
+   - rooms_min: {{kind, key:\"<房间名>\", n:<数>}}\n\
+   - storage_mass_min: {{kind, kg:<数>}}\n\
+   - power_net: {{kind, watts:<数>}}\n\
+   - power_operational: {{kind}}\n\
+   - generator_fueled: {{kind}}\n\
+   - oxygen_producing: {{kind}}\n\
+   - surface_open: {{kind, minY:<地表Y>}}\n\
+   - scout_done: {{kind}}\n\
+   - breath_min: {{kind, value:<数>}}\n\
+   - breath_ratio_min: {{kind, pct:<数>}}\n\
+   - manual: {{kind}}（人工判定，永远不会自动 done）\n\
+   可选 kind 白名单: {}",
         CHECK_KINDS.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ")
     );
     let user = format!(
         "== 本局世界事实 ==\n{brief_text}\n\n== 跨局通用原则（任何地图都适用）==\n{}\n\n== 硬性约束 ==\n\
 1. 产氧设备（氧气扩散器/电解器）需要电力 → 供电节点的 id 必须出现在产氧节点的 requires 里；\n2. 若走研究路线（电解器/藻类箱被研究锁时），必须有建研究站的节点；\n3. 判据用终局量：产氧 = {{kind:oxygen_producing}}；换气 = {{kind:surface_open,minY:<地表Y>}}；\n   卫生 = {{kind:building_min,key:toilets,n:<人数>}}；床位 = {{kind:building_min,key:beds,n:<人数>}}；\n   供电 = {{kind:power_operational}}；食物 = {{kind:food_cycles_min,cycles:<N>}}；\n4. 不得写死坐标：AutoBuild 的 region 一律 \"auto\"；禁止 build/dig/order/auto_connect 动作；\n5. 语义 goal 只能取：scout/material/surface/oxygen/expand/open_chamber/power/research/forage/mop_dirty/element:<元素名>；\n6. 节点数 6~14；requires/unlocks 引用必须存在且构成 DAG；每个节点 1~3 个动作；\n7. 必须覆盖五条生命线：卫生、氧气、食物、居住(床)、电力；survival_node 指向换气/产氧节点；\n
-8. {kinds_line}。\n\n== 输出 schema（字段名必须完全一致）==\n{{\n\
+8. {kinds_line}；\n9. 每个节点**必须**带 success_check 对象（照抄第3条的例子格式），缺失会被校验拒绝。\n\n== 输出 schema（字段名必须完全一致）==\n{{\n\
   \"objective\": \"一句话\", \"survival_node\": \"<id>\", \"author\": \"ai\", \"locked\": true,\n\
   \"nodes\": [{{\"id\": \"T1\", \"name\": \"...\", \"status\": \"todo\", \"requires\": [], \"unlocks\": [],\n\
-    \"actions\": [{{\"kind\": \"auto\", \"goal\": \"...\", \"why\": \"...\"]}},\n\
-    \"success_check\": {{...}}, \"success\": \"人类可读\", \"note\": \"\"]}}\n}}",
+    \"actions\": [{{\"kind\": \"auto\", \"goal\": \"...\", \"why\": \"...\"}}],\n\
+    \"success_check\": {{\"kind\": \"building_min\", \"key\": \"toilets\", \"n\": 3}}, \"success\": \"人类可读\", \"note\": \"\"}}\n}}",
         UNIVERSAL_PRINCIPLES.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
     );
     (system, user)
@@ -478,7 +470,8 @@ pub fn author_opening_plan(
     fp: Option<&str>,
 ) -> Result<String, String> {
     let (system, user) = build_prompts(brief_text);
-    let raw = crate::slow::call_llm(cfg, &system, &user)?;
+    // 开局规划要输出 6~14 个完整节点（含 success_check/actions），4096 会被截断 → 给 16000。
+    let raw = crate::slow::call_llm(cfg, &system, &user, 16000)?;
     let json_text = extract_json(&raw).ok_or("LLM 输出里没有 JSON")?;
     let mut raw_v: Value = serde_json::from_str(json_text).map_err(|e| format!("计划 JSON 解析失败: {e}"))?;
     let mut plan: Plan = serde_json::from_value(raw_v.clone()).map_err(|e| format!("计划 schema 不合法: {e}"))?;

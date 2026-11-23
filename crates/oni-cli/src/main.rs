@@ -85,11 +85,17 @@ fn main() -> ExitCode {
 }
 
 const HELP: &str = r#"oni <子命令>
-  observe            采全局面（多源并行），输出全局态势卡 + 账本 + 趋势
+  serve              ★ 一键启动：快系统 + 慢系统 + Web 控制台(:8789)（主力入口）
+  observe [--cached]  采全局面（多源并行），输出全局态势卡 + 账本 + 趋势
+                    （--cached = 零 MCP 读守护进程快照）
   doctor             连通性 / 建造目录 / 协议自检
   cells <x1,y1,x2,y2>            世界模型逐格诊断（可站/支撑/可达集 vs 实时元素）
+  reach              打印世界模型可达集（与游戏真值不一致时以游戏为准）
+  scout              开局资源侦察：关键资源位置+距离，落盘 scout.json
   plan-check                    依赖图体检：节点 status / 判据 / 假 done 清单
   plan-llm                      手动触发 LLM 开局规划（采事实→生成→校验→落盘）
+  plan-reset                    重开规划：清旧 plan + 局内状态 → 同步生成新开局战略
+  restart [存档索引]             回滚存档 + 重置 plan + 清局内状态 + 开施工窗口
   preflight dig  <x1,y1,x2,y2>   挖掘预检：目标可挖? 有落脚点?
   preflight build <x,y> <Prefab>    建造预检：占格空? 支撑实心? 材料合法?
   plan               按依赖图选本轮唯一目标
@@ -104,6 +110,7 @@ const HELP: &str = r#"oni <子命令>
   raw <oni://URI>        打印任意 MCP 资源的原始 JSON（审计用）
   call <tool> <json>   直接调用任意 MCP 工具（绕过语义封装，调试用）
   agent [--interval N]  常驻循环守护进程（后台跑，不依赖主 agent 的回合速度）
+  slow [--port=N] [--interval=N]   只起慢系统（LLM 决策 + Web 控制台）
   window <秒>          请求开一个施工窗口（守护进程拥有，到点自动冻回暂停）
   hold [原因]          冻结世界（主 agent 改代码期间用）：暂停 + 代理只观察不自动恢复
   release               解除 hold，让代理恢复自主循环
@@ -754,8 +761,8 @@ fn cmd_bus(args: &[String]) -> anyhow::Result<()> {
 
 fn cmd_plan_reset() -> anyhow::Result<()> {
     // ★ 新局不再复制模板 playbook（硬编码套路换地图就不适用，已删除）：
-    //   落一份「待 LLM 规划」占位 —— 快系统采集本局世界事实（opening_brief.json），
-    //   慢系统 LLM 依据事实生成正式计划（author=ai）。
+    //   落一份「待 LLM 规划」占位，随后**同步**采集本局事实并调 LLM 生成正式计划。
+    //   同步 = 消除空窗：reset 返回时 plan 已就绪，不会出现 0 节点死锁期。
     let id = current_save();
     let fp = id.as_ref().map(|i| i.fingerprint.clone());
     if !oni_engine::saveswitch::reset_plan(PLAN, fp.as_deref().unwrap_or("unknown")) {
@@ -763,12 +770,50 @@ fn cmd_plan_reset() -> anyhow::Result<()> {
     }
     // 只清**当前存档**的局内状态；别的存档的缓存在各自的目录里，互不影响。
     oni_engine::saveswitch::clear_save_state();
-    println!("✅ plan.json 已重置为「待 LLM 规划」占位（author=pending_llm，0 节点）");
+    println!("✅ plan.json 已重置（author=pending_llm），正在同步生成开局战略…");
     if let Some(i) = &fp {
         println!("   存档指纹: {}（已写入 plan.json）", i);
     }
-    println!("   已清本存档的局内状态：目标锁 / 侦察报告 / 趋势样本 / 实时快照");
-    println!("   下一步：快系统采集 opening_brief.json → 慢系统 LLM 生成开局战略");
+
+    // LLM 配置与 serve 同源：读 agent.toml（没有则回落到 SlowConfig::default 的
+    //   环境变量 / MCode config.yaml 读取）。
+    let mut cfg = oni_engine::slow::SlowConfig::default();
+    if let Some((_fi, _fw, _si, _port, ep, key, model, fmt)) = read_agent_toml() {
+        if !ep.is_empty() { cfg.endpoint = Some(ep); }
+        if !key.is_empty() { cfg.api_key = Some(key); }
+        if !model.is_empty() { cfg.model = model; }
+        if !fmt.is_empty() { cfg.api_format = fmt; }
+    }
+    if cfg.is_mock() {
+        println!("⚠ 未配置 LLM → 跳过同步规划；plan 保持占位，快系统下一轮会采 brief，慢系统异步重试。");
+        return Ok(());
+    }
+    match connect() {
+        Ok(s) => {
+            let snap = oni_engine::sense::sense(&s);
+            let facts = oni_engine::opening::collect_facts(&s, &snap);
+            let scout_report = oni_engine::autoact::scout_resources(&s, None);
+            let rec = serde_json::json!({
+                "facts": serde_json::to_value(&facts).unwrap_or_default(),
+                "scout": scout_report,
+                "cycle": snap.cycle,
+                "population": snap.dupes.len(),
+            });
+            let brief = serde_json::to_string_pretty(&rec).unwrap_or_default();
+            println!("📋 世界事实已采集（{} 字节）→ 同步调用 LLM 生成开局战略…", brief.len());
+            match oni_engine::opening::author_opening_plan(&cfg, &brief, PLAN, fp.as_deref()) {
+                Ok(msg) => println!("✅ {}", msg),
+                Err(reason) => {
+                    // 失败不 bail：reset 本身已完成；退回原异步路径（快系统采 brief → 慢系统冷却后重试）。
+                    println!("⚠ LLM 开局规划失败：{}", reason);
+                    println!("   plan 保持「待 LLM 规划」占位；快系统下一轮采 brief，慢系统冷却后重试。");
+                }
+            }
+        }
+        Err(e) => {
+            println!("⚠ 连不上游戏（{}）→ 跳过同步规划；plan 保持占位，快系统下一轮采 brief。", e);
+        }
+    }
     Ok(())
 }
 

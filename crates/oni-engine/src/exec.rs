@@ -384,8 +384,23 @@ fn dig_space_for(
     None
 }
 
+/// ★ 汇总各动作结果的真实成败：**任一失败 → 整体失败**。
+///
+/// 为什么必须是这个规则：慢系统的熔断统计读 goal_outcomes.jsonl 的 ok 字段，
+///   ok 恒为 true 时熔断永不触发 → 同一个推不动的目标被无限重复入队
+///   → 快系统恢复→失败→冻回 无限乒乓（实测 material 前沿全是梯子需求）。
+pub fn aggregate_ok(results: &[ActionResult]) -> bool {
+    results.iter().all(|r| r.ok)
+}
+
 pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> ExecOutcome {
     let mut results = Vec::new();
+    // ★ 各分支的**真实**成败由 results 承载，末尾用 aggregate_ok 汇总。
+    //   旧逻辑：函数末尾无条件 `ok: true` → 分支里 push 的 ok:false 被丢掉
+    //   → "无可下单曲"这种零进展被报成成功 → 慢系统以为目标达成 →
+    //   无限重复入队同一个推不动的目标 → 快系统恢复→失败→冻回 无限乒乓
+    //   （实测：material 目标反复"已执行：前沿 N 格无可下单曲…推不动"，
+    //     而 ai_goals.jsonl 里全是 done:true）。
     for a in actions {
         match a {
             Action::Dig { rect, why, auto_ladder, focus } => {
@@ -766,6 +781,8 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                     (false, format!("{}{}前沿 {} 格无可下单曲（全部需梯子或已有标记）→ 零进展，等梯子/复制人消化；该目标当前推不动",
                         note_prefix, out_note, ready.len()))
                 };
+                // 零进展（无可下单曲）用 ok=false → 末尾 aggregate_ok 会让整体失败
+                //   → 触发熔断/上报换方案，不再被硬编码的 ok:true 吞掉。
                 results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok, detail });
             }
             Action::Build { anchor, prefab, size, material, why } => {
@@ -1180,7 +1197,9 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
             }
         }
     }
-    ExecOutcome { results, ok: true }
+    // 汇总：以 results 里的**真实**成败为准 —— 任一失败 → 整体失败。
+    let ok = aggregate_ok(&results);
+    ExecOutcome { results, ok }
 }
 
 /// **真实可达材料**：读 `oni://resources/inventory`。
@@ -1760,6 +1779,31 @@ pub fn bootstrap_material(
 #[cfg(test)]
 mod buildability_tests {
     use super::*;
+
+    /// ★ 回归："零进展"绝不能报成功。
+    ///   旧 bug：execute() 末尾无条件 `ok: true`，分支里 push 的 ok:false 被丢掉
+    ///   → 慢系统收到"已执行"以为目标达成 → 无限重复入队推不动的目标
+    ///   → 快系统恢复→失败→冻回 无限乒乓（实测 material 反复"已执行：前沿 N 格无可下单曲"）。
+    ///   熔断机制靠 goal_outcomes.jsonl 里的 ok 字段统计，ok 恒 true → 熔断永不触发。
+    #[test]
+    fn exec_outcome_aggregates_failure_from_results() {
+        let failed = ActionResult {
+            kind: "dig".into(),
+            why: "采建材".into(),
+            ok: false,
+            detail: "前沿 14 格无可下单曲（全部需梯子或已有标记）→ 零进展".into(),
+        };
+        let ok_hit = ActionResult {
+            kind: "dig".into(),
+            why: "撤销死工单".into(),
+            ok: true,
+            detail: "撤销死工单 @(1,2)".into(),
+        };
+        // 汇总规则：**任一结果失败 → 整体失败**（哪怕同时有成功的附带结果）。
+        assert!(!aggregate_ok(&[failed.clone()]), "单个失败结果必须让整体失败");
+        assert!(!aggregate_ok(&[ok_hit.clone(), failed]), "混合结果里有失败 → 整体必须失败");
+        assert!(aggregate_ok(&[ok_hit]), "全成功才允许整体成功");
+    }
 
     /// 研究优先级表：食物链必须排在产氧前面。
     #[test]
