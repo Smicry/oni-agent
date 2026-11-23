@@ -26,6 +26,11 @@ pub const HORIZON: usize = 3;
 
 /// 窗口失效条件（任一成立 → 下次心跳重算）。
 pub fn window_stale(plan: &Plan, snap_cycle: i64) -> Option<String> {
+    window_stale_with(plan, snap_cycle, None)
+}
+
+/// 带 goal_outcomes 目录的版本：慢系统调用时传 sd，能检测 W1 轨迹不可行。
+pub fn window_stale_with(plan: &Plan, snap_cycle: i64, sd: Option<&std::path::Path>) -> Option<String> {
     let nodes = &plan.nodes;
     if nodes.is_empty() {
         return Some("窗口为空".into());
@@ -35,6 +40,13 @@ pub fn window_stale(plan: &Plan, snap_cycle: i64) -> Option<String> {
     }
     if nodes.iter().all(|n| n.is_done() || n.is_blocked() || n.is_deferred()) {
         return Some("窗口全部 done/blocked/deferred（枷锁效应）".into());
+    }
+    // ★ MPC 本职：W1 的轨迹**不可行**（同一 goal 连续失败 ≥3 次）→ 重算，
+    //   而不是让 LLM 每轮对着一个推不动的 W1 反复试。
+    if let Some(sd) = sd {
+        if let Some(reason) = w1_trajectory_infeasible(plan, sd) {
+            return Some(reason);
+        }
     }
     let born = plan.window_cycle;
     if born == 0 {
@@ -271,9 +283,63 @@ mod tests {
         assert!(window_stale(&p, 11).is_none());
     }
 
+
+    /// MPC 本职：W1 的 goal 连续失败 ≥3 次 → 轨迹不可行 → 窗口重算。
+    #[test]
+    fn w1_repeated_failure_marks_window_stale() {
+        let dir = std::env::temp_dir().join(format!("oni_w1_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = plan(vec![node("W1", "todo", vec![]), node("W2", "todo", vec!["W1"])], 10);
+        let mut w1 = p.clone(); w1.nodes[0].actions = vec![crate::exec::Action::Auto { goal: "material".into(), why: String::new() }];
+        // 无 outcomes → 不过期
+        let _ = std::fs::remove_file(dir.join("goal_outcomes.jsonl"));
+        assert!(super::w1_trajectory_infeasible(&w1, &dir).is_none());
+        // 连续 2 次失败 → 还没到阈值
+        let two = (0..2).map(|i| format!("{{\"goal\":\"material\",\"ok\":false,\"detail\":\"x\",\"ts\":{}}}", 100 + i)).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.join("goal_outcomes.jsonl"), &two).unwrap();
+        assert!(super::w1_trajectory_infeasible(&w1, &dir).is_none(), "2 次不应触发");
+        // 连续 3 次失败 → 不可行
+        let three = format!("{}\n{{\"goal\":\"material\",\"ok\":false,\"detail\":\"x\",\"ts\":103}}", two);
+        std::fs::write(dir.join("goal_outcomes.jsonl"), &three).unwrap();
+        let r = super::w1_trajectory_infeasible(&w1, &dir);
+        assert!(r.is_some() && r.unwrap().contains("material"), "3 次应触发重算");
+        // 中间有成功 → 计数中断，不触发
+        let with_ok = format!("{}\n{{\"goal\":\"material\",\"ok\":true,\"detail\":\"ok\",\"ts\":104}}\n{{\"goal\":\"material\",\"ok\":false,\"detail\":\"x\",\"ts\":105}}", three);
+        std::fs::write(dir.join("goal_outcomes.jsonl"), &with_ok).unwrap();
+        assert!(super::w1_trajectory_infeasible(&w1, &dir).is_none(), "成功应中断计数");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn w1_must_be_executable_now() {
         let bad = plan(vec![node("W1", "todo", vec!["W2"]), node("W2", "todo", vec![])], 1);
         assert!(validate_window(&bad).iter().any(|e| e.contains("W1 不得有 requires")));
     }
+}
+
+
+/// W1（第一个可执行节点）的 goal 是否**连续失败 ≥3 次**。
+/// 读 goal_outcomes.jsonl 从最新往回数，同一 goal 连续 ok=false 的条数（遇到成功即停）。
+pub fn w1_trajectory_infeasible(plan: &Plan, sd: &std::path::Path) -> Option<String> {
+    let done: std::collections::HashSet<&str> = plan.nodes.iter().filter(|n| n.is_done()).map(|n| n.id.as_str()).collect();
+    let w1 = plan.nodes.iter().find(|n| {
+        !n.is_done() && !n.is_blocked() && !n.is_deferred()
+            && n.requires.iter().all(|r| done.contains(r.as_str()))
+    })?;
+    let goal = w1.actions.iter().find_map(|a| match a {
+        crate::exec::Action::Auto { goal, .. } => Some(goal.as_str()),
+        _ => None,
+    })?;
+    let text = std::fs::read_to_string(sd.join("goal_outcomes.jsonl")).ok()?;
+    let mut fails = 0usize;
+    for line in text.lines().rev() {
+        let Ok(o) = serde_json::from_str::<Value>(line) else { continue };
+        if o.get("goal").and_then(|v| v.as_str()) != Some(goal) { continue; }
+        if o.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) { break; }
+        fails += 1;
+        if fails >= 3 {
+            return Some(format!("W1「{}」goal={} 连续失败 {} 次 → 轨迹不可行，重算", w1.name, goal, fails));
+        }
+    }
+    None
 }

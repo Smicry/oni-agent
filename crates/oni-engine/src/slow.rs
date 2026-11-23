@@ -790,6 +790,59 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
     crate::commands::push_ai_goal(goal, reason) != 0
 }
 
+/// ★ 大脑→线控的**接口契约**：LLM 的 commands 只允许两类，其余拒绝并回执原因。
+///
+/// 为什么（v3 原则 0.2/0.3）：大脑不直接控制电机。LLM 下 `build Outhouse --apply`（无坐标）、
+/// `use toilet 128,192`（不存在的命令）会**静默失败**——它不知道自己没做成，下一轮还试。
+/// 智驾里大脑给导航的是目的地，不是电机扭矩。
+///
+/// 放行：
+///   ① 带坐标的精确工单：`build x,y Prefab [Mat] [--apply]`、`order 挖 @(x,y):N`、`preflight ...`
+///   ② 元命令：window / policy / hold / release / pause / resume / resolve / decision / note
+/// 拒绝：无坐标的 build、不存在的子命令、任何"use/让/去"类自然语言
+pub fn validate_llm_command(cmd: &str) -> Result<Vec<String>, String> {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let Some(sub) = parts.first() else { return Err("空命令".into()) };
+    // 坐标形式："x,y" / "@(x,y)" / "@(x,y):优先级" —— 扫描字符串找 "数字,数字" 对，不手拆 token
+    let b: Vec<char> = cmd.chars().collect();
+    let has_coord = (0..b.len()).any(|i| {
+        if b[i] != ',' || i == 0 || i + 1 >= b.len() { return false; }
+        let digits_before = b[..i].iter().rev().take_while(|c| c.is_ascii_digit()).count();
+        let digits_after = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        digits_before > 0 && digits_after > 0
+    });
+    match *sub {
+        // 精确工单：必须有坐标
+        "build" | "order" | "preflight" | "dig" | "probe" => {
+            if has_coord { Ok(parts.iter().map(|s| s.to_string()).collect()) }
+            else { Err(format!("'{sub}' 需要坐标（如 build 135,192 Outhouse SandStone --apply / order 挖 @(120,195):9）。建造请改用 goal（toilet/oxygen/...），坐标由执行器算")) }
+        }
+        // 元命令：不需要坐标
+        "window" | "policy" | "hold" | "release" | "pause" | "resume" | "resolve"
+        | "decision" | "note" | "command" | "escalations" | "plan-check" => Ok(parts.iter().map(|s| s.to_string()).collect()),
+        _ => Err(format!("'{sub}' 不是可执行的 oni 子命令。可用：带坐标的 build/order/preflight，或元命令 window/policy/resolve。建造走 goal")),
+    }
+}
+
+#[cfg(test)]
+mod llm_command_tests {
+    use super::validate_llm_command;
+    #[test]
+    fn precise_orders_pass_and_vague_ones_are_rejected_with_reason() {
+        assert!(validate_llm_command("build 135,192 Outhouse SandStone --apply").is_ok());
+        assert!(validate_llm_command("order 挖 @(120,195):9").is_ok());
+        assert!(validate_llm_command("window 90").is_ok());
+        assert!(validate_llm_command("policy set co2_max_kg=3").is_ok());
+        // 实测 LLM 下过的三条无效命令，全部要被拒且给出可操作的原因
+        let e1 = validate_llm_command("build Outhouse --apply").unwrap_err();
+        assert!(e1.contains("坐标") && e1.contains("goal"), "{e1}");
+        let e2 = validate_llm_command("use toilet 128,192").unwrap_err();
+        assert!(e2.contains("不是可执行"), "{e2}");
+        let e3 = validate_llm_command("build Toilet --apply").unwrap_err();
+        assert!(e3.contains("坐标"), "{e3}");
+    }
+}
+
 fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String {
     let mut log = Vec::new();
     // ★ 策略调整落地：慢系统直接改选址判据（落盘 + 立刻对快系统生效）。
@@ -844,9 +897,15 @@ fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String
         log.push(format!("ai_goal[{}]:已入队(快系统执行)", dec.goal));
     }
     for c in &dec.commands {
-        let parts: Vec<&str> = c.split_whitespace().collect();
-        if parts.is_empty() { continue; }
-        log.push(format!("$ oni {}: {}", c, run_oni(&parts)));
+        // ★ 接口契约：大脑只能给带坐标的精确工单或元命令，其余拒绝并把原因回执进对话流，
+        //   否则 LLM 不知道自己没做成，下一轮还会试（实测 $ oni build Outhouse --apply 静默失败三次）。
+        match validate_llm_command(c) {
+            Ok(parts) => {
+                let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                log.push(format!("$ oni {}: {}", c, run_oni(&refs)));
+            }
+            Err(reason) => log.push(format!("⛔ 拒绝 LLM 命令 '{}': {}", c, reason)),
+        }
     }
     // 只要有 escalation 就 resolve —— 慢系统看过即解冻，不管选了什么动作。
     // 只要看过就 resolve，保持 pending 队列干净（慢系统不阻塞快系统）。
@@ -1262,7 +1321,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         //   滚动窗口只要 3 节点 / 8000 token，比 14 节点的 opening 图稳得多。
         let author = plan.as_ref().and_then(|p| p.author.as_deref()).unwrap_or("");
         let author_is_ai = author == "ai" || author == "pending_llm";
-        let stale = plan.as_ref().and_then(|p| crate::window::window_stale(p, snap_cycle));
+        let stale = plan.as_ref().and_then(|p| crate::window::window_stale_with(p, snap_cycle, Some(&sd)));
         eprintln!("[window:diag] plan_loaded={} author_is_ai={} stale={:?} mock={}", plan.is_some(), author_is_ai, stale, cfg.is_mock());
         // 只对 AI 产的 plan 做滚动刷新；opening 占位（pending_llm）由上面的开局分支处理。
         // mock 模式不调 LLM（测试环境无端点）。

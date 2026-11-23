@@ -103,16 +103,21 @@ impl Cell {
         if self.is_solid() {
             return false; // 实心岩住不了人
         }
+        // ★ 液体格一律不住人：mod 的元素字段在"有薄层污水"时仍报主导气体为 Oxygen，
+        //   旧判定于是把厕所/床建在污染水里（实测两座 Outhouse 泡在 DirtyWater 里，
+        //   入口被淹，复制人宁可膀胱 100% 也不用）。人要待的格子必须干燥。
+        if self.is_liquid() {
+            return false;
+        }
         let el = self.element.as_str();
         // element 为空 = **读不到数据**（batch fetch 漏格），
         //   不能当成"安全"—— AGENTS.md §9：读不到数据 ≠ 数据是极值。
-        //   代理把床建在 (131,189)正是因为那格没读到元素，
-        //   element 空 -> 判"安全" -> 严格筛选失效 -> 复制人睡在 CO2 里 -> 。
         if el.is_empty() {
             return false;
         }
         if matches!(el, "Oxygen" | "氧气" | "OxygenGas" | "PureOxygen") {
-            return true;
+            // 氧气还要**够呼吸**（质量 ≥0.3kg）：近真空格元素名也是 Oxygen，人爬上去窒息。
+            return self.has_breathable_mass();
         }
         if matches!(el, "CarbonDioxide" | "二氧化碳") {
             return self.mass_kg < 0.05; // 人待在里面会慢慢掉呼吸 -> 一律不行
@@ -222,5 +227,17 @@ mod tests {
     #[test]
     fn unknown_element_is_not_safe() {
         assert!(!cell("", 0.0).is_safer_for_occupied());
+    }
+
+    /// ★ 回归：液体格不住人，哪怕主导气体是氧气。
+    ///   实测两座 Outhouse 建在 DirtyWater 里（mod 元素字段报 Oxygen），
+    ///   入口被淹，复制人膀胱 100% 也不用。
+    #[test]
+    fn liquid_cell_is_never_safe_for_occupied_even_if_oxygen_dominant() {
+        let mut c = cell("Oxygen", 1.6);
+        c.state = "liquid".into();
+        assert!(!c.is_safer_for_occupied(), "有液体的格子不能建厕所/床");
+        // 近真空的氧气格也不能住人（元素名对但质量不够）
+        assert!(!cell("Oxygen", 0.05).is_safer_for_occupied());
     }
 }
