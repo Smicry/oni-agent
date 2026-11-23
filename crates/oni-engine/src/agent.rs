@@ -1127,139 +1127,31 @@ impl Agent {
 
         // 救援模式优先于保命模式：有人倒地时，先救倒下的，再谈产氧/换气。
         // 实时调度优先：Level>=2（紧急/救命）时，**抢占**静态计划。
+        // ★ v3 阶段 1：**Urgent 不再在 plan 里做字符串匹配**（删除 19 处 tag.contains）。
+        //   为什么：意图到节点的翻译靠 `tag.contains("厕所")`，LLM 换个说法就断
+        //   （实测 T1 的 why 含"厕所"→ Urgent 建厕所误匹配到采建材节点 → 真正的
+        //   卫生节点永远轮不上）。v3 的分工：**安全壳反射弧**负责保命，
+        //   plan 只负责非紧急的战略推进，两者不再靠自然语言耦合。
+        //   唯一保留的 plan 抢占：LLM 显式标记的 `rescue` 节点（结构化字段，不是字符串）。
         let picked_by_scheduler = if directive.level >= crate::priority::Level::Urgent {
-            let want = directive.action;
-            // ：氧气续航告急时禁止扩张性挖掘 —— 跳过"换气/地表/挖矿"节点，
-            //   否则代理越缺氧越挖，暴露地下 CO₂ 让氧气掉得更快（死亡螺旋）。
-            //   产氧节点不受此限（它产值不扩张）。
             if directive.forbid_expansion {
                 report.notes.push(
-                    "🚫 氧气续航告急 → 禁止扩张性挖掘（跳过换气/地表/挖矿节点，只做产氧/救援/食物）".into(),
+                    "🚫 氧气续航告急 → 禁止扩张性挖掘（只做产氧/救援/食物）".into(),
                 );
             }
             plan.nodes
                 .iter()
-                .find(|n| n.rescue && !n.is_done() && !n.is_blocked())
+                .find(|n| n.rescue && !n.is_done() && !n.is_blocked() && !n.is_deferred())
                 .cloned()
-                .or_else(|| {
-                    plan.nodes
-                        .iter()
-                        .find(|n| {
-                            // 二次修正：
-                            //   旧逻辑把 done 节点一律跳过 → T1 建了 1 座厕所就 done，
-                            //   但 3 人膀胱告急时**还需要第 2/3 座** → Urgent 喊「建厕所」
-                            //   却匹配不到任何节点 → 回落常规计划 → 膀胱涨到 100% → 随地排泄
-                            //   → 污染水
-                            //   正解：**膀胱告急时允许复活 done 的卫生节点**（条件已重新告急）。
-                            let is_toilet_urgent = matches!(
-                                want,
-                                crate::priority::Action::BuildToilet
-                            );
-                            if n.is_done() && !is_toilet_urgent {
-                                return false;
-                            }
-                            if n.is_blocked() {
-                                return false;
-                            }
-                            // ★ tag 只取节点的**语义身份**（名称 + 动作的 goal/prefab），
-                            //   **不含动作的 why 文案**。
-                            //   为什么：why 是给人和 LLM 看的解释文本，里面的词是**偶然**的 ——
-                            //   实测 T1「浅层建材自举」的 why 里写了"厕所、梯子、砖块都需要建材"，
-                            //   于是 Urgent「建厕所」匹配到了 T1（采建材）而不是 T2（卫生前置：三人厕所）→
-                            //   每轮把 T1 复活成 done → T2 永远轮不上 → 厕所永远建不成。
-                            let tag = format!(
-                                "{} {}",
-                                n.name,
-                                n.actions
-                                    .iter()
-                                    .map(action_identity)
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            );
-                            // ：禁止扩张时跳过换气/地表/挖矿类节点
-                            if directive.forbid_expansion
-                                && (tag.contains("换气") || tag.contains("地表") || tag.contains("挖矿"))
-                                && !tag.contains("产氧")
-                            {
-                                return false;
-                            }
-                            match want {
-                                crate::priority::Action::Rescue => {
-                                    // 人在 CO₂/污染格里时正解是"换气/产氧把人带出来"，
-                                    //   只匹配"救援擦排"会在救援节点 done 后匹配失败
-                                    //   静默回落到常规计划 → 紧急态被稀释。
-                                    tag.contains("救援")
-                                        || tag.contains("擦")
-                                        || tag.contains("排")
-                                        || tag.contains("换气")
-                                        || tag.contains("地表")
-                                        || tag.contains("空气")
-                                        || tag.contains("产氧")
-                                        || tag.contains("氧石")
-                                }
-                                crate::priority::Action::Ventilate => {
-                                    tag.contains("换气") || tag.contains("地表") || tag.contains("空气")
-                                }
-                                crate::priority::Action::ProduceOxygen => {
-                                    tag.contains("产氧") || tag.contains("氧石")
-                                }
-                                crate::priority::Action::ForageFood => {
-                                    tag.contains("食物") || tag.contains("采集")
-                                }
-                                crate::priority::Action::Power => {
-                                    tag.contains("供电") || tag.contains("发电")
-                                }
-                                crate::priority::Action::BuildToilet => {
-                                    // 膀胱告急 → 必须匹配到"卫生/厕所/旱厕"节点。
-                                    //   没有厕所 → 随地排泄 → 污染水
-                                    // T1 名字写「旱厕」而非「厕所」，旧匹配只认
-                                    //   「厕所/卫生/如厕」→ Urgent 喊建厕所却匹配不到 → 回落 → 膀胱 100%。
-                                    //   同时认 Outhouse prefab（无论节点名怎么写）。
-                                    tag.contains("厕所")
-                                        || tag.contains("卫生")
-                                        || tag.contains("如厕")
-                                        || tag.contains("旱厕")
-                                        || tag.contains("Outhouse")
-                                }
-                                crate::priority::Action::FollowPlan => false,
-                            }
-                        })
-                        .cloned()
-                })
         } else {
             None
         };
-
-        // 调度器抢了紧急态但匹配不到节点 → 必须显式报告，
-        //   不能静默回落让人以为"紧急态已被处理"。
         if directive.level >= crate::priority::Level::Urgent && picked_by_scheduler.is_none() {
             report.notes.push(format!(
-                "⚠ 调度[{:?}] 找不到匹配节点（动作 {:?}）→ 回落常规计划；请检查 plan 是否覆盖该场景",
+                "🛡 调度[{:?}]（{:?}）→ 安全壳反射弧接管（不再做 plan 字符串匹配）",
                 directive.level, directive.action
             ));
-            // 效果回执：
-            //   Urgent 喊出"建厕所"却匹配不到节点 = 紧急态形同虚设；
-            //   旧逻辑只写一行日志 → 看着像在抢救，实际膀胱涨到 100%。
-            //   现在升级为 escalation + bus，慢系统一定能看见并处理。
-            let _ = crate::escalate::raise(
-                crate::escalate::Kind::StrategyMismatch,
-                "",
-                format!("Urgent 动作 {:?} 找不到匹配节点：{}（紧急态被静默降级）",
-                    directive.action, directive.reason),
-                "请检查 plan 是否覆盖该紧急场景（节点名/动作标签）".into(),
-                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
-                    oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
-            );
         }
-        // 修正：**Urgent 抢占必须尊重依赖图**。
-        //   旧行为：膀胱告急 → 直接选中"建厕所"节点 → 但它的前置（挖空间/铺砖）
-        //   还没做 → 预检必不过 → 每轮失败 → 每轮升级 → 每轮冻结 → 噪声不断。
-        //   正解：抢占到的节点若前置未完成 → **改为执行它的前置**（逐级回溯）。
-        // ★ 紧急抢占必须尊重依赖图 —— **但有例外**。
-        //   若被回溯到的前置**已被熔断（blocked）或暂缓（deferred）**，依赖链走不通：
-        //   继续执行它只会重复一次注定失败的施工（实测 T1 熔断 → Urgent 建厕所
-        //   变成"执行 T1" → 厕所永远建不成 → 膀胱爆表）。
-        //   此时保命**不等它** → 标记 chain_blocked，改走内置保命反射弧。
         let mut urgent_chain_blocked = false;
         let picked_by_scheduler = picked_by_scheduler.map(|n| {
             let mut cur = n;
