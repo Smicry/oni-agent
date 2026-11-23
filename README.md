@@ -131,10 +131,16 @@ This repo ships a project-level Skill and helper scripts for [MCode](https://www
 在 AI 开启时会被代理自动恢复——要真正停住应改用 `oni hold`。
 
 ## Docs
+
+Start at [`docs/README.md`](docs/README.md) (index).
+
+- [`docs/architecture-v3.md`](docs/architecture-v3.md) — **architecture**: LLM drives / rolling window / safety shell; why the v2 rule engine failed
+- [`docs/FAST_SLOW_CONTRACT.md`](docs/FAST_SLOW_CONTRACT.md) — fast/slow contract (the single authority; code yields to it)
+- [`docs/dual-system.md`](docs/dual-system.md) / [`docs/coordination.md`](docs/coordination.md) — handoff protocol, bus design, pause semantics
 - [`AGENTS.md`](AGENTS.md) — engineering rules for agents working in this repo
 - [`docs/knowledge-base.md`](docs/knowledge-base.md) — sourced ONI mechanics
-- [`docs/coordination.md`](docs/coordination.md) — fast/slow system coordination
 - [`design/graph-model.md`](design/graph-model.md) — chamber graph design
+- `docs/archive/` — superseded designs (v2 rule-based planner), kept for provenance only
 
 ## Requirements
 
