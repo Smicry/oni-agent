@@ -37,7 +37,12 @@ pub fn window_stale(plan: &Plan, snap_cycle: i64) -> Option<String> {
         return Some("窗口全部 done/blocked/deferred（枷锁效应）".into());
     }
     let born = plan.window_cycle;
-    if born > 0 && snap_cycle - born >= 2 {
+    if born == 0 {
+        // window_cycle=0 且非空 → 这是 v2 时代的**静态 DAG**（不是滚动窗口），
+        // 必须升级：它的 requires 长链在世界变化后就是枷锁。
+        return Some("旧静态 plan（非滚动窗口）→ 升级为 horizon-3 窗口".into());
+    }
+    if snap_cycle - born >= 2 {
         return Some(format!("窗口已跨 {} 周期", snap_cycle - born));
     }
     None
@@ -75,6 +80,30 @@ fn recent_outcomes(sd: &std::path::Path, n: usize) -> String {
         })
         .collect();
     if picked.is_empty() { "（暂无执行记录）".into() } else { picked.join("\n") }
+}
+
+/// 校验前先**适配 LLM 的常见写法偏差**（契约层容错，而非拒绝）。
+///
+/// 实测：LLM 把自然语言前置条件（"存在可安全移动的复制人"）写进了 `requires` 数组，
+/// 而规范是 `requires` 只放节点 ID、前置条件文本放 `pre` 字段。
+/// 拒绝整份窗口会让殖民地继续跑旧 DAG（更糟）；自动迁移才是正确做法。
+pub fn adapt_window(plan: &mut Plan) -> Vec<String> {
+    let ids: std::collections::HashSet<String> = plan.nodes.iter().map(|n| n.id.clone()).collect();
+    let mut notes = Vec::new();
+    for n in &mut plan.nodes {
+        let (valid, prose): (Vec<String>, Vec<String>) = n
+            .requires
+            .iter()
+            .cloned()
+            .partition(|r| ids.contains(r));
+        if !prose.is_empty() {
+            notes.push(format!("{}: {} 条自然语言前置从 requires 迁移到 pre", n.id, prose.len()));
+            n.requires = valid;
+            let merged = prose.join("；");
+            n.note = if n.note.is_empty() { merged } else { format!("{}；{}", n.note, merged) };
+        }
+    }
+    notes
 }
 
 /// 校验滚动窗口（比 opening 的全局校验轻：不要求五条生命线全覆盖，那是安全壳的事）。
@@ -122,15 +151,25 @@ pub fn refresh_window(cfg: &SlowConfig, brief: &str, plan_path: &str, fp: Option
     }
     let mut plan: Plan = serde_json::from_value(v.clone()).map_err(|e| format!("窗口 schema 不合法: {e}"))?;
     let repairs = crate::opening::repair_plan_checks(&mut plan);
+    let adapted = adapt_window(&mut plan);
     let errs = validate_window(&plan);
     if !errs.is_empty() {
         let names: Vec<String> = plan.nodes.iter().map(|n| format!("{}({})", n.id, n.name.chars().take(10).collect::<String>())).collect();
         return Err(format!("窗口校验未通过（{} 条）：{}；节点：{}", errs.len(), errs.join("；"), names.join("、")));
     }
-    std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default())
+    // 落盘**适配后**的 plan（而不是原始 v）：否则 requires 里的自然语言会原样写回，
+    //   decide() 读到 requires 不存在的节点 → 整张窗口被当成死锁。
+    let mut out_v = serde_json::to_value(&plan).map_err(|e| format!("窗口序列化失败: {e}"))?;
+    if let (Some(o), Some(src_o)) = (out_v.as_object_mut(), v.as_object()) {
+        for k in ["window_cycle", "save_fingerprint", "objective"] {
+            if let Some(x) = src_o.get(k) { o.insert(k.to_string(), x.clone()); }
+        }
+    }
+    std::fs::write(plan_path, serde_json::to_string_pretty(&out_v).unwrap_or_default())
         .map_err(|e| format!("写盘失败: {e}"))?;
     let mut msg = format!("滚动窗口已刷新（{} 步，周期 {}）", plan.nodes.len(), cycle);
     if !repairs.is_empty() { msg.push_str(&format!("；⚠ {} 条判据降级 manual", repairs.len())); }
+    if !adapted.is_empty() { msg.push_str(&format!("；适配 {} 处 requires→pre", adapted.len())); }
     Ok(msg)
 }
 

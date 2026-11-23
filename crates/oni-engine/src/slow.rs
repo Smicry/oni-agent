@@ -1163,13 +1163,14 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
             .ok().and_then(|t| serde_json::from_str(&t).ok());
         let author_is_ai = plan.as_ref().map(|p| p.author.as_deref() == Some("ai")).unwrap_or(false);
         let stale = plan.as_ref().and_then(|p| crate::window::window_stale(p, snap_cycle));
+        eprintln!("[window:diag] plan_loaded={} author_is_ai={} stale={:?} mock={}", plan.is_some(), author_is_ai, stale, cfg.is_mock());
         // 只对 AI 产的 plan 做滚动刷新；opening 占位（pending_llm）由上面的开局分支处理。
         // mock 模式不调 LLM（测试环境无端点）。
         if author_is_ai && stale.is_some() && !cfg.is_mock() {
-            let brief = std::fs::read_to_string(sd.join("opening_brief.json"))
-                .or_else(|_| std::fs::read_to_string(sd.join("opening_brief.done")))
-                .unwrap_or_default();
-            if !brief.is_empty() {
+            // 事实来源：**优先用当前快照**（滚动窗口要的是"现在"，不是开局时的 brief）。
+            //   开局 brief 成功后会被重命名为 .done 或被 plan-reset 清掉，不能依赖它。
+            let brief = format!("当前局面（cycle {}）：{}", snap_cycle, serde_json::to_string_pretty(&snap).unwrap_or_default());
+            {
                 let fp = oni_mcp::save::last_seen().map(|s| s.fingerprint);
                 match crate::window::refresh_window(cfg, &brief, plan_path, fp.as_deref(), snap_cycle, &sd) {
                     Ok(summary) => {
