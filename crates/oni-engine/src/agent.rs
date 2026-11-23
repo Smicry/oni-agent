@@ -1209,7 +1209,15 @@ pub fn cycle(&mut self) -> CycleReport {
         //     ② plan 里根本没有匹配节点（plan-reset 后 LLM 还没出图，0 节点）。
         //   两种情况都改为：直接执行**内置保命反射弧**（不依赖 plan 的语义动作）。
         //   命中了可执行的 plan 节点时仍走 plan（它可能有更完整的施工流程）。
+        // ★ v3 协调：窗口已覆盖该红线 → 让规划器走（它有完整流程），反射弧只兜底。
+        let covered = window_covers_urgent(&plan.nodes, directive.action);
+        if covered {
+            report.notes.push(
+                format!("🪟 调度[{:?}] 已被滚动窗口覆盖 → 交给规划器执行（反射弧不抢占）", directive.action.label()),
+            );
+        }
         if directive.level >= crate::priority::Level::Urgent
+            && !covered
             && (urgent_chain_blocked || picked_by_scheduler.is_none())
         {
             let vital = vital_reflex_actions(directive.action);
@@ -2234,6 +2242,32 @@ pub fn has_unexecutable_predecessor(node: &crate::decide::Node, plan: &[crate::d
     })
 }
 
+/// v3：**安全壳与规划器的协调**——窗口是否已覆盖当前 Urgent 红线？
+///
+/// 问题（实测）：膀胱 100% 触发 Urgent → 安全壳反射弧每轮抢占并 return →
+///   滚动窗口的 W1「建造厕所」**永远没机会执行**（日志里一直 `节点=-`）。
+///   反射弧只有"挖一格"的简版流程，而 W1 有完整的"挖空间 → 建"流程——
+///   两者目标一致时，**让规划器走**，它做得更好；反射弧只负责窗口没覆盖的红线。
+///
+/// 判据（结构化，不做字符串匹配）：
+///   窗口里有节点满足 ① 现在可执行（requires 全 done、自身非 done/blocked/deferred）
+///   ② 其某个动作的语义身份与 Urgent 反射弧的语义目标一致（用 action_identity 比较）。
+pub fn window_covers_urgent(plan: &[crate::decide::Node], urgent: crate::priority::Action) -> bool {
+    let reflex = vital_reflex_actions(urgent);
+    if reflex.is_empty() {
+        return false;
+    }
+    let reflex_ids: std::collections::HashSet<String> = reflex.iter().map(action_identity).collect();
+    let done: std::collections::HashSet<&str> = plan.iter().filter(|n| n.is_done()).map(|n| n.id.as_str()).collect();
+    plan.iter().any(|n| {
+        if n.is_done() || n.is_blocked() || n.is_deferred() {
+            return false;
+        }
+        let ready = n.requires.iter().all(|r| done.contains(r.as_str()));
+        ready && n.actions.iter().any(|a| reflex_ids.contains(&action_identity(a)))
+    })
+}
+
 /// v3：保命反射归安全壳（reflex.rs）。此处保留薄包装供既有调用点与测试使用。
 pub fn vital_reflex_actions(action: crate::priority::Action) -> Vec<crate::exec::Action> {
     crate::reflex::vital_reflex(action)
@@ -2622,6 +2656,38 @@ mod tests {
         assert_eq!(derive_run_state(false, false, false, false, true), RunState::Stopped);
         // 正常运行
         assert_eq!(derive_run_state(false, false, false, false, false), RunState::Running);
+    }
+
+
+    /// v3 协调：窗口已覆盖红线时，反射弧不得抢占规划器。
+    ///   实测事故：膀胱 100% → 反射弧每轮抢占 → W1「建造厕所」永远执行不到。
+    #[test]
+    fn window_covering_urgent_yields_to_planner() {
+        use crate::decide::Node;
+        use crate::exec::Action;
+        use crate::priority::Action as PAction;
+        let w1 = Node {
+            id: "W1".into(), name: "建造厕所".into(), status: "todo".into(),
+            requires: vec![], unlocks: vec![],
+            actions: vec![Action::Auto { goal: "toilet".into(), why: String::new() }],
+            success_check: None, success: String::new(), rescue: false, note: String::new(),
+            priority: None, deferred: None, deferred_at: None, stall: None,
+        };
+        // W1 无前置、目标一致 → 窗口覆盖了「建厕所」红线 → 反射弧让位
+        assert!(super::window_covers_urgent(&[w1.clone()], PAction::BuildToilet));
+        // 但不覆盖「产氧」红线（目标不一致）→ 反射弧该上
+        assert!(!super::window_covers_urgent(&[w1.clone()], PAction::ProduceOxygen));
+        // W1 已 done → 不覆盖
+        let mut done = w1.clone(); done.status = "done".into();
+        assert!(!super::window_covers_urgent(&[done], PAction::BuildToilet));
+        // W1 被暂缓 → 不覆盖（否则规划器选不出它，反射弧又被挡 → 双重死锁）
+        let mut deferred = w1.clone(); deferred.deferred = Some("x".into());
+        assert!(!super::window_covers_urgent(&[deferred], PAction::BuildToilet));
+        // W1 有未完成前置 → 不覆盖（它现在不可执行）
+        let mut blocked_w1 = w1.clone(); blocked_w1.requires = vec!["W0".into()];
+        assert!(!super::window_covers_urgent(&[blocked_w1], PAction::BuildToilet));
+        // 空窗口 → 不覆盖
+        assert!(!super::window_covers_urgent(&[], PAction::BuildToilet));
     }
 
     #[test]
