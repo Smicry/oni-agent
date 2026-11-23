@@ -20,6 +20,8 @@ pub mod autoact;
 pub mod decide;
 pub mod live;
 pub mod priority;
+pub mod reflex;
+pub mod window;
 pub mod exec;
 pub mod audit;
 pub mod bus;

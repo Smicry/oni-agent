@@ -293,16 +293,8 @@ impl Agent {
     ///   快照是批量采集的，采集与判定之间有秒级间隔；本函数在判定点重新读一次
     ///   （1s TTL → 判定时基本必读实时值），避免用陈旧状态决定"世界在不在跑"。
     fn game_paused(&self) -> bool {
-        self.session
-            .read_json("oni://colony/status")
-            .ok()
-            .and_then(|v| {
-                let paused = v.get("isPaused").and_then(|b| b.as_bool()).unwrap_or(false);
-                let speed = v.get("gameSpeed").and_then(|s| s.as_f64()).unwrap_or(-1.0);
-                // 任一信号说停 → 判停（保守：宁可不下工单，也不可在停着的世界里下单）
-                Some(paused || (speed >= 0.0 && speed <= 0.0))
-            })
-            .unwrap_or(false)
+        // v3：世界状态判定归安全壳（reflex.rs），只问传感器，不推断。
+        crate::reflex::world_paused(&self.session)
     }
 
     /// A: 工单积压 + 全员闲看门 —— 在**执行闸门之前**运行。
@@ -480,7 +472,16 @@ impl Agent {
     ///   → 那张工单永远不会被执行（游戏是暂停的）
     ///   → 指纹永远不变 → 连续 3 轮"零进展" → **误熔断好节点**
     ///   → 依赖图死锁 → 殖民地彻底停摆。
-    pub fn cycle(&mut self) -> CycleReport {
+    /// v3：统一在出口派生运行状态——无论 cycle_inner 从哪个分支 return，
+/// report.run_state 都反映**本轮结束时**的真实状态（供日志/测试断言）。
+pub fn cycle(&mut self) -> CycleReport {
+    let mut report = self.cycle_inner();
+    report.run_state = derive_run_state(
+        hold_active(), self.danger_cycle, self.paused_by_us, self.frozen, self.idle_stopped);
+    report
+}
+
+    fn cycle_inner(&mut self) -> CycleReport {
         self.cycles += 1;
         // ---- 换存档检测（每轮最先做）----------------------------------
         // 指纹变了 = 换了一局 → 旧计划归档 + 计划按模板重置 +
@@ -528,6 +529,7 @@ impl Agent {
             acted: false,
             node: None,
             notes: Vec::new(),
+            run_state: RunState::Running,
         };
         if let Some(msg) = save_switch {
             report.notes.push(msg);
@@ -1967,6 +1969,51 @@ pub fn issued_work(out: &crate::exec::ExecOutcome) -> bool {
     })
 }
 
+/// v3 运行状态（**观测用单一真相源**，从既有 bool 派生）。
+///
+/// 为什么先做"派生视图"而不是直接删 bool：状态 bool 有 40+ 处写入点，
+/// 一次性重构成 3 态枚举每处都是行为改变、没有集成测试兜底。
+/// 先让状态**可见**（日志 / 测试可断言），再收敛——自动驾驶改状态机也是先加 observability。
+///
+/// 三态定义（契约 §5）：
+/// - `Running`：世界在跑，代理执行
+/// - `PausedByHold`：用户总开关（唯一受保护的停止）
+/// - `PausedByDanger`：紧急态占空比（冻 20s 取快照 → 跑 120s）
+///   附带 `Frozen`（施工窗口到期冻回，自持续窗）与 `Stopped`（动作失败且无待办，等介入）
+///   作为"世界停着但非 hold/危险"的子态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    Running,
+    PausedByHold,
+    PausedByDanger { phase: &'static str },
+    Frozen,
+    Stopped,
+}
+
+impl RunState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunState::Running => "Running",
+            RunState::PausedByHold => "PausedByHold",
+            RunState::PausedByDanger { phase } => phase,
+            RunState::Frozen => "Frozen(窗口到期)",
+            RunState::Stopped => "Stopped(失败无待办)",
+        }
+    }
+}
+
+/// 从既有状态 bool 派生 v3 三态（纯函数，可单测）。
+pub fn derive_run_state(hold: bool, danger_cycle: bool, paused_by_us: bool,
+    frozen: bool, idle_stopped: bool) -> RunState {
+    if hold { return RunState::PausedByHold; }
+    if danger_cycle {
+        return RunState::PausedByDanger { phase: if paused_by_us { "Danger(冻结期)" } else { "Danger(运行期)" } };
+    }
+    if frozen { return RunState::Frozen; }
+    if idle_stopped { return RunState::Stopped; }
+    RunState::Running
+}
+
 pub struct CycleReport {
     pub cycle: i64,
     pub verdict: Verdict,
@@ -1975,6 +2022,8 @@ pub struct CycleReport {
     pub acted: bool,
     pub node: Option<String>,
     pub notes: Vec<String>,
+    /// v3：本轮结束时的运行状态（从 bool 派生，供日志/测试断言）。
+    pub run_state: RunState,
 }
 
 /// 检查成功判据（机器可判的那几类）。返回 None = 需要人工判断。
@@ -2185,39 +2234,9 @@ pub fn has_unexecutable_predecessor(node: &crate::decide::Node, plan: &[crate::d
     })
 }
 
-/// ★ **保命反射弧**：把 Urgent 动作翻译成**不依赖 plan 依赖图**的具体动作。
-///
-/// 为什么需要它独立于 plan：
-///   保命（膀胱爆/窒息/缺食）**不能等前置**。plan 的 requires 是战略顺序，
-///   但当 Urgent 目标的某个前置已被熔断（blocked）或暂缓（deferred）时，
-///   "尊重依赖图"会把保命动作改写成执行那个注定失败的前置 ——
-///   实测：T2「卫生前置：三人厕所」requires T1「采建材」，T1 熔断后 →
-///   Urgent 建厕所变成"执行 T1" → 厕所永远建不成 → 膀胱爆表。
-///
-/// 范围严格限定为保命最小集；供电/扩张类属战略层，不在此列。
-/// 动作本身用语义目标（如 `toilet`），由运行时探测 prefab 与落点，不写死坐标。
+/// v3：保命反射归安全壳（reflex.rs）。此处保留薄包装供既有调用点与测试使用。
 pub fn vital_reflex_actions(action: crate::priority::Action) -> Vec<crate::exec::Action> {
-    match action {
-        crate::priority::Action::BuildToilet => vec![crate::exec::Action::Auto {
-            goal: "toilet".into(),
-            why: "膀胱告急 → 内置保命反射弧（语义目标 toilet，运行时选 prefab/落点）".into(),
-        }],
-        crate::priority::Action::Rescue => vec![crate::exec::Action::Auto {
-            goal: "mop_dirty".into(),
-            why: "有人受污染威胁 → 内置保命反射弧清污".into(),
-        }],
-        crate::priority::Action::ProduceOxygen | crate::priority::Action::Ventilate => {
-            vec![crate::exec::Action::Auto {
-                goal: "oxygen".into(),
-                why: "氧气红线 → 内置保命反射弧产氧".into(),
-            }]
-        }
-        crate::priority::Action::ForageFood => vec![crate::exec::Action::Auto {
-            goal: "forage".into(),
-            why: "食物告急 → 内置保命反射弧采集".into(),
-        }],
-        crate::priority::Action::Power | crate::priority::Action::FollowPlan => Vec::new(),
-    }
+    crate::reflex::vital_reflex(action)
 }
 
 /// 把节点写回 todo（解除熔断 / 保命节点重试）。
@@ -2587,6 +2606,24 @@ mod tests {
 
     /// 空闲即冻结的判据：没有待办工单 **且** 没有施工中建筑 → 应该冻结。
     /// 有待办工单（挖掘标记/建造蓝图）→ 复制人还在干活 → 让世界继续跑。
+
+    /// v3：运行状态派生——hold 优先于一切，危险期次之，然后是窗口冻回 / 失败停机。
+    #[test]
+    fn run_state_derivation_priority() {
+        use super::{derive_run_state, RunState};
+        // hold 是唯一受保护的停止，压过一切
+        assert_eq!(derive_run_state(true, true, true, true, true), RunState::PausedByHold);
+        // 危险期：分冻结期/运行期
+        assert_eq!(derive_run_state(false, true, true, false, false), RunState::PausedByDanger { phase: "Danger(冻结期)" });
+        assert_eq!(derive_run_state(false, true, false, false, false), RunState::PausedByDanger { phase: "Danger(运行期)" });
+        // 窗口到期冻回
+        assert_eq!(derive_run_state(false, false, false, true, false), RunState::Frozen);
+        // 失败且无待办
+        assert_eq!(derive_run_state(false, false, false, false, true), RunState::Stopped);
+        // 正常运行
+        assert_eq!(derive_run_state(false, false, false, false, false), RunState::Running);
+    }
+
     #[test]
     fn idle_freeze_decision() {
         let work = |pending: Option<i64>, building: i64| pending.unwrap_or(0) > 0 || building > 0;

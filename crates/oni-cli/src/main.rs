@@ -1016,8 +1016,8 @@ fn cmd_serve() -> anyhow::Result<()> {
         agent.cfg.interval_secs, agent.cfg.work_window_secs, web_port);
     loop {
         let r = agent.cycle();
-        let mut line = format!("[{}] cycle={} verdict={} 节点={} 动作={}",
-            chrono::Local::now().format("%H:%M:%S"), r.cycle, r.verdict.label(),
+        let mut line = format!("[{}] cycle={} state={} verdict={} 节点={} 动作={}",
+            chrono::Local::now().format("%H:%M:%S"), r.cycle, r.run_state.label(), r.verdict.label(),
             r.node.clone().unwrap_or_else(|| "-".into()), if r.acted { "已执行" } else { "无" });
         for n in &r.notes { line.push_str(" | "); line.push_str(n); }
         println!("{}", line);
@@ -1064,8 +1064,8 @@ fn cmd_agent(args: &[String]) -> anyhow::Result<()> {
         agent.cfg.interval_secs, agent.cfg.work_window_secs);
     loop {
         let r = agent.cycle();
-        let mut line = format!("[{}] cycle={} verdict={} 节点={} 动作={}",
-            chrono::Local::now().format("%H:%M:%S"), r.cycle, r.verdict.label(),
+        let mut line = format!("[{}] cycle={} state={} verdict={} 节点={} 动作={}",
+            chrono::Local::now().format("%H:%M:%S"), r.cycle, r.run_state.label(), r.verdict.label(),
             r.node.clone().unwrap_or_else(|| "-".into()), if r.acted { "已执行" } else { "无" });
         for n in &r.notes { line.push_str(" | "); line.push_str(n); }
         println!("{line}");

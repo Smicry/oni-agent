@@ -109,6 +109,13 @@ pub struct Plan {
     /// AI-authored plans are locked: mechanical replanning must never overwrite them.
     #[serde(default)]
     pub locked: bool,
+    /// 一句话目标（LLM 填，人读）。
+    #[serde(default)]
+    pub objective: String,
+    /// v3 滚动窗口：本 plan 生成时的游戏周期。0 = 非窗口（旧静态 plan）。
+    /// 快系统据此判断窗口是否过期（跨 ≥2 周期 → 重算）。
+    #[serde(default)]
+    pub window_cycle: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +298,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let (chosen, ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(chosen.map(|n| n.id), Some("B".to_string()),
@@ -306,6 +314,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert!(chosen.is_none(), "暂缓节点本轮不应被选中");
@@ -327,6 +336,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(
@@ -349,6 +359,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(
@@ -370,6 +381,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(
@@ -392,6 +404,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let (chosen, _ready, _blocked) = decide_inner(&plan, false);
         assert_eq!(chosen.map(|n| n.id), Some("food".to_string()),

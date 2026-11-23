@@ -1152,6 +1152,50 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         }
     }
 
+    // ★ v3 滚动窗口：plan.json 是 horizon-3 的短视窗口，过期就重算（MPC 式）。
+    //   为什么：静态长链在世界变化后变成枷锁（实测 7 节点全锁死，殖民地失去方向）。
+    //   过期条件见 window::window_stale（空 / 全完成 / 枷锁 / 跨 ≥2 周期）。
+    {
+        let sd = save_dir();
+        let plan_path = "plan.json";
+        let snap_cycle = snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0);
+        let plan: Option<crate::decide::Plan> = std::fs::read_to_string(plan_path)
+            .ok().and_then(|t| serde_json::from_str(&t).ok());
+        let author_is_ai = plan.as_ref().map(|p| p.author.as_deref() == Some("ai")).unwrap_or(false);
+        let stale = plan.as_ref().and_then(|p| crate::window::window_stale(p, snap_cycle));
+        // 只对 AI 产的 plan 做滚动刷新；opening 占位（pending_llm）由上面的开局分支处理。
+        // mock 模式不调 LLM（测试环境无端点）。
+        if author_is_ai && stale.is_some() && !cfg.is_mock() {
+            let brief = std::fs::read_to_string(sd.join("opening_brief.json"))
+                .or_else(|_| std::fs::read_to_string(sd.join("opening_brief.done")))
+                .unwrap_or_default();
+            if !brief.is_empty() {
+                let fp = oni_mcp::save::last_seen().map(|s| s.fingerprint);
+                match crate::window::refresh_window(cfg, &brief, plan_path, fp.as_deref(), snap_cycle, &sd) {
+                    Ok(summary) => {
+                        let rec = serde_json::json!({
+                            "id": now(), "ts": now(), "cycle": snap_cycle,
+                            "source": "slow_service", "choice": "window_refresh",
+                            "action": "author_window", "priority": "P1",
+                            "reason": format!("滚动窗口过期（{}）→ 重算：{}", stale.clone().unwrap_or_default(), summary),
+                            "goal": "", "commands": [],
+                        });
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                            .open(sd.join("decisions.jsonl")) { let _ = writeln!(f, "{}", rec); }
+                        let out = format!("[window] 🔄 {}（过期原因：{}）", summary, stale.unwrap_or_default());
+                        if let Ok(mut v) = view.lock() { v.last_decision = out.clone(); }
+                        eprintln!("[slow] {}", out);
+                    }
+                    Err(reason) => {
+                        let out = format!("[window] ⚠ 滚动窗口刷新失败（保留旧窗口）：{}", reason);
+                        if let Ok(mut v) = view.lock() { v.last_decision = out.clone(); }
+                        eprintln!("[slow] {}", out);
+                    }
+                }
+            }
+        }
+    }
+
     // ★ 主动规划心跳：无事件时周期性唤起 LLM 推进战略，而非干等卡点。
     let proactive = escs.is_empty() && cmds.is_empty();
     if proactive && !should_proactive() {

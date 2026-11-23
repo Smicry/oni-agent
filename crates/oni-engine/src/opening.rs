@@ -581,6 +581,7 @@ mod tests {
             survival_node: Some("O1".into()),
             author: Some("ai".into()),
             locked: true,
+            ..Default::default()
         };
         let errs = validate_plan(&plan);
         assert!(errs.is_empty(), "合法计划不应报错: {errs:?}");
@@ -610,6 +611,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let errs = validate_plan(&plan);
         assert!(errs.iter().any(|e| e.contains("供电")),
@@ -653,6 +655,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let errs = validate_plan(&plan);
         assert!(errs.iter().any(|e| e.contains("重复")),
@@ -688,6 +691,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let errs = validate_plan(&plan);
         assert!(errs.iter().any(|e| e.contains("auto")),
@@ -718,6 +722,7 @@ mod tests {
             survival_node: None,
             author: None,
             locked: false,
+            ..Default::default()
         };
         let errs = validate_plan(&plan);
         assert!(errs.iter().any(|e| e.contains("氧气")),
