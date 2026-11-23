@@ -47,8 +47,10 @@ fully delegated to the agent — no separate game-pause button.
 - **Slow system** (LLM, every 5s): strategy, replanning, exception handling, rule updates.
 
 The fast system publishes escalations and a shared snapshot; the slow system writes semantic
-goals (`ai_goals.jsonl`) and precise orders. No duplicate MCP collection: the daemon is the only
-sampler. See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](docs/dual-system.md).
+goals (`ai_goals.jsonl`) and precise orders. The daemon is the only **continuous** sampler and
+writes the shared snapshot — but `oni observe` (default) and `oni audit` (when the snapshot is
+stale) still take a live sample themselves. Use `oni observe --cached` for a zero-MCP read of the
+daemon snapshot. See [`docs/coordination.md`](docs/coordination.md) and [`docs/dual-system.md`](docs/dual-system.md).
 
 **The authoritative fast/slow contract is [`docs/FAST_SLOW_CONTRACT.md`](docs/FAST_SLOW_CONTRACT.md).**
 In short: the slow system decides *where to go*, the fast system decides *how to survive right now* —
@@ -74,7 +76,7 @@ through. On life-red-line emergencies the fast system skips only *expansion* goa
 - **Single control switch (AI on/off)**: the user controls the agent, not the game clock. `stop` (hold) is the *only* user stop signal — it freezes the world and stands the agent down, surviving reloads/restarts. While AI is on, the agent owns game pause/resume entirely: any non-hold pause is auto-resumed with a fresh work window, so long-running jobs (shafts, research) are never stranded by a stale "user paused" flag. Old per-pause owners (`agent`/`none`/`user`) are all treated as resumable now; only `hold` is authoritative.
 - **Decision record**: each slow-system decision is logged with rationale and expected outcome (see `decisions.jsonl`).
 - **Structured failure feedback**: every goal execution writes `goal_outcomes.jsonl` with a
-  `fail_kind` (`no_target`/`no_material`/`research_locked`/`preflight`/`rejected`/`no_placement`/`bad_goal`).
+  `fail_kind` (`no_target`/`no_material`/`research_locked`/`preflight`/`rejected`/`no_placement`/`bad_goal`/`no_progress`/`unknown`; success is recorded as `none`). `no_progress` means the goal exists but the current physical conditions can't move it (e.g. every reachable frontier cell needs a ladder) — the circuit breaker counts it as a **failure**.
   The LLM sees *why* a goal failed, not just a count, so it fixes the root cause instead of renaming goals.
 - **Permanent circuit breaker**: a goal that has never succeeded and fails ≥3 times is banned for
   the whole save (time cooldowns used to let the same dead goal back in; `oxygen` 0/8 once dragged
@@ -95,22 +97,38 @@ through. On life-red-line emergencies the fast system skips only *expansion* goa
   failures. Facts (what a cell is, whether an order landed) stay in code.
 - **Singleflight + cache**: concurrent reads of the same cell URI collapse into one MCP request and
   the read cache TTL covers a whole cycle, so the per-cycle preflight no longer floods the mod
-  endpoint (it used to queue hundreds of requests and stall the cycle for ~90s).
+  endpoint (it used to queue hundreds of requests and stall the cycle for ~90s). Per-URI TTL
+  overrides give volatile state a **1s** freshness (`oni://colony/status`) while bulk sources stay
+  at 8s — the same singleflight still merges concurrent reads, so freshness costs no extra load.
+- **Live world-state check**: "is the world running?" is decided from **live** facts
+  (`isPaused` / `gameSpeed <= 0` / a fresh re-read), never from a stale snapshot — deciding on a
+  stale value makes the agent keep issuing orders into a paused game, where they never execute,
+  which reads as zero progress and trips the circuit breaker on healthy nodes.
+- **Survival nodes are deferred, not retried**: a survival node that keeps failing is escalated to
+  the slow system and **deferred** (recoverable, with cooldown) instead of being retried every round.
+  Circuit-breaking a survival node would be suicide, but re-selecting it forever causes an
+  endless resume→fail→freeze loop that leaves the game paused most of the time.
 
-## MCode integration (Hook + Skill)
+## MCode integration (Skill + scripts)
 
-This repo ships a project-level Hook and Skill for [MCode](https://www.minimax.io/):
+This repo ships a project-level Skill and helper scripts for [MCode](https://www.minimax.io/):
 
 ```
 .minimax/
-├── hooks.json                       # UserPromptSubmit → oni pause (freeze world on new message)
-├── scripts/pause-on-prompt.mjs      # silent, fail-open; path resolved relative to the script
+├── hooks.json                       # hook 开关；当前 **未注册** UserPromptSubmit 条目（见下）
+├── scripts/pause-on-prompt.mjs      # UserPromptSubmit 执行体（静默、fail-open）—— 当前未被引用
 ├── scripts/session-id.sh            # stable per-save key from initial save hash
 └── skills/oni-colony-ops/SKILL.md   # colony takeover loop: freeze→observe→replan→execute→verify
 ```
 
-The Hook is project-scoped and inactive until enabled in MCode → Settings → Hooks → Project.
-It only affects this repository and never blocks the conversation.
+**关于那个 Hook：当前 `hooks.json` 的 `hooks` 映射为空，`UserPromptSubmit` 条目已被有意移除**
+（慢系统改为常驻 `oni serve` 守护进程后，不再依赖 MCode 会话驱动）。因此
+**"用户发新消息自动冻结世界"目前不生效**。需要主 agent 在改代码/深挖期间冻结世界时，
+请显式执行 `oni hold`（唯一受保护的停止信号），改完 `oni release`。
+
+`scripts/pause-on-prompt.mjs` 保留作为参考实现；如要重新启用，请在 `hooks.json` 的
+`hooks.UserPromptSubmit` 里补回对应条目。注意它调用的是 `oni pause`（owner=User），
+在 AI 开启时会被代理自动恢复——要真正停住应改用 `oni hold`。
 
 ## Docs
 - [`AGENTS.md`](AGENTS.md) — engineering rules for agents working in this repo

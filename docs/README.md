@@ -28,17 +28,25 @@
 3. **知识库每条实质性数值必须有出处**；社区经验值明确标注，不与官方机制混淆。
 4. 阈值以 `AGENTS.md` 与代码为准；知识库不重复收录，避免两处打架。
 
-## 项目级 Hook（用户新消息即自动暂停）
+## 项目级 Skill 与脚本
 
-本仓库自带一个**项目级** Hook：`UserPromptSubmit` → 用户一提交新消息就自动 `oni pause`，
-把游戏冻结成静止快照，等规划好再恢复。
+本仓库自带项目级 Skill 与辅助脚本：
 
 ```
 .minimax/
-├── hooks.json                      # 项目级 Hook 定义（需在 设置 → 钩子 → 项目 开启）
-├── scripts/pause-on-prompt.mjs      # 静默执行 oni pause，失败不阻塞对话
+├── hooks.json                      # hook 开关；当前 **未注册** UserPromptSubmit 条目
+├── scripts/pause-on-prompt.mjs      # UserPromptSubmit 执行体（静默、fail-open）——当前未被引用
+├── scripts/session-id.sh            # 单局稳定 key（初始存档 hash 前 16 位）
 └── skills/oni-colony-ops/SKILL.md  # 殖民地接管流程（冻结→观察→重规划→执行→验证）
 ```
+
+**注意："用户新消息即自动暂停"当前不生效。** `hooks.json` 的 `hooks` 映射为空，
+`UserPromptSubmit` 条目已被有意移除（慢系统改为常驻 `oni serve` 守护进程后，
+不再依赖 MCode 会话驱动）。`pause-on-prompt.mjs` 作为参考实现保留。
+
+主 agent 需要冻结世界时用 `oni hold`（唯一受保护的停止信号），改完 `oni release`。
+若要重新启用该 Hook，需在 `hooks.json` 的 `hooks.UserPromptSubmit` 补回条目——
+但注意它调的是 `oni pause`（owner=User），AI 开启时会被代理自动恢复，冻结不住。
 
 **为什么放项目级而不是全局 plugin**：
 - 这个 Hook 只在《缺氧》项目里有意义，不该污染其它项目的会话。

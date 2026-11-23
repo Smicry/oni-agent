@@ -1,10 +1,10 @@
 ---
 name: oni-colony-ops
 description: |
-  接管并长期运营《缺氧》(Oxygen Not Included) 殖民地。Use when the user asks to take over the colony, check on colony status, re-plan the build order, diagnose why the colony is stuck, or when a new user message arrives during an active run. Enforces the freeze-observe-replan-execute-verify loop so the world never keeps running while the agent thinks, and refuses to guess map facts instead of reading them.
+  接管并长期运营《缺氧》(Oxygen Not Included) 殖民地。Use when the user asks to take over the colony, check on colony status, re-plan the build order, diagnose why the colony is stuck, or when a new user message arrives during an active run. Enforces the freeze-observe-replan-execute-verify loop so the world never keeps running while the agent thinks — freezing is explicit (`oni hold` / `oni release`); there is no automatic prompt hook. Refuses to guess map facts instead of reading them.
   触发场景：接手这局、殖民地怎么了、重新安排计划、为什么卡住了、代理停摆了、新消息到达时重规划。
 descriptions:
-  zh-Hans: "接管并长期运营《缺氧》殖民地：冻结→观察→重规划→执行→验证循环；不猜地图事实，一切以官方读数为准。"
+  zh-Hans: "接管并长期运营《缺氧》殖民地：冻结→观察→重规划→执行→验证循环；冻结靠显式 `oni hold` / `oni release`（没有自动暂停 hook）；不猜地图事实，一切以官方读数为准。"
 ---
 
 # ONI 殖民地接管与运营
@@ -16,9 +16,12 @@ descriptions:
 
 **每轮的第一件事是冻结世界，不是观察世界。**
 
-- 本项目已有 `UserPromptSubmit` hook：用户新消息到达时自动调 `oni pause`。
-  不必再手动暂停，但**要复核它真的生效**（`oni observe` 看状态行）。
-- 用户**手动**暂停时优先级最高：代理绝不越权恢复。只观察待命。
+- **当前没有自动冻结**：`UserPromptSubmit` hook **未注册**（`.minimax/hooks.json` 的 `hooks` 是空映射；
+  `scripts/pause-on-prompt.mjs` 只是保留的参考实现，无人引用）。
+  用户发来新消息**不会**自动 `oni pause` —— 要冻结必须**显式** `oni hold "理由"`。
+- 用户**手动**暂停（owner=user）**不会**让代理停手：AI 开启时，除 `hold` 外的所有暂停
+  （owner = agent / none / user / escalation）代理都会**自主恢复**并开施工窗口
+  （`agent.rs` 的统一恢复分支）。**唯一受保护的停止信号是 `oni hold`。**
 
 ## 1. 一轮的标准循环
 
@@ -27,8 +30,10 @@ FREEZE → OBSERVE(全局) → JUDGE → REPLAN → EXEC(预检→dry-run→appl
 ```
 
 ### FREEZE
-- `oni pause "理由"`（已暂停则跳过，幂等）。
+- `oni hold "理由"`（写 hold 标记 + 暂停游戏；幂等）。
+  **别用 `oni pause`** —— pause 的 owner 是 User，会被代理**自动恢复**，冻不住。
 - 冻结只是为了拿到**静止快照**。冻结期间不思考下一步动作。
+- 看完/改完 → `oni release` 解除 hold；要施工再 `oni window <秒>`。
 
 ### OBSERVE —— 一次采全，禁止只看单一数据源
 ```bash
@@ -70,12 +75,13 @@ oni raw 'oni://buildings/materials?prefabId=X'   #  这个建筑当前能用哪�
 ### VERIFY —— 复读，不靠日志自证
 ```bash
 oni probe x1,y1,x2,y2        # 标记/建筑真的落地了吗
-oni raw 'oni://buildings/index'  # 建筑实例真的建成了吗
+oni call world_editor '{"command":"read","path":"/active/buildings/index.md"}'  # 建筑实例真的建成了吗
 ```
 日志说 `ok: true` **不等于**动作生效。必须复读目标区域比对。
 
 ### RESUME —— 有限窗口
-恢复后给一个**有上限**的窗口（如 120–300s），到点自动冻回。
+`oni release`（解除 hold）后 `oni window <秒>`（如 120–300s），到点自动冻回。
+`oni window` 本身也是"授权代理恢复"的动作（会清掉 user/hook 的暂停所有权）。
 不要无限期恢复：暂停只冻结倒计时，不会让人好转。
 
 ## 2. 必须记住的硬约束
@@ -84,8 +90,9 @@ oni raw 'oni://buildings/index'  # 建筑实例真的建成了吗
 |---|---|
 | 开局地上**零建材** | 梯子/砖块/发电机全部造不了（`phase: failed`）→ **第一步是采建材**，不是挖矿 |
 | 建造材料必须问 mod | `oni://buildings/materials?prefabId=X` 按地上实际库存给出可用材料 |
-| 梯子 1 格 1 格往上 | `auto_ladder` 在目标正下方那格的支撑格 (x,y-2) 铺梯子 |
+| 梯子 1 格 1 格往上 | `ladder_step()` 先定该列**基座**（复制人真走得到的那格），再从**基座+1** 起补**第一处缺梯子的格**，逐格向上铺成连续链；**不是固定 `(x,y-2)` 落点** |
 | 梯子约 100kg/格 | 开长竖井前先算材料；**横着采通常比竖着挖省** |
+| 建筑占格以 **mod 目录**为准 | 本仓库不硬编码尺寸（从目录取 width/height）→ `oni doctor` 会打印各建筑 WxH，别照抄记忆里的尺寸 |
 | 直挖深井会困死人 | 往下只走斜向阶梯；往上靠梯子列 |
 | 挖过的地方留碎岩 | 必须先 `扫` 清障，否则工单被立刻取消 |
 | 一次只能下一条工单 | 游戏变更非事务性 |
@@ -111,6 +118,7 @@ oni raw 'oni://buildings/index'  # 建筑实例真的建成了吗
 ## 4. 不要做的事
 
 - 不要手写 MCP 调用或 SEARCH/REPLACE 补丁 —— 用 `oni` CLI，它封装了预检、通配符补丁与回写。
+- 不要用 `oni pause` 代替 `oni hold` 冻结世界 —— pause 会被代理自动恢复，等于没冻。
 - 不要在没读格子的前提下断言"这里有矿/这里是空"。
 - 不要因为"指令返回 ok"就认为做成了 —— 必须复读验证。
 - 不要在人口为 0 时继续下工单。
@@ -133,15 +141,17 @@ oni raw 'oni://buildings/index'  # 建筑实例真的建成了吗
 oni hold "改 agent.rs：修复 auto_ladder"   # 开始改代码前：暂停 + 写 hold 标记
 oni release                                  # 改完解除
 oni window 120                               # 需要施工时开一个有上限的窗口
-oni pause / oni resume                       # 手动控制
+oni pause / oni resume                       # 手动控制（pause 的 owner=User，
+                                             # 会被代理自动恢复；要真停住用 hold）
 ```
 
 | 场景 | 动作 |
 |---|---|
-| 用户发来新消息 | 项目级 Hook 自动 `oni pause`（本项目已配置） |
+| 用户发来新消息 | **当前无自动冻结**（UserPromptSubmit hook 未注册）→ 需要冻结就显式 `oni hold "原因"` |
 | 你要改代码/深挖问题 | `oni hold "原因"` —— 游戏冻结，代理只观察不自动恢复 |
-| 代理没有待办工单 | 引擎自动「空闲即冻结」→ 冻回暂停 |
-| 代理动作失败 | 自动冻结等人，不空转重试 |
+| 用户手动按了暂停 | 代理**仍会自主恢复**（owner=user 也在统一恢复分支内）→ 想让它停住只能用 `oni hold` |
+| 代理没有待办工单（全员空闲） | 只**上报慢系统**，世界**继续跑**（不冻结）→ 别指望它自己停 |
+| 代理动作失败 | 慢系统**无待办** → 冻回暂停等人（终态）；慢系统**有待办** → 冻 20s 后自持重试 |
 | 有人呼吸 < 35 | **例外**：占空比（冻 20s → 跑 120s），暂停救不了窒息的人 |
 
 > hold 期间**不要**执行写操作 —— 世界冻结着，行动要等 `oni release` 之后。
@@ -154,8 +164,10 @@ Design conclusion: 代理观察的是材料/建筑/气体总量，**没有"人�
 | Level | 触发 | 动作 |
 |---|---|---|
 | 3 救命 | 有人失去行动能力 | 救援：排毒 / 拖到有空气处 / 治疗 |
-| 2 紧急 | 有人呼吸 < 50，或**所在格不可呼吸**（污染水/CO₂/氯气） | 先把人弄到能呼吸的地方 |
-| 1 关注 | stress 飙升 / 氧气消耗归零 / 空气比例低 / 食物不足 | 对应计划节点 |
+| 2 紧急 | 有人呼吸 < 50；或**人在不可呼吸格**（污染水/CO₂/氯气）**且呼吸 < 95**（读不到呼吸值时保守判危险）；或膀胱 > 80% 且厕所数 < 人口 | 先把人弄到能呼吸的地方 / 立刻建厕所 |
+| 2 紧急 | 氧气续航 < 3 周期 | 产氧优先 + **禁止扩张性挖掘**（见 §10） |
+| 2 紧急 | 氧气消耗几乎归零但人还在 / 氧气完全冻结且呼吸或胁迫异常 | 立刻查人、准备救援 |
+| 1 关注 | 人在不可呼吸格但呼吸 ≥ 95 / stress 飙升 / 空气比例低 / 食物续航 < 0.5 周期 | 对应计划节点（不抢占） |
 | 0 正常 | 无异常 | 按 plan 依赖图推进 |
 
 **早期预警（比"呼吸值=0"早几分钟）**
@@ -164,8 +176,9 @@ Design conclusion: 代理观察的是材料/建筑/气体总量，**没有"人�
 - **stress 飙升** = 有人在受苦。
 
 ```bash
-oni observe            # 看调度结论（每轮都会打印 📊 调度[Level]）
-oni observe --cached   # 零 MCP 压力地看同一份调度结论
+oni observe            # 全局态势卡（周期/气体/电力/建筑/趋势）
+oni observe --cached   # 零 MCP 压力地看同一份快照
+tail -f ~/.oni-agent/agent.log   # 📊 调度[Level] 在守护进程日志里，**不在**态势卡里
 ```
 
 >  **读不到数据 ≠ 数据是极值。** 快照里读不到的字段是 0，
@@ -178,7 +191,7 @@ plan.json 里**不允许出现硬编码坐标**。动作只说**意图**，坐�
 | goal | 含义 | 运行时怎么算 |
 |---|---|---|
 | `surface` | 挖通到地表 | 图模块 0-1 BFS 最短路的**第一个要挖的格**（不是终点） |
-| 采建材（梯子/砖块材料） | 可达区周边矩形，挖掘管线优先挑砂岩/泥土/藻类 |
+| `material`（采建材） | 挖到任意一种合法建材（梯子/砖块的材料） | 可达区 bbox 外扩 3 格圈成目标区；挖掘管线选前沿格时优先挑砂岩/泥土/藻类 |
 | `element:Algae` | 挖到含某元素的格 | 以可达区为中心逐环搜索最近目标 |
 | `mop_dirty` | 排掉污染水/污染氧 | 扫地图 token（`染`/`污`） |
 | `auto_build` + `region:"auto"` | 自动找建造落点 | 以复制人位置为中心的可达区矩形 |
@@ -210,13 +223,14 @@ plan.json 里**不允许出现硬编码坐标**。动作只说**意图**，坐�
 看运行状态与调度结论：
 
 ```bash
-oni observe --cached   # 零 MCP：全局态势卡 + 调度结论
-tail -f ~/.oni-agent/agent.log
+oni observe --cached   # 零 MCP：全局态势卡
+tail -f ~/.oni-agent/agent.log   # 📊 调度[Level] / 🔒 / ⏸ / ⛔ 都在这里
 ```
 
->  日志里的 **📊 调度[Level]** 是这一轮真正要做的事；
-> **🔒 / ⏸ / ⛔** 是运行状态（冻结/暂停/失败）。
-> 「❌ dig → 目标附近没有可挖的格」= 目标列爬不上去 → 换列，不是加轮次。
+>  日志里的 **📊 调度[Level]** 是这一轮真正要做的事（Level 取值 = Rescue/Urgent/Watch/Normal）；
+> **🔒** 冻结或冻回、**⏸** 只观察不执行、**⛔** 熔断或恢复被拒。
+> 「❌ dig → …无可下单曲 / 零进展 / 推不动」= 这一列推不动 → 换列，不是加轮次
+> （零进展归类见 `agent.rs` 的 `fail_kind=no_progress`）。
 
 ## 10. Hard rule: 缺氧时禁止扩张性挖掘
 
@@ -233,8 +247,12 @@ tail -f ~/.oni-agent/agent.log
 
 不依赖旧局的具体状态 —— 旧坐标/目标锁/进度换局即失效。
 
-1. 算当前局 hash：`./.minimax/scripts/session-id.sh`
-2. 对比 ~/.oni-agent/current-session 第一行：不同 = 新局 → 清空局内状态（goal_lock.json）
+1. 看当前存档身份：`oni state`（打印存档名、世界、**指纹**、局内状态目录、plan.json 指纹）。
+2. **存档指纹 ≠ plan.json 指纹 = 换过局**（或 plan 没跟着重置）→
+   `oni plan-reset`（重置 plan + 清该存档的局内状态 goal_lock.json 等）。
+   ~~`~/.oni-agent/current-session`~~ 已废弃 —— 现在是 `~/.oni-agent/current.json` 的 `fingerprint`；
+   `./.minimax/scripts/session-id.sh` 算的是**另一个**哈希（初始存档 sha256 前 16 位），
+   **不要**拿它跟 current.json 的指纹比。
 3. **观察分析**：`oni observe --cached` 拉全局态势 + `oni plan` 看依赖图 + 目视关键地形
 4. 基于**当前局面**选第一个目标（通常是产氧/采建材），不继承旧局计划
 
@@ -246,15 +264,16 @@ tail -f ~/.oni-agent/agent.log
 **先知道资源在哪，再决定挖哪里。** 不知道铁矿在 20 格外就深挖 = 全灭。
 
 ```bash
-oni scout          # 探测关键资源位置+距离，落盘 ~/.oni-agent/scout.json
-oni plan-reset     # 换存档时重置 plan（用 plan.template.json）+ 清局内状态
+oni scout          # 探测关键资源位置+距离，落盘 saves/<存档指纹>/scout.json（按存档隔离）
+oni plan-reset     # 换存档时重置 plan（写 author=pending_llm 占位）+ 清该存档的局内状态，
+                   # 随后**同步**调 LLM 生成开局战略（**没有本地模板兜底**）
 ```
 
-开局模板的依赖链（体现"优先向上而非向下"）：
+开局依赖链（现在由慢系统 LLM 依**本局事实**生成，下面的顺序只是典型形态，不是硬编码模板）：
 
 ```
 侦察 → 建材 → 产氧(氧石) → 换气(向上到地表) → 深挖产氧链(铁矿) → 食物 → 居住 → 供电 → 新人 → 火箭
 ```
 
  换气排在深挖之前：挖 20 格会把地下 CO2 释放到低层走廊（CO2 沉底）→ colony loss.
- 换存档必须先 `oni plan-reset`：上一局的 done 状态被继承会让代理跳过关键步骤。
+ 换存档必须先 `oni plan-reset`：plan.json 带着上一局的指纹与 done 状态，新局不会自动沿用。

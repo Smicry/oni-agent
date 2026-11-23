@@ -167,7 +167,9 @@
 - 开局地上通常**零建材** → 梯子/砖块/发电机/存储箱全部造不了。
   梯子要 `Isoresin`（异构树液，来自植物）或藻类/木头 —— 通常需要先挖通通道采集。
 - 造 **1 格**梯子（不是 1 段）→ 复制人爬上去 → 再挖头顶 → 再造 1 格 → 一格格往上。
-- 地图 token 里 `.` = 空/无视图，`?` = 未知（不是空！），`x` = 氧气，`真` = 真空。
+- 地图 token 里 `.` 与 `?` **都表示未探索**（`grid.rs:110` → `Kind::Unknown`；寻路按"可挖通但代价 1"处理），
+  不是"空格"；`x` = 氧气，`碳` = 二氧化碳，`梯` = 梯子。
+  真空**不靠字形**判定 —— 看 cell 的 `element == "Vacuum"`（`cell.rs:81`）。
 - 建筑锚点会偏移（地图渲染 vs 建筑索引不一致）→ 关键建筑留 1 格缓冲。
 ### 开局通用流程（实测得出，换存档同样适用）
 
@@ -183,8 +185,9 @@
 5. 有了材料再发电、盖房、种地。
 
 **陷阱**
-- **梯子列是 1 格 1 格往上**：`auto_ladder` 会在"目标正下方那格的支撑格 (x, y-2)"自动铺梯子。
-  铺 1 格 → 人爬上去 → 挖头顶 → 再铺 1 格 → 循环。
+- **梯子列是 1 格 1 格往上**：`ladder_step()` 先定该列**基座**（复制人真走得到的那格），
+  再从**基座+1** 起补**第一处缺梯子的格**，逐格向上铺成连续链（`preflight.rs:846-884`）。
+  **不是固定在 `(x, y-2)` 落点**。铺 1 格 → 人爬上去 → 挖头顶 → 再铺 1 格 → 循环。
 - 梯子建好后**复制人可达格数会暴涨**（实测 13 → 49），这是竖井打通的信号。
 - 挖开的竖井如果正上方是 CO₂ 空腔，CO₂ 会**往上飘**（比氧气轻的是氧气，CO₂ 重会沉底 ——
   但空腔在上方时，挖开后连通处 CO₂ 会往下走，要留意坑底）。
@@ -275,28 +278,7 @@
   （污染水/污染氧会顺着通道扩散）。开路之前先想清楚两头是什么。
 - 长期开着的深竖井是 CO₂ 的"烟囱"：CO₂ 沉底、地表空气灌进来，
   但如果竖井不通地表，CO₂ 会一直在坑里累积。
-## 11. 来源清单
-
-**官方 wiki**（oxygennotincluded.wiki.gg，均已实际打开确认）
-- [Duplicant（耗氧 100 g/s = 60 kg/周期）](https://oxygennotincluded.wiki.gg/wiki/Duplicant)
-- [Oxygen（可呼吸阈值、气液分层）](https://oxygennotincluded.wiki.gg/wiki/Oxygen)
-- [Gas（气体扩散、冷凝/蒸发 ±3°C）](https://oxygennotincluded.wiki.gg/wiki/Gas)
-- [Algae Terrarium（耗藻 30g/s + 水 300g/s、30°C、光照 +10%）](https://oxygennotincluded.wiki.gg/wiki/Algae_Terrarium)
-- [Electrolyzer（耗水 1000 g/s）](https://oxygennotincluded.wiki.gg/wiki/Electrolyzer)
-- [Printing Pod](https://oxygennotincluded.wiki.gg/wiki/Printing_Pod)
-- [Ladder（Anywhere 规则）](https://oxygennotincluded.wiki.gg/wiki/Ladder)
-- [Manual Generator](https://oxygennotincluded.wiki.gg/wiki/Manual_Generator)
-- [Building（占格与支撑）](https://oxygennotincluded.wiki.gg/wiki/Building)
-
-**攻略经验**（社区，非官方数值）
-- [新手开局指南：氧气/温度/粮食三大隐形杀手](https://www.allinwondergame.com/news/oxygen-not-included-beginner-guide)
-- [萌新入门技巧：哈赤、煤电隔离、种植布局](https://kirokiro.cc/?p=69860)
-- [Beginner's Guide（前 50 周期基础设施清单）](https://evagamestation.com/2026/02/28/oxygen-not-included-beginners-guide/)
-
-> 本项目自己的判定阈值与存档专属信息不在本文，见 `../AGENTS.md`（工程硬规则）与
-> `playbook.md`（场景手册）。
-
-## 9. 开局竖井与"上不去"的房间
+## 12. 开局竖井与"上不去"的房间
 
 **规则**
 - 复制人**向上移动只有两种方式**：目标格**正下方是实心岩**（可以斜着踏上岩肩），
@@ -318,3 +300,24 @@
   复制人在井底作业呼吸一路掉到 0。要么挖成 2 格宽，要么让居住区远离井底。
 - **倒地的复制人必须挪到床上才能醒**，而"救援"若默认把人送到**基地低层**（毒气区），
   救援就变成了杀手 —— 目标应优先选高处/富氧区的建筑。
+
+## 11. 来源清单
+
+**官方 wiki**（oxygennotincluded.wiki.gg，均已实际打开确认）
+- [Duplicant（耗氧 100 g/s = 60 kg/周期）](https://oxygennotincluded.wiki.gg/wiki/Duplicant)
+- [Oxygen（可呼吸阈值、气液分层）](https://oxygennotincluded.wiki.gg/wiki/Oxygen)
+- [Gas（气体扩散、冷凝/蒸发 ±3°C）](https://oxygennotincluded.wiki.gg/wiki/Gas)
+- [Algae Terrarium（耗藻 30g/s + 水 300g/s、30°C、光照 +10%）](https://oxygennotincluded.wiki.gg/wiki/Algae_Terrarium)
+- [Electrolyzer（耗水 1000 g/s）](https://oxygennotincluded.wiki.gg/wiki/Electrolyzer)
+- [Printing Pod](https://oxygennotincluded.wiki.gg/wiki/Printing_Pod)
+- [Ladder（Anywhere 规则）](https://oxygennotincluded.wiki.gg/wiki/Ladder)
+- [Manual Generator](https://oxygennotincluded.wiki.gg/wiki/Manual_Generator)
+- [Building（占格与支撑）](https://oxygennotincluded.wiki.gg/wiki/Building)
+
+**攻略经验**（社区，非官方数值）
+- [新手开局指南：氧气/温度/粮食三大隐形杀手](https://www.allinwondergame.com/news/oxygen-not-included-beginner-guide)
+- [萌新入门技巧：哈赤、煤电隔离、种植布局](https://kirokiro.cc/?p=69860)
+- [Beginner's Guide（前 50 周期基础设施清单）](https://evagamestation.com/2026/02/28/oxygen-not-included-beginners-guide/)
+
+> 本项目自己的判定阈值与存档专属信息不在本文，见 `../AGENTS.md`（工程硬规则）与
+> `playbook.md`（场景手册）。

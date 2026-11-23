@@ -42,8 +42,10 @@
      `autoMaterialReason: building_locked_by_research`；锁着的造不出来，别排在计划后面。
    - **造出来 ≠ 有人吃** —— 复制人有食谱白名单；农业站种的东西若不在
      `/active/management/food.md` 的允许列表，要先开 `food_policy`。
-2. REPLAN 补引擎语义：`requires` 是硬依赖，`unlocks` 只是**优先级权重**（引擎取其长度），
-   `unlocks=[]` 的节点会永远排最后。
+2. REPLAN 补引擎语义：`requires` 是硬依赖；选点排序 = **(显式 priority, stall 降权, unlocks 长度)**
+   —— `unlocks` 只是**最后一位**的平局项，且 **stall（连续未达成判据的轮数）优先于 unlocks**
+   （否则"解锁下游多但连续没达成"的节点会永远压住供电节点，实测 P1 被选中 0 次 → 全灭）。
+   `unlocks=[]` 的节点**不会**永远排最后（urgent 节点照样优先）。
 3. OBSERVE 补一句：**MCP 并发读全图时会大面积 503**，这时退回视口模式 + 逐格读。
 4. 故障速查加一行：`节点永远不 done → 下游全不解锁 → 整图卡死`，
    先查该节点 `success_check` 是否**恒假**（读错层级 / 建筑未解锁 / 判据不可能达成）。

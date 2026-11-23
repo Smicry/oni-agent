@@ -7,16 +7,29 @@
 
 ```bash
 cargo build --release
+./target/release/oni serve       # ★ 主力入口：一条命令同时起快系统 + 慢系统 + Web 控制台(:8789)
 ./target/release/oni observe     # 全局态势卡（一切判断的起点）
 ./target/release/oni plan        # 本轮唯一目标
 ./target/release/oni act         # 执行（预检 → dry-run → apply）
 ./target/release/oni preflight dig x1,y1,x2,y2
 ./target/release/oni preflight build x,y Prefab
 ./target/release/oni probe x1,y1,x2,y2
+./target/release/oni cells x1,y1,x2,y2   # 模型判定 vs 实时元素并排诊断
+./target/release/oni reach              # 打印世界模型可达集
 ./target/release/oni graph [--full]
+./target/release/oni scout          # 开局资源侦察（落盘 scout.json）
+./target/release/oni plan-reset    # 重开规划：清旧计划 + 同步生成新开局战略
+./target/release/oni plan-llm      # 手动触发 LLM 开局规划（采事实→生成→校验→落盘）
+./target/release/oni plan-check     # 依赖图体检：假 done / 判据复核
 ./target/release/oni window <秒> / pause / resume / hold / release
 ./target/release/oni escalations / bus timeline / status
+./target/release/oni raw 'oni://<资源>'  # 直接读 mod 资源（排查用）
 ```
+
+其它常用：`doctor`（连通性自检）、`status`（慢系统态势，零 MCP）、`escalations`/`resolve`（卡点上报与解决）、
+`decision`（慢系统决策留痕）、`policy`（选址策略参数）、`restart`（回滚存档+重置计划）、`agent`/`slow`（单独起快/慢系统）。
+完整列表见 `oni help`。
+
 不手写 MCP 调用、不手写 SEARCH/REPLACE；引擎封装了预检与回写。
 
 ## 2. 坐标系
@@ -79,24 +92,45 @@ cargo build --release
 - 主 agent 改代码前 `oni hold`，改完 `oni release`（与 AI 总开关同一机制）。
 - 紧急态（有人倒地/呼吸<35）：占空比冻 20s → 跑 120s；暂停只冻结倒计时，救不了窒息的人。
 - 卡住时不停世界：只本轮不下新工单，让已有工单继续做。
-- 空闲即冻结（无待办且无施工）；窗口到期按"有活续窗 / 空闲冻回"。
+- 全员空闲 → **只上报慢系统，世界继续跑**（不冻结）；窗口到期按"有活续窗 / 空闲冻回"。
+- **动作失败且慢系统无待办** → 冻回等介入（不自持）：这是终态，不是循环。
+  但只要慢系统还有待办（ai_goals_pending / escalation），失败也只冻 20s 后自持重试。
+
+### 7.1 世界状态必须用实时真值判定（2026-11-23 实测事故）
+
+**判据：拿过期快照判"世界在不在跑" → 代理以为在跑 → 继续下工单 → 游戏实际停着 →
+工单永不执行 → 指纹不变 → 判零进展 → 误熔断好节点（契约 §9 铁律被绕过）。**
+
+- 判定世界在不在跑**不能只信快照的 `paused`**（快照是批量采集的，采集与判定之间有秒级间隔）。
+- 判据用**三重信号**，任一为停即判停：`isPaused` / `gameSpeed <= 0`（速度 0 等于没跑）/ 实时复核。
+- `oni://colony/status` 走 **1s TTL** 的秒级新鲜度（`cache.rs` 的 per-URI 覆盖），
+  其余观察源 8s。**关键状态不绕过缓存**——同一套 singleflight 合并并发读，既新鲜又不打爆端点。
+- 世界判停时：**不下工单、不计进展、不熔断**，只观察（快系统 `can_execute=false`）。
 
 ## 8. 依赖图（plan.json）
 
-**AI 拥有战略决策**：plan.json 带 `author=ai` + `locked=true` 时，机械规划器**永不覆盖**，
-只能把重规划建议写入 `suggestions.jsonl` 等 AI 审阅；`oni plan-auto` 默认只出草稿，
-`--apply` 也会被 locked 拒绝。AI 不在时宁可停摆，也不让 if-else 规则越权做战略判断。
+**AI 拥有战略决策**：plan.json 带 `author=ai` + `locked=true` 时，机械规划器**永不覆盖**
+（机械 planner 与模板 playbook 已删除，见 §11），重规划建议只写入 `suggestions.jsonl` 等 AI 审阅。
+AI 不在时宁可停摆，也不让 if-else 规则越权做战略判断。
 慢系统决策用 `oni decision add/list/resolve` 留痕（依据+证据+预期+回填）。
 
 - 节点有 requires / unlocks / actions / success_check / status / priority。
 - decide() 先比 priority 再比 unlocks，平局取文件靠前（文件顺序=优先级）。
 - status: todo / in_progress / done / blocked / deferred；熔断只用于有替代方案的节点，保命节点永不熔断。
+- **保命节点禁熔断 ≠ 每轮都重试**：保命节点连续失败达阈值 → 上报慢系统并**暂缓**（deferred，
+  有冷却、条件变化后自动恢复）。只"本轮停手"会被下一轮重新选中 → 恢复→失败→冻回无限乒乓。
 - 判据用终局指标（氧气/食物/人口/可达格），不用中间产物存量；绝对值判据在新档开局常已满足 → 用续航。
 - 计划文件不放硬编码坐标；用语义目标（surface / open_chamber / element:X / material / mop_dirty）。
 - 「能不能造」要过三关：材料 + 研究锁（buildability）+ 运转条件（电/水）；只过第一关会"指令 ok 但没效果"。
 
 ## 9. 工程纪律
 
+- **失败必须诚实上报**（2026-11-23 实测事故）：动作汇总不能硬编码成功。
+  `execute()` 的 `ok` 必须由各结果真实汇总（任一失败 → 整体失败）。
+  否则熔断统计读到的永远是"成功" → 连续失败计数不增长 → 熔断永不触发 →
+  慢系统无限重复入队推不动的目标 → 快系统恢复→失败→冻回无限乒乓。
+  零进展（无可下单曲 / 推不动 / 零进展）必须归类为**失败**（`fail_kind=no_progress`），
+  熔断统计还要能从 detail 自行识别（不信历史脏数据里的 ok 字段）。
 - 动作必须有**效果判据**；连续 3 轮指纹不变 → 换方案，不是加轮次。
 - 读不到数据 ≠ 数据是极值：呼吸值读不到要保守判危险；人口为 0 先确认数据源没失败。
 - 工单语法查 `/active/ops/orders.md`：`挖 土@(x,y):7`、`擦 @(x,y):9`；返回 ok ≠ 生效，要验证效果。

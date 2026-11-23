@@ -28,7 +28,7 @@
 | `cells` | Grid（viewport.md + 官方字形表 + 建筑索引） | 气室范围、挖掘目标 |
 | `masses` | `oni://world/cell/{x}/{y}` 的 element/massKg（并行取） | 氧气/CO₂/氯气/资源统计 |
 | `has_dupes` | `oni://dupes/todos` 的位置 | 标记当前生活区 |
-| `touches_surface` | 气室内是否有格 ≥ maxY-2 | 无限空气源判定 |
+| `touches_surface` | 气室内是否有格 ≥ `surface_y`（有实心地形的最高层） | 无限空气源判定 |
 | `breath_ratio()` | O₂/(O₂+CO₂) | 局部空气红线 |
 
 ### 边 = 实心隔层
@@ -40,7 +40,7 @@
 | 查询 | 方法 | 战略价值 |
 |---|---|---|
 | 当前生活区氧气还能撑多久 | `dupe_chambers()[i].oxygen_cycles(n)` | 决定"先产氧还是先挖矿" |
-| 哪些气室空气有毒 | `hazardous_chambers(0.55)` | 避开氯气坑 / CO₂ 沉底坑 |
+| 哪些气室空气有毒 | `hazardous_chambers(breath_floor)` | 避开氯气坑 / CO₂ 沉底坑 —— ⚠️ **当前无调用点**：`oni graph` 只调 `report()`，需先把该清单接进报告 |
 | 到地表要挖几格 | `route_to_surface().dig_count` | 估算开拓成本，选竖井位置 |
 | 哪个气室有矿 | `chamber.top_masses(3)` | 决定下一挖方向 |
 | 危险气体在哪 | `chamber.hazards()` | 通风规划 |
@@ -50,7 +50,8 @@
 1. 格子类别：`Grid::load` —— 官方 viewport.md + `/active/buildings/index.md` + 官方字形表（不靠渲染猜建筑）。
 2. 气体质量：`oni://world/cell/{x}/{y}` 的 `element` / `massKg`（官方真值，不用渲染字形）。
 3. 复制人位置：`oni://dupes/todos`（与 preflight 同源）。
-4. 地表判定：viewport 上界 Y-2（ mod 的 Y 轴向上递增）。
+4. 地表判定：**有实心地形的最高层**（`surface_y`，`graph.rs:227-233`；判定在 `graph.rs:241`）。
+   不能取 `max_y`（地图顶部是太空），也不能取"上界 Y-2"（本仓库没有这个实现）。
 
 ## 4.5 全图模式（`oni graph --full`）—— 应对各种地图的关键
 
@@ -96,7 +97,9 @@ oni graph --full          # 全图气室图
 - **氧耗速率是社区经验值**（60kg/人/周期 ≈ 0.1kg/s × 600s），非官方数值；只用于气室间的**相对比较**，不作生死判定。见 `docs/knowledge-base.md`。
 - **续航按"封闭气室"假设**：实际挖通后会扩散，续航会变长；这不是 bug，是"不打通就只剩这么点时间"的保守估计。
 - **挖掘路径是纯几何最短路**：未考虑官方可达域、保护区（打印舱/发电机）、梯子规则。它是"往哪个方向开拓"的参考，不能直接下单；具体挖掘仍要走 `preflight_dig`。
-- 气室数是 viewport 可见范围（默认 65×41）内的，移动相机会改变图。
+- **默认模式**下气室数受 viewport 视野限制（默认 65×41，`grid.rs:283`），移动相机会改变图；
+  `oni graph --full` 走 `MapGraph::build_full()`（`graph.rs:150-158` → `grid.rs:289` `load_full`），
+  覆盖整张星体 12 层（`LAYER_HEIGHT=32` / `MAX_LAYERS=12`，Y 0~383），**不受此限**。
 
 ## 6. 后续演化方向
 
