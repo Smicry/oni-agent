@@ -53,7 +53,7 @@ fn build_window_prompt(brief: &str, prev_outcomes: &str) -> (String, String) {
     let system = "你是《缺氧》殖民地的滚动窗口规划器。每次只规划未来 3 步（不是全局计划）。世界是部分可观察的：挖开才知道后面是什么。所以**不要写长链**——只写从当前局面出发、下一步最该做的 3 件事，每步带前置条件（pre）与达成条件（post）。只输出 JSON，不要任何其它文字。".to_string();
     let kinds = crate::opening::CHECK_KINDS.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join("/");
     let user = format!(
-        "== 本局世界事实 ==\n{brief}\n\n== 上一窗口的执行结果（反馈闭环）==\n{prev_outcomes}\n\n== 硬约束 ==\n1. 恰好 {HORIZON} 个节点，id 为 W1/W2/W3；W1 必须是**现在就能执行**的（pre 已满足）；\n2. 每个节点：{{id, name, requires:[...], actions:[{{kind:\"auto\",goal:\"...\",why:\"...\"}}], success_check:{{...}}, success:\"人类可读\", pre:\"执行前必须成立的条件\", post:\"达成后应成立\"}}；\n3. 语义 goal 只能取：scout/material/surface/oxygen/expand/open_chamber/power/research/forage/mop_dirty/toilet/element:<元素名>；\n4. 判据 kind 只能取：{kinds}；字段格式：loose_min{{element,kg}} / building_min{{key,n}} / prefab_min{{prefab,n}} / oxygen_producing{{}} / power_operational{{}} / reachable_min{{n}} / food_cycles_min{{cycles}} / surface_open{{minY}}；\n5. 不写坐标；AutoBuild 的 region 一律 \"auto\"；\n6. **不要重复上一窗口里已失败的目标**（除非事实变了让它重新可行）——换一条路。\n7. 卫生/氧气/食物/居住/电力五条生命线：哪条最危急就排进 W1，其余按需排进 W2/W3。\n输出 JSON：{{\"objective\":\"一句话\",\"author\":\"ai\",\"locked\":true,\"nodes\":[...]}}",
+        "== 本局世界事实 ==\n{brief}\n\n== 上一窗口的执行结果（反馈闭环）==\n{prev_outcomes}\n\n== 硬约束 ==\n1. 恰好 {HORIZON} 个节点，id 为 W1/W2/W3；W1 必须是**现在就能执行**的（pre 已满足）；\n2. 每个节点：{{id, name, requires:[...], actions:[{{kind:\"auto\",goal:\"...\",why:\"...\"}}], success_check:{{...}}, success:\"人类可读\", pre:\"执行前必须成立的条件\", post:\"达成后应成立\"}}；\n3. 语义 goal 只能取：scout/material/surface/oxygen/expand/open_chamber/power/research/forage/mop_dirty/toilet/element:<元素名>；\n4. 判据 kind 只能取：{kinds}；字段格式：loose_min{{element,kg}} / building_min{{key,n}} / prefab_min{{prefab,n}} / oxygen_producing{{}} / power_operational{{}} / reachable_min{{n}} / food_cycles_min{{cycles}} / surface_open{{minY}}；\n5. 不写坐标；AutoBuild 的 region 一律 \"auto\"；\n6. **不要重复上一窗口里已失败的目标**（除非事实变了让它重新可行）——换一条路。\n7. 卫生/氧气/食物/居住/电力五条生命线：哪条最危急就排进 W1，其余按需排进 W2/W3。\n8. **建造依赖材料（物理约束，不可跳过）**：任何建造/研究/发电/产氧节点之前，必须先有 material 或 element:X 节点把材料挖出来。事实里地上散装建材为 0 时，W1 **必须**是采建材（material）——直接排建造会因缺材料全部失败。\n9. **执行结果里连续出现同一 fail_kind（no_material / no_target / 零进展）** → 本窗口必须换方向，不要重试同一目标。\n输出 JSON：{{\"objective\":\"一句话\",\"author\":\"ai\",\"locked\":true,\"nodes\":[...]}}",
     );
     (system, user)
 }
@@ -80,6 +80,64 @@ fn recent_outcomes(sd: &std::path::Path, n: usize) -> String {
         })
         .collect();
     if picked.is_empty() { "（暂无执行记录）".into() } else { picked.join("\n") }
+}
+
+
+/// 把 live_snapshot 压成 LLM 一眼能看懂的**关键事实摘要**（滚动窗口用）。
+///
+/// 为什么不直接丢整份快照：快照几百行 JSON，LLM 看到了 `"inventory": []` 却推不出
+/// "零建材 → 任何建造前必须先挖"（实测窗口 W1 直接排建厕所/供电/制氧 → 全部因缺材料失败）。
+/// 摘要把**决策真正依赖的数字**放最前面，并显式标出"物理约束是否触发"。
+pub fn facts_summary(snap: &serde_json::Value, cycle: i64) -> String {
+    let num = |v: &serde_json::Value, path: &[&str]| -> f64 {
+        let mut cur = v;
+        for k in path { cur = &cur[*k]; }
+        cur.as_f64().unwrap_or(0.0)
+    };
+    let inventory = snap.get("inventory").and_then(|v| v.get("items")).and_then(|v| v.as_array());
+    let mat_tags = ["SandStone", "Dirt", "Algae", "Sand", "Clay", "Cuprite", "Carbon", "IronOre"];
+    let mut mat_lines = Vec::new();
+    let mut loose_total = 0.0;
+    for tag in mat_tags {
+        let kg: f64 = inventory
+            .map(|a| a.iter().filter(|it| it.get("elementId").and_then(|x| x.as_str()) == Some(tag))
+                .filter_map(|it| it.get("totalMassKg").and_then(|m| m.as_f64())).sum())
+            .unwrap_or(0.0);
+        if kg > 0.0 {
+            mat_lines.push(format!("  {tag}: {kg:.0} kg"));
+            if ["SandStone", "Dirt", "Algae", "Sand", "Clay"].contains(&tag) { loose_total += kg; }
+        }
+    }
+    let build_mat_zero = loose_total < 50.0;
+    let dupes = snap.get("dupes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let bladder = snap.get("dupes").and_then(|v| v.as_array()).map(|a| {
+        a.iter().filter_map(|d| d.get("bladder").and_then(|b| b.as_f64())).fold(0.0, f64::max)
+    }).unwrap_or(0.0);
+    let min_breath = snap.get("dupes").and_then(|v| v.as_array()).map(|a| {
+        a.iter().filter_map(|d| d.get("breath").and_then(|b| b.as_f64())).fold(100.0, f64::min)
+    }).unwrap_or(100.0);
+    let reachable = num(snap, &["reachable_cells"]);
+    let oxygen_kg = num(snap, &["gas", "oxygenKg"]);
+    let food_kcal = num(snap, &["food", "kcal"]);
+    let pending = num(snap, &["pending_orders"]);
+    let mut s = String::new();
+    s.push_str(&format!("周期 {cycle}；人口 {dupes}；可达格 {reachable:.0}；最低呼吸 {min_breath:.0}%；最高膀胱 {bladder:.0}%\n"));
+    s.push_str(&format!("氧气 {oxygen_kg:.0} kg；食物 {food_kcal:.0} kcal；待办工单 {pending:.0}\n"));
+    if mat_lines.is_empty() {
+        s.push_str("地上散装材料：**0（什么都没有）**\n");
+    } else {
+        s.push_str(&format!("地上散装材料：\n{}\n", mat_lines.join("\n")));
+    }
+    if build_mat_zero {
+        s.push_str("⚠ 物理约束触发：**建材为零** → 任何建造（厕所/床/发电机/研究站/产氧）都不可能成功，W1 必须是采建材（material）或挖矿（element:X）。\n");
+    }
+    if bladder >= 80.0 { s.push_str("⚠ 卫生红线：有人膀胱 ≥80% → 厕所是最高优先级（但前提是先有建材）。\n"); }
+    if min_breath < 50.0 { s.push_str("⚠ 窒息红线：有人呼吸 <50% → 救援/换气是最高优先级。\n"); }
+    s.push_str(&format!("建筑：厕所 {} / 床 {} / 制氧 {} / 研究站 {} / 发电机 {}\n",
+        num(snap, &["buildings", "toilets"]), num(snap, &["buildings", "beds"]),
+        num(snap, &["buildings", "oxygenProducers"]), num(snap, &["buildings", "researchStations"]),
+        num(snap, &["power", "summary", "generatorOperational"])));
+    s
 }
 
 /// 校验前先**适配 LLM 的常见写法偏差**（契约层容错，而非拒绝）。

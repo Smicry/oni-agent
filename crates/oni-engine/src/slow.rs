@@ -1161,7 +1161,11 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         let snap_cycle = snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0);
         let plan: Option<crate::decide::Plan> = std::fs::read_to_string(plan_path)
             .ok().and_then(|t| serde_json::from_str(&t).ok());
-        let author_is_ai = plan.as_ref().map(|p| p.author.as_deref() == Some("ai")).unwrap_or(false);
+        // 开局规划失败留下的空占位（author=pending_llm）也允许滚动窗口接管：
+        //   否则 opening 的 10 分钟冷却期里 plan 一直是空的，殖民地没战略（实测空窗）。
+        //   滚动窗口只要 3 节点 / 8000 token，比 14 节点的 opening 图稳得多。
+        let author = plan.as_ref().and_then(|p| p.author.as_deref()).unwrap_or("");
+        let author_is_ai = author == "ai" || author == "pending_llm";
         let stale = plan.as_ref().and_then(|p| crate::window::window_stale(p, snap_cycle));
         eprintln!("[window:diag] plan_loaded={} author_is_ai={} stale={:?} mock={}", plan.is_some(), author_is_ai, stale, cfg.is_mock());
         // 只对 AI 产的 plan 做滚动刷新；opening 占位（pending_llm）由上面的开局分支处理。
@@ -1169,7 +1173,9 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         if author_is_ai && stale.is_some() && !cfg.is_mock() {
             // 事实来源：**优先用当前快照**（滚动窗口要的是"现在"，不是开局时的 brief）。
             //   开局 brief 成功后会被重命名为 .done 或被 plan-reset 清掉，不能依赖它。
-            let brief = format!("当前局面（cycle {}）：{}", snap_cycle, serde_json::to_string_pretty(&snap).unwrap_or_default());
+            // ★ 事实要**结构化摘要**，不是整坨快照 JSON：LLM 在大 JSON 里找不到关键数字
+            //   （实测：inventory 为空它没推出"零建材 → 必须先挖"，窗口 W1 直接排建造 → 全部失败）。
+            let brief = crate::window::facts_summary(&snap, snap_cycle);
             {
                 let fp = oni_mcp::save::last_seen().map(|s| s.fingerprint);
                 match crate::window::refresh_window(cfg, &brief, plan_path, fp.as_deref(), snap_cycle, &sd) {
