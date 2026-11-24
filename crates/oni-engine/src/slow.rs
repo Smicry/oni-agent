@@ -162,6 +162,8 @@ pub struct SlowView {
     ///   没有它，前端会把上一周期的对话一直挂着（实测用户看到 Cycle 4 的指令而这局才 Cycle 1）。
     pub save_fingerprint: String,
     pub session_epoch: i64,
+    /// 方向盘模式：指令模式（有未完成用户指令）/ 自主模式。前端显示。
+    pub control_mode: String,
     pub updated_at: i64,
 }
 impl Default for SlowView {
@@ -172,7 +174,7 @@ impl Default for SlowView {
             dupes: vec![], escalations: vec![], commands: vec![],
             recent_decisions: vec![], conversation: vec![], last_decision: String::new(),
             ai_enabled: true,
-            save_fingerprint: String::new(), session_epoch: 0, updated_at: 0,
+            save_fingerprint: String::new(), session_epoch: 0, control_mode: "自主模式".into(), updated_at: 0,
         }
     }
 }
@@ -714,12 +716,16 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
         }
     }
     if !cmds.is_empty() {
-        p.push_str("\n== 用户指令(优先,世界已暂停) ==\n");
+        p.push_str("\n== 🎮 用户指令模式（优先于自主决策；世界已暂停） ==\n");
         for c in cmds {
             p.push_str(&format!("  #{} {}\n",
                 c.get("id").unwrap_or(&Value::Null),
                 c.get("text").unwrap_or(&Value::Null)));
         }
+        // ★ 方向盘回执（v3 ⑥）：人打了方向，车走了没有必须回执。
+        //   reason 会作为该指令的回执展示给用户：写清楚打算怎么执行（含 goal），
+        //   不要只写分析。无法执行的指令要说明原因并给出替代方案。
+        p.push_str("  → 你的 reason 会作为该指令的回执展示给用户：写清楚『打算怎么执行』（含 goal），\n    不要只写分析。无法执行的指令要说明原因并给出替代方案。\n");
     }
     // 检查最近一条用户指令完成状态：未完成/失败则提示 LLM 优先推动
     {
@@ -840,6 +846,69 @@ mod llm_command_tests {
         assert!(e2.contains("不是可执行"), "{e2}");
         let e3 = validate_llm_command("build Toilet --apply").unwrap_err();
         assert!(e3.contains("坐标"), "{e3}");
+    }
+}
+
+/// ★ 大脑事件驱动门控（v3 ⑤）：同一事件只触发一次 LLM 决策。
+///
+/// 实测 392 分钟 744 次 LLM 调用（每 32s 一次），其中大量是**同一个卡点被反复看到**：
+/// 快系统每 10s 上报一次，慢系统每 5s 轮询一次，resolve 之前同一 id 会被 LLM 看 2~3 次，
+/// 每次都是完整 prompt（~4k token）却没有新信息。
+/// 智驾对照：大脑是事件驱动的，同一个传感器事件不会触发两次重新规划。
+///
+/// 规则：escalation 按 id、用户指令按 id 去重，处理过的记入 processed.json（带 TTL，避免无限膨胀）。
+/// 无新事件 + 无用户指令 → 走 60s 心跳（should_proactive），否则本轮不调 LLM。
+fn event_gate(escs: &[Value], cmds: &[Value]) -> Vec<Value> {
+    let path = save_dir().join("processed_events.json");
+    let mut done: std::collections::HashMap<i64, i64> = std::fs::read_to_string(&path)
+        .ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let now_ts = now();
+    // 只保留 30 分钟内的记录
+    done.retain(|_, t| now_ts - *t < 1800);
+    let mut fresh = Vec::new();
+    for e in escs.iter().chain(cmds.iter()) {
+        let id = e.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if id == 0 || !done.contains_key(&id) { fresh.push(e.clone()); }
+    }
+    if !fresh.is_empty() {
+        for e in &fresh {
+            if let Some(id) = e.get("id").and_then(|v| v.as_i64()) { done.insert(id, now_ts); }
+        }
+        let _ = std::fs::write(&path, serde_json::to_string(&done).unwrap_or_default());
+    }
+    fresh
+}
+
+/// 纯函数版（可测）：给定已处理集合，返回新事件。
+pub fn filter_fresh_events<'a>(escs: &'a [Value], cmds: &'a [Value], done: &std::collections::HashMap<i64, i64>) -> Vec<&'a Value> {
+    escs.iter().chain(cmds.iter())
+        .filter(|e| {
+            let id = e.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            id == 0 || !done.contains_key(&id)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod event_gate_tests {
+    use super::filter_fresh_events;
+    use std::collections::HashMap;
+    #[test]
+    fn same_escalation_id_triggers_llm_only_once() {
+        let e = serde_json::json!({"id": 100, "kind": "Deadlock"});
+        let c = serde_json::json!({"id": 200, "text": "建厕所"});
+        let mut done: HashMap<i64, i64> = HashMap::new();
+        assert_eq!(filter_fresh_events(&[e.clone()], &[c.clone()], &done).len(), 2, "首次都算新事件");
+        done.insert(100, 0);
+        let ev = [e.clone()];
+        let cv = [c.clone()];
+        let fresh = filter_fresh_events(&ev, &cv, &done);
+        assert_eq!(fresh.len(), 1, "已处理的 escalation 不再触发");
+        assert_eq!(fresh[0]["id"], 200);
+        done.insert(200, 0);
+        let ev2 = [e];
+        let cv2 = [c];
+        assert!(filter_fresh_events(&ev2, &cv2, &done).is_empty(), "全处理过 → 不调 LLM");
     }
 }
 
@@ -1099,6 +1168,14 @@ fn collect_state(cfg: &SlowConfig) -> SlowView {
     // 局内会话纪元：指纹 + 局内状态目录的创建时刻（clear_save_state 重建目录 → 纪元变化）。
     //   前端看到纪元变了就清空对话流（换局/读档重开）。
     view.save_fingerprint = oni_mcp::save::last_seen().map(|s| s.fingerprint).unwrap_or_default();
+    // ★ 方向盘模式（v3 ⑦）：有未完成的用户指令 = 指令模式；否则自主模式。前端据此显示。
+    {
+        let pending_cmd = std::fs::read_to_string(sd.join("commands.jsonl"))
+            .map(|t| t.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .any(|c| !c.get("done").and_then(|v| v.as_bool()).unwrap_or(false)))
+            .unwrap_or(false);
+        view.control_mode = if pending_cmd { "指令模式" } else { "自主模式" }.into();
+    }
     view.session_epoch = std::fs::metadata(&sd).and_then(|m| m.created()).ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
     let diag = snap.get("diagnostics").unwrap_or(&Value::Null);
@@ -1358,12 +1435,20 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         }
     }
 
-    // ★ 主动规划心跳：无事件时周期性唤起 LLM 推进战略，而非干等卡点。
-    let proactive = escs.is_empty() && cmds.is_empty();
+    // ★ v3 ⑤ 事件驱动：同一 escalation / 用户指令只触发一次 LLM 决策。
+    //   快系统每 10s 上报、慢系统每 5s 轮询 → resolve 前同一卡点会被看 2~3 次，
+    //   每次都是完整 prompt 却没有新信息（实测 392 分钟 744 次调用）。
+    let fresh = event_gate(&escs, &cmds);
+    let has_fresh = !fresh.is_empty();
+    // ★ 主动规划心跳：无新事件时才走 60s 心跳；有新事件直接决策。
+    let proactive = !has_fresh;
     if proactive && !should_proactive() {
         return "idle".into();
     }
     if proactive { mark_proactive(); }
+    // 只把**新**事件喂给 LLM：已处理过的卡点/指令不再重复出现在 prompt 里。
+    let escs: Vec<Value> = if has_fresh { fresh.iter().filter(|e| e.get("kind").is_some()).cloned().collect() } else { escs };
+    let cmds: Vec<Value> = if has_fresh { fresh.iter().filter(|e| e.get("kind").is_none()).cloned().collect() } else { cmds };
 
     let prompt = build_prompt(&escs, &cmds, &snap, proactive);
     let decision = if cfg.is_mock() {

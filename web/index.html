@@ -67,7 +67,7 @@ function esc(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'
 function time(ts){if(!ts)return'';var d=new Date(ts*1000);return d.toLocaleTimeString();}
 async function refresh(){
   var r=await fetch('/api/state'); if(!r.ok) return; var s=await r.json();
-  document.getElementById('mode').textContent='['+s.mode+'] '+time(s.updated_at);
+  document.getElementById('mode').textContent='['+s.mode+'] '+(s.control_mode||'')+' '+time(s.updated_at);
   document.getElementById('worldState').textContent=s.paused?'世界:已暂停':'世界:运行中';
   var tog=document.getElementById('aiToggle');
   if(s.ai_enabled===false){
