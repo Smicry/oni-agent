@@ -66,7 +66,7 @@ fn main() -> ExitCode {
         "serve" => cmd_serve(),
         "window" => cmd_window(&rest),
         "hold" => cmd_hold(&rest),
-        "release" => cmd_release(),
+        "release" => cmd_release(&rest),
         "pause" => cmd_pause_resume(&rest, true),
         "resume" => cmd_pause_resume(&rest, false),
         "help" | "--help" | "-h" => {
@@ -916,9 +916,12 @@ fn cmd_window(args: &[String]) -> anyhow::Result<()> {
 fn cmd_hold(args: &[String]) -> anyhow::Result<()> {
     // 暂停游戏 + 写 hold 标记：主 agent 改代码/深挖期间冻结世界，保持观察权。
     let reason = args.first().cloned().unwrap_or_else(|| "主 agent 正在处理".into());
-    oni_engine::agent::write_hold(&reason).map_err(|e| anyhow::anyhow!("写 hold 标记失败: {e}"))?;
-    oni_engine::control::pause(oni_engine::control::Owner::Hold, &reason);
     let s = connect()?;
+    // 记录 hold 时的周期：release 时校验世界有没有被推进（见 cmd_release）
+    let cycle = s.read_json("oni://colony/status").ok()
+        .and_then(|v| v.get("cycle").and_then(|c| c.as_i64())).unwrap_or(0);
+    oni_engine::agent::write_hold(&reason, cycle).map_err(|e| anyhow::anyhow!("写 hold 标记失败: {e}"))?;
+    oni_engine::control::pause(oni_engine::control::Owner::Hold, &reason);
     let out = s.call_text("game_control", serde_json::json!({
         "domain": "speed", "action": "pause",
         "task": format!("oni: hold — {reason}"),
@@ -930,7 +933,27 @@ fn cmd_hold(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_release() -> anyhow::Result<()> {
+fn cmd_release(args: &[String]) -> anyhow::Result<()> {
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
+    // ★ 安全壳：release 前校验世界没有漂走。
+    //   hold 的语义是"冻结世界"，但只有代理进程在跑时才守得住——进程被 kill 后
+    //   游戏可能被手动/残留进程推进。实测：hold 期间游戏跑了 13 个周期、殖民地全灭，
+    //   而 release 脚本无脑解除 → 代理在一个已死的局上继续决策。
+    //   规则：hold 文件里记录 hold 时的周期；release 时周期变了 → 拒绝（除非 --force）。
+    if !force {
+        if let Some(held_cycle) = oni_engine::agent::hold_cycle() {
+            if let Ok(s) = connect() {
+                let now_cycle = s.read_json("oni://colony/status").ok()
+                    .and_then(|v| v.get("cycle").and_then(|c| c.as_i64())).unwrap_or(0);
+                if now_cycle != held_cycle {
+                    anyhow::bail!(
+                        "⛔ release 拒绝：hold 时周期 {}，现在周期 {} —— 世界在 hold 期间被推进了 {} 个周期。\n   代理的 decisions/窗口还是 hold 时的，直接 release 会让它用旧记忆面对新世界。\n   先 oni observe 核对局面；确认无误用 oni release --force（会清局内上下文后解除）。",
+                        held_cycle, now_cycle, (now_cycle - held_cycle).abs()
+                    );
+                }
+            }
+        }
+    }
     oni_engine::agent::clear_hold();
     oni_engine::control::resume(oni_engine::control::Owner::Hold);
     println!("✅ hold 已解除：代理恢复自主循环（需要时用 `oni window <秒>` 开施工窗口）");

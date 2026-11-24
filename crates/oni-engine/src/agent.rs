@@ -60,20 +60,28 @@ pub fn hold_path() -> std::path::PathBuf {
 }
 
 /// 写 hold 标记（主 agent 开始改代码时调用）。
-pub fn write_hold(reason: &str) -> std::io::Result<()> {
+pub fn write_hold(reason: &str, cycle: i64) -> std::io::Result<()> {
     let path = hold_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, reason)
+    std::fs::write(&path, reason)?;
+    // 记录 hold 时的周期：release 时校验世界有没有被推进（见 cmd_release）
+    std::fs::write(path.with_extension("cycle"), cycle.to_string())
 }
 
 /// 清除 hold 标记（主 agent 改完代码后调用）。
 pub fn clear_hold() {
     let _ = std::fs::remove_file(hold_path());
+    let _ = std::fs::remove_file(hold_path().with_extension("cycle"));
 }
 
 /// 是否处于 hold 状态。
+/// hold 时记录的游戏周期（用于 release 前校验世界有没有被推进）。None = 未记录。
+pub fn hold_cycle() -> Option<i64> {
+    std::fs::read_to_string(hold_path().with_extension("cycle")).ok()?.trim().parse().ok()
+}
+
 pub fn hold_active() -> bool {
     hold_path().exists()
 }
@@ -2722,7 +2730,7 @@ mod tests {
     fn hold_roundtrip() {
         let _ = clear_hold();
         assert!(!hold_active());
-        write_hold("test").expect("write hold");
+        write_hold("test", 7).expect("write hold");
         assert!(hold_active());
         clear_hold();
         assert!(!hold_active());
