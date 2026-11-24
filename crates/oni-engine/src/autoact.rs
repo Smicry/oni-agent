@@ -750,17 +750,16 @@ pub fn parse_goal(s: &str) -> Option<Goal> {
         return Some(Goal::Forage);
     }
     let e = s.strip_prefix("element:").unwrap_or(s);
-    let known = [
-        "Algae", "OxyRock", "SandStone", "Sand", "Carbon", "Cuprite", "Dirt", "Clay", "Coal",
-        // 铁矿必须在内：研究站/电解器/发电机/电池/矿物脱氧机
-        //   **全部**要 IronOre，而铁矿深埋。
-        //   known 列表没有它 → element:IronOre 解析失败 → "语义目标找不到" → 节点卡死。
-        "IronOre", "GoldAmalgam", "Steel", "UraniumOre", "AluminumOre", "Cobalt",
-    ];
-    for k in known {
-        if e.eq_ignore_ascii_case(k) {
-            return Some(Goal::Element(k));
-        }
+    // ★ 契约层：element:X 不再手写白名单。
+    //   旧白名单 16 个元素，LLM 写 element:Gold 就解析失败（实测）→ "无法解析的 goal" → 节点卡死。
+    //   每加一个元素就改代码 = §0.4 第一条反模式（判据字段只认一种写法）。
+    //   正解：只要 X 是合法元素 ID 形态（字母/数字/下划线，首字母大写）就接受；
+    //   元素是否真的存在于地图，由执行器编译时查（它本来就要查）——那是执行器的事。
+    if !e.is_empty()
+        && e.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+        && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Some(Goal::Element(Box::leak(e.to_string().into_boxed_str())));
     }
     None
 }
@@ -1885,6 +1884,20 @@ BasicForagePlantPlanted@(131,199) PrickleGrass@(132,199) BasicSingleHarvestPlant
     }
 
     /// 产氧语义目标能被解析（"oxygen" / "产氧" 两种写法）。
+    /// ★ 回归：element:X 不再手写白名单——LLM 写 element:Gold 必须能解析。
+    ///   旧白名单 16 个元素，第 17 个就卡死（实测 W2「采掘金矿」连续 no_target）。
+    #[test]
+    fn any_valid_element_id_parses() {
+        for el in ["Gold", "GoldAmalgam", "IronOre", "Tungsten", "Niobium", "Isoresin", "Phosphorite", "some_New_Ore2"] {
+            assert!(parse_goal(&format!("element:{el}")).is_some(), "element:{el} 必须可解析");
+        }
+        // 非法形态仍拒绝
+        assert!(parse_goal("element:").is_none());
+        assert!(parse_goal("element:123abc").is_none(), "首字符必须是字母");
+        assert!(parse_goal("element:Iron Ore").is_none(), "不能含空格");
+        assert!(parse_goal("element:Iron;Ore").is_none(), "不能含分号");
+    }
+
     #[test]
     fn oxygen_goal_parses() {
         assert_eq!(parse_goal("oxygen"), Some(Goal::Oxygen));
