@@ -41,6 +41,40 @@ pub struct SaveId {
     /// 首次见到这个存档的时间（unix 秒）
     #[serde(default)]
     pub first_seen: i64,
+    /// 当前加载的**存档文件**（mod `game_control launch status` 的 activeSaveFile）。
+    ///
+    /// 比"存档名"强得多：同名存档 / 同一局读到更早的自动存档，文件路径都不同 → 时间线不同。
+    /// 指纹公式**不含**它（改公式会让所有存档首次运行都被判成新局）；切换判定单独比这个字段。
+    #[serde(default)]
+    pub save_file: String,
+    #[serde(default)]
+    pub save_size: u64,
+    #[serde(default)]
+    pub save_mtime: i64,
+}
+
+/// 从 `game_control launch status` 文本解析 activeSaveFile（当前加载的存档文件路径）。
+pub fn parse_active_save_file(text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.trim_start().starts_with("activeSaveFile:"))
+        .and_then(|l| l.splitn(2, ':').nth(1))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// 存档文件元信息 (大小, mtime unix 秒)。文件不可达返回 (0, 0)（存档在别的机器/云路径时）。
+pub fn file_meta(path: &str) -> (u64, i64) {
+    std::fs::metadata(path)
+        .map(|m| {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            (m.len(), mt)
+        })
+        .unwrap_or((0, 0))
 }
 
 static CURRENT: OnceLock<Mutex<Option<SaveId>>> = OnceLock::new();
@@ -151,6 +185,14 @@ pub fn identify(session: &McpSession) -> Option<SaveId> {
     }
     let anchor = printing_pod_anchor(session).unwrap_or_default();
     let fingerprint = fingerprint_of(&[&name, &world, &world_id.to_string(), &anchor]);
+    // ★ 存档文件身份：同名存档 / 读更早的自动存档 → 路径不同 → 时间线不同（切换判定单独比它）
+    let save_file = session
+        .call_text("game_control", serde_json::json!({
+            "domain": "launch", "action": "status", "task": "存档身份：当前加载的存档文件" }))
+        .ok()
+        .and_then(|t| parse_active_save_file(&t))
+        .unwrap_or_default();
+    let (save_size, save_mtime) = file_meta(&save_file);
     Some(SaveId {
         fingerprint,
         name,
@@ -158,6 +200,9 @@ pub fn identify(session: &McpSession) -> Option<SaveId> {
         world_id,
         anchor,
         first_seen: now(),
+        save_file,
+        save_size,
+        save_mtime,
     })
 }
 
@@ -250,3 +295,29 @@ pub fn write_meta(id: &SaveId) {
     );
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// activeSaveFile 解析：取第一处、去空白、空值不算。
+    #[test]
+    fn parse_active_save_file_line() {
+        let t = "gameInitialized: true\nloaded: true\nactiveSaveFile: /Users/x/Library/陨石坑/陨石坑.sav\nactiveSaveFolder: /Users/x\n";
+        assert_eq!(parse_active_save_file(t).as_deref(), Some("/Users/x/Library/陨石坑/陨石坑.sav"));
+        assert_eq!(parse_active_save_file("activeSaveFile: \n"), None);
+        assert_eq!(parse_active_save_file("nope"), None);
+    }
+
+    /// 存档文件元信息：存在 → (大小, mtime)；不可达 → (0, 0)，不 panic。
+    #[test]
+    fn file_meta_reads_size_and_mtime() {
+        let p = std::env::temp_dir().join(format!("oni-save-meta-{}", std::process::id()));
+        std::fs::write(&p, b"hello").unwrap();
+        let (size, mt) = file_meta(p.to_str().unwrap());
+        assert_eq!(size, 5);
+        assert!(mt > 1_600_000_000, "mtime={mt}");
+        assert_eq!(file_meta("/definitely/not/here.sav"), (0, 0));
+        let _ = std::fs::remove_file(&p);
+    }
+}

@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         "status" => cmd_status(),
         "audit" => cmd_audit(),
         "bus" => cmd_bus(&rest),
+        "brief" => cmd_brief(),
         "command" => cmd_command(&rest),
         "decision" => cmd_decision(&rest),
         "scout" => cmd_scout(),
@@ -1032,6 +1033,17 @@ impl Drop for DaemonLock {
 
 /// 统一启动：一个进程同时跑快系统(agent循环) + 慢系统(LLM决策+Web)。
 /// 配置从项目根 agent.toml 读取（复制 agent.example.toml 填写）。
+/// 打印「大脑此刻看到的事实简报」（window::facts_summary，决策与窗口 prompt 共用）。
+/// 审计传感器信息是否准确、足够时，一条命令就能看到慢系统拿到什么。
+fn cmd_brief() -> anyhow::Result<()> {
+    let s = connect()?;
+    let snap = oni_engine::sense::sense(&s);
+    let v = serde_json::to_value(&snap)?;
+    let cycle = v.get("cycle").and_then(|c| c.as_i64()).unwrap_or(0);
+    println!("{}", oni_engine::window::facts_summary(&v, cycle));
+    Ok(())
+}
+
 fn cmd_serve() -> anyhow::Result<()> {
     let _lock = acquire_daemon_lock("serve")?;
     use oni_engine::agent::{Agent, AgentConfig};

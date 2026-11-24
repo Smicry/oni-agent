@@ -161,6 +161,24 @@ pub fn plan_looks_stale(plan_path: &str) -> bool {
     })
 }
 
+/// 是不是换了一条时间线：指纹变了，或**存档文件**变了（同名存档 / 同一局读到更早的自动存档）。
+///
+/// 为什么加文件：指纹 = 存档名 + 世界 + 打印舱锚点，同名存档可能指纹相同；
+///   而读更早的自动存档（`auto_save/陨石坑 Cycle 3.sav`）名字、锚点都一样，只有**路径**不同。
+///   只在两边都知道路径时才比（mod 没报路径时不误判）。指纹公式本身不含路径（改公式会让所有存档首跑被判新局）。
+pub fn timeline_changed(last: Option<&SaveId>, new: &SaveId, plan_fp: Option<&str>) -> bool {
+    let file_changed = last
+        .map(|l| !l.save_file.is_empty() && !new.save_file.is_empty() && l.save_file != new.save_file)
+        .unwrap_or(false);
+    if file_changed {
+        return true;
+    }
+    if plan_fp == Some(new.fingerprint.as_str()) {
+        return false;
+    }
+    last.map(|l| l.fingerprint != new.fingerprint).unwrap_or(true)
+}
+
 /// 每轮调用：识别当前存档 → 发现切换就自动隔离。
 ///
 /// 返回 Some 表示**这次切换了存档**（调用方应该打一条显眼日志）。
@@ -176,15 +194,9 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
     //   meta 一旦丢了（换机器 / 换存档读档 / 手改 plan.json 没打指纹）就会误报
     //   「检测到换存档」→ 归档 + 刷屏，
     //   让人以为计划被重置（实际只是补了个指纹）。
-    if plan_fp.as_deref() == Some(new.fingerprint.as_str()) {
+    if !timeline_changed(last.as_ref(), &new, plan_fp.as_deref()) {
         save::set_current(new);
         return None;
-    }
-    if let Some(l) = &last {
-        if l.fingerprint == new.fingerprint {
-            save::set_current(new);
-            return None;
-        }
     }
 
     // 切换了
@@ -228,6 +240,24 @@ mod tests {
     fn tmp(name: &str) -> String {
         let p = std::env::temp_dir().join(format!("oni-saveswitch-{name}-{}", std::process::id()));
         p.to_string_lossy().to_string()
+    }
+
+    fn id(fp: &str, file: &str) -> SaveId {
+        SaveId { fingerprint: fp.into(), name: "陨石坑".into(), world: "埃莉星".into(), world_id: 0,
+            anchor: "(130,192)".into(), first_seen: 0, save_file: file.into(), save_size: 0, save_mtime: 0 }
+    }
+
+    /// 存档文件变了 = 换了时间线，哪怕指纹（名字/世界/锚点）完全相同：同名存档、读更早的自动存档。
+    #[test]
+    fn timeline_changes_when_save_file_changes_even_if_fingerprint_matches() {
+        let a = id("fp1", "/saves/陨石坑/陨石坑.sav");
+        let b = id("fp1", "/saves/陨石坑/auto_save/陨石坑 Cycle 3.sav");
+        assert!(timeline_changed(Some(&a), &b, Some("fp1")), "同名同指纹但文件不同 → 切换");
+        assert!(!timeline_changed(Some(&a), &id("fp1", "/saves/陨石坑/陨石坑.sav"), Some("fp1")), "同文件 → 同一时间线");
+        assert!(!timeline_changed(Some(&id("fp1", "")), &id("fp1", "/x.sav"), Some("fp1")), "mod 没报旧路径 → 不按文件误判");
+        assert!(timeline_changed(Some(&id("fp1", "/x.sav")), &id("fp2", "/x.sav"), None), "指纹变了 → 切换");
+        assert!(!timeline_changed(Some(&id("fp1", "/x.sav")), &id("fp1", "/x.sav"), None), "计划没指纹但 last_seen 同指纹 → 同一时间线");
+        assert!(timeline_changed(None, &a, None), "第一次见 → 切换");
     }
 
     #[test]

@@ -131,6 +131,30 @@ impl Transport {
     pub fn session_id(&self) -> Option<String> {
         self.session_id.lock().ok().and_then(|g| g.clone())
     }
+
+    /// 重新握手：丢弃旧 `Mcp-Session-Id`，重新 `initialize`。
+    ///
+    /// 为什么需要：mod 端对**长连接 session** 的"可见世界扫描"类字段
+    ///   （cycle / buildings / 体征 / paused）在游戏长时间暂停后会停止更新，
+    ///   而同一响应里的实时字段（foodKcal）还在变 → 半冻结快照。
+    ///   新 session 一切正常（实测：serve 看到 cycle 1/厕所 0/膀胱 86 持续 25 分钟，
+    ///   新进程直读同一 URI 是 cycle 2/厕所 1/膀胱 0）。
+    ///   传感器不能无限信任一条 session：世界运行态变化后 / 周期性重连。
+    pub fn reinitialize(&self) -> Result<(), McpError> {
+        if let Ok(mut g) = self.session_id.lock() {
+            *g = None;
+        }
+        self.request(
+            "initialize",
+            Some(json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "oni-agent", "version": "0.1.0" }
+            })),
+        )?;
+        self.notify("notifications/initialized", None);
+        Ok(())
+    }
 }
 
 /// Streamable HTTP 可能返回 SSE 帧；取最后一个 `data:` 行。

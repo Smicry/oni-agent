@@ -91,8 +91,12 @@ impl McpSession {
                     *guard = Some(result.as_ref().map_err(|e| e.to_string()).cloned());
                     cv.notify_all();
                     drop(guard);
-                    // 槽位留着不删：删会有竞态（新线程可能刚加入）。
-                    // 后续读走缓存（TTL 8s），缓存过期后自然会有新的 leader。
+                    // ★ 槽位**必须移除**：singleflight 只合并"并发"读。
+                    //   旧实现留着不删 → 下一次缓存过期的读者 map.get(uri)=Some → 走 waiter
+                    //   分支 → 拿到槽里**第一次**的结果 → 该 URI 永远不会再有新 leader
+                    //   （旧注释说"缓存过期后自然会有新的 leader"，但代码做不到）。
+                    //   等待者持有的是 Arc 克隆：先写结果+唤醒、再移除 map 条目，它们照常拿到结果。
+                    self.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(uri);
                     let v = result?;
                     if let Ok(text) = serde_json::to_string(&v) {
                         self.cache.put(uri, &text);
@@ -134,6 +138,22 @@ impl McpSession {
         Ok(content_text(&self.read_resource(uri)?))
     }
 
+    /// 重新握手并清空 singleflight 槽位与缓存（见 [`Transport::reinitialize`]）。
+    ///
+    /// 什么时候调：世界运行态变化（代理恢复游戏）后 + 周期性兜底。
+    /// 失败不致命：下一轮照常用旧 session，下次再试。
+    pub fn refresh(&self) -> Result<(), McpError> {
+        self.t.reinitialize()?;
+        self.inflight.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.cache.clear();
+        Ok(())
+    }
+
+    /// 在飞槽位数（诊断 / 测试用）。完成的读不应留下槽位。
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// 读资源并解析 JSON。解析失败是错误，不做静默降级。
     pub fn read_json(&self, uri: &str) -> Result<Value, McpError> {
         let raw = self.read_text(uri)?;
@@ -143,6 +163,91 @@ impl McpSession {
     /// 调工具并取文本（工具返回 `content[].text`，通常是 YAML 片段）。
     pub fn call_text(&self, name: &str, args: Value) -> Result<String, McpError> {
         Ok(content_text(&self.call_tool(name, args)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 本地 mock 端点：每个 `resources/read` 返回递增编号，其余请求回空结果。
+    /// 支持keep-alive（同一条连接上循环读请求）。
+    fn mock_endpoint() -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let counter = counter.clone();
+                std::thread::spawn(move || loop {
+                    // 读到 headers 结束，再按 Content-Length 读完 body
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let (mut head_end, mut len) = (None, 0usize);
+                    loop {
+                        let k = match stream.read(&mut tmp) { Ok(0) | Err(_) => return, Ok(k) => k };
+                        buf.extend_from_slice(&tmp[..k]);
+                        if head_end.is_none() {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") { head_end = Some(p + 4); }
+                        }
+                        if let Some(he) = head_end {
+                            let head = String::from_utf8_lossy(&buf[..he]).to_string();
+                            len = head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                                .and_then(|l| l.split(':').nth(1)).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                            if buf.len() >= he + len { break; }
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).to_string();
+                    let (body, sid): (String, Option<&str>) = if req.contains("\"initialize\"") {
+                        (json!({"jsonrpc":"2.0","id":1,"result":{}}).to_string(), Some("s1"))
+                    } else if req.contains("resources/read") {
+                        let c = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        (json!({"jsonrpc":"2.0","id":2,"result":{"contents":[{"text":format!("read#{c}")}]}}).to_string(), None)
+                    } else {
+                        (json!({"jsonrpc":"2.0","id":3,"result":{}}).to_string(), None)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}",
+                        body.len(),
+                        sid.map(|s| format!("Mcp-Session-Id: {s}\r\n")).unwrap_or_default(),
+                        body);
+                    if stream.write_all(resp.as_bytes()).is_err() { return; }
+                });
+            }
+        });
+        (format!("http://{addr}/mcp/"), h)
+    }
+
+    /// singleflight 只合并**并发**读：缓存过期后的第二次读必须真的再打到端点。
+    ///   旧实现 leader 完成后槽位不删 → 第二次读走 waiter 分支拿到第一次的结果
+    ///   → 该 URI 在这个 session 里永久冻结（serve 实测：diagnostics 25 分钟不更新）。
+    #[test]
+    fn second_read_after_cache_expiry_hits_the_endpoint() {
+        std::env::set_var("ONI_MAX_CONCURRENT", "16");
+        std::env::set_var("ONI_STATE_DIR", std::env::temp_dir().join(format!("oni-test-state-{}", std::process::id())));
+        let (url, _h) = mock_endpoint();
+        let s = McpSession::connect(&url).unwrap();
+        let a = s.read_text("oni://test/x").unwrap();
+        s.cache.clear(); // 模拟 TTL 过期
+        let b = s.read_text("oni://test/x").unwrap();
+        assert_ne!(a, b, "缓存清空后的第二次读必须真的打到端点（槽位泄漏）：a={a} b={b}");
+        assert_eq!(s.inflight_len(), 0, "完成的读不应留下在飞槽位");
+    }
+
+    /// refresh() 必须让下一次读拿到新请求（而不是旧 session 的旧槽/旧缓存）。
+    #[test]
+    fn refresh_clears_cache_and_slots() {
+        std::env::set_var("ONI_MAX_CONCURRENT", "16");
+        std::env::set_var("ONI_STATE_DIR", std::env::temp_dir().join(format!("oni-test-state-{}", std::process::id())));
+        let (url, _h) = mock_endpoint();
+        let s = McpSession::connect(&url).unwrap();
+        let a = s.read_text("oni://test/y").unwrap();
+        s.refresh().unwrap();
+        let b = s.read_text("oni://test/y").unwrap();
+        assert_ne!(a, b, "refresh 后必须重新请求：a={a} b={b}");
+        assert_eq!(s.inflight_len(), 0);
     }
 }
 

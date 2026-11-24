@@ -151,6 +151,23 @@ cargo build --release
 - `oni://colony/status` 走 **1s TTL** 的秒级新鲜度（`cache.rs` 的 per-URI 覆盖），
   其余观察源 8s。**关键状态不绕过缓存**——同一套 singleflight 合并并发读，既新鲜又不打爆端点。
 - 世界判停时：**不下工单、不计进展、不熔断**，只观察（快系统 `can_execute=false`）。
+- **传感器 session 不无限信任**（2026-11-24 实测）：mod 对长连接 session 的"可见世界扫描"类字段
+  （cycle / buildings / 体征 / paused）会在游戏长时间暂停后停止更新，而同一响应里的实时字段（foodKcal）还在变
+  → 半冻结快照 → 快系统拿着 14 小时前的"厕所 0 / 膀胱 86"决策。新 session 一切正常。
+  规则：代理恢复游戏后立即 `McpSession::refresh()`，另每 5 分钟周期重连兜底；singleflight 只合并**并发**读，
+  完成的槽位必须移除（留着不删 = 该 URI 永久返回第一次结果）。
+- **MCP 数据是否过期用心跳判，不靠猜**（`sense::SensorHealth`）：`game_control time` 的 `realtimeSinceStartup`
+  是游戏进程墙钟，暂停/换档照样走、必然递增；两次快照**相等**（间隔 ≥3s）= 响应是缓存 → `health=stale` →
+  立即重连、快系统本轮不下工单、慢系统不规划、简报第一行喊停；**回退** = 游戏重启 → 重连并重新识别存档。
+  各数据源交叉印证（status/diagnostics 的周期、人口与名单）不一致 → `degraded`，对应字段标不可信。
+  **换档**（`saveswitch` 指纹变化）也立即重连 session：mod 对旧 session 的扫描可能还会喂几拍旧世界的数据。
+- **对局身份 = 指纹 + 存档文件 + 时钟连续性**（缺一不可）：指纹（存档名+世界+锚点）分不清同名存档和
+  "读到更早的自动存档"；`game_control launch status` 的 `activeSaveFile` 路径不同 = 换了时间线
+  （`saveswitch::timeline_changed`）；游戏时钟 `(cycle, timeOfDayPercent)` **只能前进**，任何回退
+  （哪怕同周期内）= 读回保存点 → 世界被改写，重连 session 并在简报标注。指纹公式不含路径
+  （改公式会让所有存档首跑被判成新局）。
+- **大脑不得操作总开关**：hold = 用户关闭 AI，是唯一用户停止信号；LLM 元命令在 hold 期间对
+  `hold/release/pause/resume/window` 封口（`validate_llm_command`），解除只能是人。
 
 ## 8. 依赖图（plan.json）
 
@@ -183,6 +200,11 @@ AI 不在时宁可停摆，也不让 if-else 规则越权做战略判断。
 - 设备选址查气体元素，不只是 Kind::Gas；人要待在设备里的必须过可呼吸检查。
 - 跨进程共享状态用 `last_seen()` 这类稳定源，不用进程内 `current()`。
 - 失败要可见：静默 skip / 只写日志 = 看着在处理、实际没做。
+- **测试不得碰真实 `~/.oni-agent`**（2026-11-24 两次事故）：`hold_roundtrip` 对真实 hold 文件做 clear
+  → 主 agent/用户的 hold 被 `cargo test` 解掉 → 世界在不知情下恢复。写状态的测试一律先 `isolate_state_dir()`
+  （`ONI_STATE_DIR` 指到临时目录）。
+- **给大脑的事实摘要只走传感器访问器**（`sense::Snapshot`），不手写 JSON 路径；读不到标"未知"而不是 0。
+  实测 `gas.oxygenKg / food.kcal` 路径不存在 → 399kg 氧气 / 16000kcal 食物被报成 0 → 窗口按假饥荒排序。
 
 ## 10. 决策记录
 

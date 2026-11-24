@@ -26,6 +26,13 @@ pub use transport::{McpError, Transport, PROTOCOL_VERSION};
 /// 仓库改名后统一走这里；旧目录 `~/.oni-mcp` 首次访问时自动迁移，
 /// 免得丢缓存与趋势样本。
 pub fn state_dir() -> std::path::PathBuf {
+    // ★ 隔离口：`ONI_STATE_DIR` 指向别处时一律用它（测试用临时目录）。
+    //   实测事故：`cargo test` 里的 hold_roundtrip 对**真实** ~/.oni-agent/hold 做 clear_hold
+    //   → 主 agent / 用户的 hold 被测试解掉 → 世界在不知情下恢复运行（两次）。
+    //   测试绝不碰真实用户状态。
+    if let Some(d) = std::env::var_os("ONI_STATE_DIR") {
+        return std::path::PathBuf::from(d);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let new = std::path::PathBuf::from(&home).join(".oni-agent");
     let old = std::path::PathBuf::from(&home).join(".oni-mcp");

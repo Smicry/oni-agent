@@ -95,61 +95,134 @@ fn recent_outcomes(sd: &std::path::Path, n: usize) -> String {
 }
 
 
-/// 把 live_snapshot 压成 LLM 一眼能看懂的**关键事实摘要**（滚动窗口用）。
+/// 把 live_snapshot 压成 LLM 一眼能看懂的**传感器→大脑统一简报**（决策 prompt 与窗口 prompt 共用）。
 ///
 /// 为什么不直接丢整份快照：快照几百行 JSON，LLM 看到了 `"inventory": []` 却推不出
 /// "零建材 → 任何建造前必须先挖"（实测窗口 W1 直接排建厕所/供电/制氧 → 全部因缺材料失败）。
 /// 摘要把**决策真正依赖的数字**放最前面，并显式标出"物理约束是否触发"。
 pub fn facts_summary(snap: &serde_json::Value, cycle: i64) -> String {
-    let num = |v: &serde_json::Value, path: &[&str]| -> f64 {
-        let mut cur = v;
-        for k in path { cur = &cur[*k]; }
-        cur.as_f64().unwrap_or(0.0)
+    // ★ 取数一律走传感器层的类型化访问器（sense::Snapshot），这里**不手写 JSON 路径**。
+    //   实测：手写的 gas.oxygenKg / food.kcal / buildings.toilets 在快照里都不存在
+    //   （真路径：diagnostics.oxygenKgVisible / inventory.items[].totalCaloriesKcal /
+    //   diagnostics.buildings.toilets）→ unwrap_or(0.0) 把 399kg 氧气、16000kcal 食物报成 0
+    //   → 大脑按假饥荒排窗口（产氧/觅食），判据写成"食物≥1 kcal"一拍就假 done。
+    //   传感器没报的数字一律标"未知"（AGENTS.md §9：读不到 ≠ 极值）。
+    let s: crate::sense::Snapshot = match serde_json::from_value(snap.clone()) {
+        Ok(s) => s,
+        Err(e) => return format!(
+            "周期 {cycle}；⚠ 快照无法解析为 Snapshot（{e}）→ 事实未知，不要假设任何存量为 0"),
     };
-    let inventory = snap.get("inventory").and_then(|v| v.get("items")).and_then(|v| v.as_array());
+    // ★ 这是**唯一**的传感器→大脑简报：决策 prompt（选目标/解卡点）和窗口 prompt（排 3 步）都用它。
+    //   之前决策 prompt 自己手写了另一份（只有周期/暂停/食物/氧气 + 名字/位置/chore/膀胱），
+    //   LLM 看不到建筑数/电力/建材/续航/在途工单/游戏告警/传感器失败 → 按想象做决定
+    //   （实测：不知道有厕所→"厕所不足"；不知道 (129,191) 是 Tile→在地板上放梯子；
+    //   不知道电力状态→排电解器）。覆盖面 = 五条生命线 + 在途工作 + 传感器健康，不多不少。
+    let opt = |v: Option<f64>| v.map(|k| format!("{k:.0}")).unwrap_or_else(|| "未知".into());
     let mat_tags = ["SandStone", "Dirt", "Algae", "Sand", "Clay", "Cuprite", "Carbon", "IronOre"];
     let mut mat_lines = Vec::new();
     let mut loose_total = 0.0;
     for tag in mat_tags {
-        let kg: f64 = inventory
-            .map(|a| a.iter().filter(|it| it.get("elementId").and_then(|x| x.as_str()) == Some(tag))
-                .filter_map(|it| it.get("totalMassKg").and_then(|m| m.as_f64())).sum())
-            .unwrap_or(0.0);
+        let kg = s.loose_kg(tag);
         if kg > 0.0 {
             mat_lines.push(format!("  {tag}: {kg:.0} kg"));
             if ["SandStone", "Dirt", "Algae", "Sand", "Clay"].contains(&tag) { loose_total += kg; }
         }
     }
-    let build_mat_zero = loose_total < 50.0;
-    let dupes = snap.get("dupes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let bladder = snap.get("dupes").and_then(|v| v.as_array()).map(|a| {
-        a.iter().filter_map(|d| d.get("bladder").and_then(|b| b.as_f64())).fold(0.0, f64::max)
-    }).unwrap_or(0.0);
-    let min_breath = snap.get("dupes").and_then(|v| v.as_array()).map(|a| {
-        a.iter().filter_map(|d| d.get("breath").and_then(|b| b.as_f64())).fold(100.0, f64::min)
-    }).unwrap_or(100.0);
-    let reachable = num(snap, &["reachable_cells"]);
-    let oxygen_kg = num(snap, &["gas", "oxygenKg"]);
-    let food_kcal = num(snap, &["food", "kcal"]);
-    let pending = num(snap, &["pending_orders"]);
-    let mut s = String::new();
-    s.push_str(&format!("周期 {cycle}；人口 {dupes}；可达格 {reachable:.0}；最低呼吸 {min_breath:.0}%；最高膀胱 {bladder:.0}%\n"));
-    s.push_str(&format!("氧气 {oxygen_kg:.0} kg；食物 {food_kcal:.0} kcal；待办工单 {pending:.0}\n"));
-    if mat_lines.is_empty() {
-        s.push_str("地上散装材料：**0（什么都没有）**\n");
+    // 只有传感器真的报了 inventory 才能断言"建材为零"；inventory 缺失 ≠ 没有
+    let inventory_known = s.inventory.get("items").map(|v| v.is_array()).unwrap_or(false);
+    let build_mat_zero = inventory_known && loose_total < 50.0;
+    let dupes = s.dupes.len();
+    let bladder = s.max_bladder();
+    let min_breath = s.dupes.iter().filter_map(|d| d.breath).fold(f64::INFINITY, f64::min);
+    let breath_txt = if min_breath.is_finite() { format!("{min_breath:.0}%") } else { "未知".to_string() };
+    // 官方可达格为 0 而复制人还站着 → 顶层读数没采到，退到每人的可达数；都没有才是"未知"
+    let reachable = if s.reachable_cells > 0 {
+        s.reachable_cells.to_string()
     } else {
-        s.push_str(&format!("地上散装材料：\n{}\n", mat_lines.join("\n")));
+        s.dupes.iter().filter_map(|d| d.reachable).max()
+            .map(|r| format!("{r}（按每人）")).unwrap_or_else(|| "未知".into())
+    };
+    let oxygen = s.oxygen_kg_opt().map(|k| format!("{k:.0} kg")).unwrap_or_else(|| "未知".into());
+    let food = s.food_kcal_opt().map(|k| format!("{k:.0} kcal")).unwrap_or_else(|| "未知".into());
+    let pending = s.pending_orders.map(|n| n.to_string()).unwrap_or_else(|| "未知".into());
+    // ---- 续航（§8：用续航不用绝对值）----
+    let food_days = s.food.get("daysRemaining").and_then(|v| v.as_f64());
+    let food_status = s.food.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let o2_per_dupe = s.atmos_num("oxygenPerDupeKg");
+    // 氧气续航没有官方值：按复制人呼吸 100 g/s ≈ 60 kg/人/周期估算，假设写在文案里让 LLM 可推翻
+    let o2_cycles = if o2_per_dupe > 0.0 { format!("{:.1}", o2_per_dupe / 60.0) } else { "未知".into() };
+    let world = if s.paused || (s.game_speed >= 0.0 && s.game_speed <= 0.0) { "暂停/速度0" } else { "运行中" };
+    let mut out = String::new();
+    // ★ 传感器健康放第一行：数据可能过期时，下面所有数字都不该用来规划
+    match s.health {
+        crate::sense::SensorHealth::Stale => out.push_str(&format!(
+            "⚠ 传感器数据可能过期（mod 心跳未推进）→ 不要据此规划或换目标；{}\n", s.health_notes.join("；"))),
+        crate::sense::SensorHealth::Degraded => out.push_str(&format!(
+            "⚠ 传感器降级（对应数字不可信，不要当成 0）：{}\n", s.health_notes.join("；"))),
+        crate::sense::SensorHealth::Ok => {}
+    }
+    out.push_str(&format!("周期 {cycle}；人口 {dupes}；世界 {world}；可达格 {reachable}；最低呼吸 {breath_txt}；最高膀胱 {bladder:.0}%\n"));
+    // ★ 日程事实（官方 workScheduled）：全员睡觉时重算窗口，LLM 必须知道"工单要等开工才执行"。
+    //   实测 23:53 全员就寝时重算，窗口按"现在就能开工"排，醒前的零进展全被读成失败。
+    out.push_str(&format!("日程：{}\n", s.schedule_summary()));
+    // ---- 每个人的体征 + 所处环境（站在污染水/CO₂ 里是选址与救援的关键事实）----
+    if !s.dupes.is_empty() {
+        out.push_str("复制人：\n");
+        for d in &s.dupes {
+            out.push_str(&format!("  {} @({},{}) {} 呼吸{} 压力{} 膀胱{} 站在:{} 可达{}\n",
+                d.name, d.x, d.y, d.chore,
+                opt(d.breath), opt(d.stress), opt(d.bladder), d.element,
+                d.reachable.map(|r| r.to_string()).unwrap_or_else(|| "未知".into())));
+        }
+    }
+    // ---- 大气 / 食物（续航）----
+    out.push_str(&format!(
+        "氧气 {}（{} kg/人，≈{} 周期，按 60kg/人/周期估）；CO₂ {} kg；污染氧 {} kg；窒息风险 {}；可呼吸格 {}/{}\n",
+        oxygen, opt(s.atmos_num("oxygenPerDupeKg").into()), o2_cycles,
+        opt(Some(s.co2_kg())), opt(s.diagnostics.get("pollutedOxygenKgVisible").and_then(|v| v.as_f64())),
+        if s.suffocation_risk().is_empty() { "未知".into() } else { s.suffocation_risk() },
+        opt(Some(s.atmos_num("breathableCells"))), opt(Some(s.atmos_num("totalVisibleCells")))));
+    out.push_str(&format!("食物 {food}（≈{} 周期，mod 口径{}）\n",
+        food_days.map(|d| format!("{d:.1}")).unwrap_or_else(|| "未知".into()),
+        if food_status.is_empty() { String::new() } else { format!("，状态 {food_status}") }));
+    // ---- 建筑与电力（§8「能不能造」三关：材料 + 研究锁 + 运转条件）----
+    out.push_str(&format!("建筑：厕所 {} / 床 {} / 制氧 {} / 研究站 {} / 电池 {}\n",
+        s.building("toilets"), s.building("beds"), s.building("oxygenProducers"),
+        s.building("researchStations"), s.building("batteries")));
+    out.push_str(&format!("电力：发电机 {}（运行 {}，缺燃料 {}）/ 电池 {}（储电 {}%）/ 用电设备 {}（通电 {}）/ 净 {} W\n",
+        s.power_int("generatorCount"), s.power_int("generatorOperational"), s.power_int("generatorEmpty"),
+        s.power_int("batteryCount"), opt(Some(s.power_num("batteryStoredPercent"))),
+        s.power_int("consumerCount"), s.power_int("consumerPowered"), opt(Some(s.power_num("netActiveWatts")))));
+    // ---- 在途工作（有活排队 ≠ 空跑；施工中 ≠ 没人干活）----
+    out.push_str(&format!("在途：待办工单 {pending}；施工中 {}\n", s.under_construction));
+    // ---- 游戏自带告警（官方事实优先）----
+    if let Some(alerts) = s.diagnostics.get("alerts").and_then(|v| v.as_array()) {
+        let lines: Vec<String> = alerts.iter().take(6).filter_map(|a| {
+            let msg = a.get("message").and_then(|m| m.as_str())?;
+            let cat = a.get("category").and_then(|c| c.as_str()).unwrap_or("");
+            let sev = a.get("severity").and_then(|c| c.as_str()).unwrap_or("");
+            Some(format!("[{cat}/{sev}] {msg}"))
+        }).collect();
+        if !lines.is_empty() { out.push_str(&format!("游戏告警：{}\n", lines.join("；"))); }
+    }
+    // ---- 传感器健康：读失败必须可见，否则 LLM 把 0/空当成真值 ----
+    if !s.errors.is_empty() {
+        let urs: Vec<String> = s.errors.iter().take(4).map(|e| e.replace("oni://", "")).collect();
+        out.push_str(&format!("⚠ 传感器：{} 个观察源读取失败（对应数字不可信，不要当成 0）：{}\n", s.errors.len(), urs.join("，")));
+    }
+    if !inventory_known {
+        out.push_str("地上散装材料：未知（传感器未报 inventory）\n");
+    } else if mat_lines.is_empty() {
+        out.push_str("地上散装材料：**0（什么都没有）**\n");
+    } else {
+        out.push_str(&format!("地上散装材料：\n{}\n", mat_lines.join("\n")));
     }
     if build_mat_zero {
-        s.push_str("⚠ 物理约束触发：**建材为零** → 任何建造（厕所/床/发电机/研究站/产氧）都不可能成功，W1 必须是采建材（material）或挖矿（element:X）。\n");
+        out.push_str("⚠ 物理约束触发：**建材为零** → 任何建造（厕所/床/发电机/研究站/产氧）都不可能成功，第一步必须是采建材（material）或挖矿（element:X）。\n");
     }
-    if bladder >= 80.0 { s.push_str("⚠ 卫生红线：有人膀胱 ≥80% → 厕所是最高优先级（但前提是先有建材）。\n"); }
-    if min_breath < 50.0 { s.push_str("⚠ 窒息红线：有人呼吸 <50% → 救援/换气是最高优先级。\n"); }
-    s.push_str(&format!("建筑：厕所 {} / 床 {} / 制氧 {} / 研究站 {} / 发电机 {}\n",
-        num(snap, &["buildings", "toilets"]), num(snap, &["buildings", "beds"]),
-        num(snap, &["buildings", "oxygenProducers"]), num(snap, &["buildings", "researchStations"]),
-        num(snap, &["power", "summary", "generatorOperational"])));
-    s
+    if bladder >= 80.0 { out.push_str("⚠ 卫生红线：有人膀胱 ≥80% → 厕所是最高优先级（但前提是先有建材）。\n"); }
+    if min_breath < 50.0 { out.push_str("⚠ 窒息红线：有人呼吸 <50% → 救援/换气是最高优先级。\n"); }
+    out
 }
 
 /// 校验前先**适配 LLM 的常见写法偏差**（契约层容错，而非拒绝）。
@@ -238,7 +311,7 @@ pub fn refresh_window(cfg: &SlowConfig, brief: &str, plan_path: &str, fp: Option
     std::fs::write(plan_path, serde_json::to_string_pretty(&out_v).unwrap_or_default())
         .map_err(|e| format!("写盘失败: {e}"))?;
     let mut msg = format!("滚动窗口已刷新（{} 步，周期 {}）", plan.nodes.len(), cycle);
-    if !repairs.is_empty() { msg.push_str(&format!("；⚠ {} 条判据降级 manual", repairs.len())); }
+    if !repairs.is_empty() { msg.push_str(&format!("；⚠ {} 条判据自愈（goal 兜底/manual）", repairs.len())); }
     if !adapted.is_empty() { msg.push_str(&format!("；适配 {} 处 requires→pre", adapted.len())); }
     Ok(msg)
 }
@@ -247,6 +320,124 @@ pub fn refresh_window(cfg: &SlowConfig, brief: &str, plan_path: &str, fp: Option
 mod tests {
     use super::*;
     use crate::decide::Node;
+
+    /// 给大脑的事实摘要必须读传感器层的**真实路径**，不能手写路径读成 0。
+    ///   锁住的不变量：快照里氧气 398kg / 食物 16000kcal / 床 1 / 研究站 2 / 发电机 1 / 砂岩 400kg，
+    ///   摘要必须原样报出来（实测曾全部报成 0 → 窗口按假饥荒排优先级 + 假 done）。
+    #[test]
+    fn facts_summary_reads_truth_not_zero() {
+        let snap = serde_json::json!({
+            "cycle": 1, "paused": false, "game_speed": 1.0, "under_construction": 2,
+            "diagnostics": {
+                "oxygenKgVisible": 398.1, "pollutedOxygenKgVisible": 23.5,
+                "buildings": {"toilets": 0, "beds": 1, "oxygenProducers": 0, "researchStations": 2, "batteries": 1},
+                "alerts": [{"category": "oxygen", "message": "未检测到制氧设备。", "severity": "warning"}],
+            },
+            "atmos": {"oxygenPerDupeKg": 140.5, "carbonDioxideMassKg": 102.7, "suffocationRisk": "nominal",
+                      "breathableCells": 262, "totalVisibleCells": 3450},
+            "inventory": {"items": [
+                {"elementId": "FieldRation", "totalCaloriesKcal": 16000.0, "totalMassKg": 20.0},
+                {"elementId": "SandStone", "totalMassKg": 400.0},
+            ]},
+            "power": {"summary": {"generatorCount": 2, "generatorOperational": 1, "generatorEmpty": 1,
+                                  "batteryCount": 1, "batteryStoredPercent": 37.5,
+                                  "consumerCount": 3, "consumerPowered": 2, "netActiveWatts": -120.0}},
+            "food": {"totalKcal": 16000.0, "daysRemaining": 5.3, "status": "nominal"},
+            "gas": {"dominantGases": [{"element": "Oxygen", "massKg": 398.1}]},
+            "buildings": {"Headquarters": 1, "RationBox": 1},
+            "pending_orders": 1, "errors": [],
+            "reachable_cells": 12,
+            "dupes": [{"name": "t", "x": 3, "y": 4, "chore": "空闲", "breath": 72.0, "stress": 8.0,
+                       "bladder": 31.0, "element": "污染水", "schedule": "工作", "blocked": 0,
+                       "reachable": 9, "work_scheduled": true}],
+        });
+        let s = facts_summary(&snap, 1);
+        assert!(s.contains("氧气 398 kg"), "{s}");
+        assert!(s.contains("食物 16000 kcal"), "{s}");
+        assert!(s.contains("≈5.3 周期，mod 口径"), "{s}");
+        assert!(s.contains("≈2.3 周期"), "氧气续航估算：{s}");
+        assert!(s.contains("厕所 0 / 床 1 / 制氧 0 / 研究站 2 / 电池 1"), "{s}");
+        assert!(s.contains("发电机 2（运行 1，缺燃料 1）/ 电池 1（储电 38%）/ 用电设备 3（通电 2）/ 净 -120 W"), "{s}");
+        assert!(s.contains("t @(3,4) 空闲 呼吸72 压力8 膀胱31 站在:污染水 可达9"), "{s}");
+        assert!(s.contains("待办工单 1；施工中 2"), "{s}");
+        assert!(s.contains("游戏告警：[oxygen/warning] 未检测到制氧设备。"), "{s}");
+        assert!(s.contains("SandStone: 400 kg"), "{s}");
+        assert!(s.contains("可达格 12"), "{s}");
+        assert!(!s.contains("建材为零"), "有 400kg 砂岩不该报建材为零：{s}");
+        assert!(!s.contains("传感器："), "没有读失败就不该报：{s}");
+    }
+
+    /// 传感器数据可能过期时，简报第一行必须喊停：下面所有数字都不该用来规划。
+    #[test]
+    fn facts_summary_flags_stale_sensor_first() {
+        let s = facts_summary(&serde_json::json!({
+            "cycle": 4, "health": "stale",
+            "health_notes": ["mod 心跳未推进（realtimeSinceStartup 不变）→ 响应可能是缓存，数据不可信", "已重连 session，下一拍复核"],
+        }), 4);
+        assert!(s.starts_with("⚠ 传感器数据可能过期"), "{s}");
+        assert!(s.contains("已重连 session"), "{s}");
+        let d = facts_summary(&serde_json::json!({
+            "cycle": 4, "health": "degraded", "health_notes": ["周期不一致：status=4 diagnostics=1"],
+        }), 4);
+        assert!(d.starts_with("⚠ 传感器降级") && d.contains("周期不一致"), "{d}");
+        let ok = facts_summary(&serde_json::json!({"cycle": 4, "health": "ok"}), 4);
+        assert!(ok.starts_with("周期 4"), "{ok}");
+    }
+
+    /// 传感器读失败必须可见：否则 LLM 把 0/空当成真值（AGENTS.md §9：读不到 ≠ 极值）。
+    #[test]
+    fn facts_summary_surfaces_sensor_errors() {
+        let s = facts_summary(&serde_json::json!({
+            "cycle": 1, "errors": ["oni://fluid/gas/summary: timeout", "oni://power/summary: 503"],
+        }), 1);
+        assert!(s.contains("⚠ 传感器：2 个观察源读取失败"), "{s}");
+        assert!(s.contains("fluid/gas/summary: timeout"), "{s}");
+        assert!(s.contains("power/summary: 503"), "{s}");
+    }
+
+    /// 窗口 prompt 必须带日程事实：全员就寝时重算，LLM 要知道工单要等开工才执行。
+    ///   实测 23:53 全员睡觉时重算窗口，按"现在就能开工"排，醒前的零进展全被读成失败。
+    #[test]
+    fn facts_summary_reports_schedule() {
+        let snap = serde_json::json!({
+            "cycle": 1,
+            "dupes": [{"name": "a", "x": 0, "y": 0, "chore": "睡觉", "breath": 100.0, "bladder": 10.0,
+                       "element": "氧气", "schedule": "Sleep", "blocked": 0, "work_scheduled": false},
+                      {"name": "b", "x": 1, "y": 0, "chore": "放松", "breath": 100.0, "bladder": 10.0,
+                       "element": "氧气", "schedule": "Recreation", "blocked": 0, "work_scheduled": false}],
+        });
+        let s = facts_summary(&snap, 1);
+        assert!(s.contains("日程：工作 0 / 非工作 2"), "{s}");
+        assert!(s.contains("不是卡住"), "{s}");
+        assert!(s.contains("氧气 未知"), "日程行不影响其它事实");
+    }
+
+    /// 传感器没报的数字必须标"未知"，不能编一个 0 让大脑按假饥荒决策（AGENTS.md §9）。
+    ///   也不能把"没报 inventory"当成"建材为零"去触发物理约束。
+    #[test]
+    fn facts_summary_says_unknown_when_sensor_silent() {
+        let s = facts_summary(&serde_json::json!({"cycle": 1, "dupes": []}), 1);
+        assert!(s.contains("氧气 未知"), "{s}");
+        assert!(s.contains("食物 未知"), "{s}");
+        assert!(s.contains("最低呼吸 未知"), "{s}");
+        assert!(s.contains("地上散装材料：未知"), "{s}");
+        assert!(!s.contains("建材为零"), "没报 inventory 不能断言建材为零：{s}");
+        // 快照整体不是 Snapshot → 明说事实未知，而不是返回一串 0
+        let bad = facts_summary(&serde_json::Value::Null, 1);
+        assert!(bad.contains("事实未知"), "{bad}");
+    }
+
+    /// inventory 报了但确实没有建材 → 物理约束必须触发（这条语义不能被上一条误伤）。
+    #[test]
+    fn facts_summary_keeps_zero_material_constraint_when_inventory_reported() {
+        let s = facts_summary(&serde_json::json!({
+            "cycle": 1, "inventory": {"items": [{"elementId": "FieldRation", "totalCaloriesKcal": 16000.0}]},
+            "dupes": [],
+        }), 1);
+        assert!(s.contains("地上散装材料：**0（什么都没有）**"), "{s}");
+        assert!(s.contains("建材为零"), "{s}");
+        assert!(s.contains("食物 16000 kcal"), "{s}");
+    }
 
     fn node(id: &str, status: &str, req: Vec<&str>) -> Node {
         Node {

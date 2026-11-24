@@ -220,20 +220,65 @@ pub fn extract_json(text: &str) -> Option<&str> {
 ///   - 判据重复 → 一个 done 会连带"证明"另一个（实测 E1/AIR 同判据）；
 ///   - 产氧节点无供电前置 → 造出来不产氧（实测：制氧1 但净 -120W）；
 ///   - 缺生命线 → 代理不会去建厕所/床/产氧（实测：床位 0/3 无人建）。
-/// **判据自愈**：LLM 发明的判据 kind → 降级为 manual（可执行但永不自动完成）。
+/// goal → 机器可判的**默认判据**（契约层归一化：只用结构化的 goal 字段，不解析文案）。
+///
+/// 为什么需要：LLM 给节点写了 goal 却没给可解析的 `success_check`（或写了白名单外的 kind）
+///   → 旧逻辑一律降级 manual → judge 里 manual 永远不 done → 3 节点窗口很快"枷锁" → 整窗重算，
+///   W1→W2→W3 的推进根本观察不到（实测 23:53 的窗口三节点全 manual）。
+///   节点已经带了**结构化**的 goal，而每个 auto-goal 在执行器里有确定的"效果"：
+///   建厕所 = 厕所数 ≥ 1、采建材 = 地上有建材……判据直接由 goal 推出，这是契约层做自己的事。
+///   forage / open_chamber / mop_dirty 没有诚实的状态判据（"食物 ≥ 1 kcal"在新档开局恒真）
+///   → 不兜底，保持 manual（LLM 想要更强/更弱的判据时显式写即可，不会被这里覆盖）。
+pub fn default_check_for_goal(goal: &str) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let g = goal.trim();
+    Some(match g {
+        "toilet" => json!({"kind": "building_min", "key": "toilets", "n": 1}),
+        "oxygen" => json!({"kind": "building_min", "key": "oxygenProducers", "n": 1}),
+        "research" => json!({"kind": "building_min", "key": "researchStations", "n": 1}),
+        "power" => json!({"kind": "power_operational"}),
+        "material" => json!({"kind": "loose_any_min", "kg": 200,
+            "elements": ["SandStone", "Dirt", "Algae", "Sand", "Clay", "Cuprite", "Carbon", "IronOre"]}),
+        "scout" => json!({"kind": "scout_done"}),
+        "surface" => json!({"kind": "surface_open"}),
+        _ if g.starts_with("element:") => {
+            let el = &g["element:".len()..];
+            if el.is_empty() { return None; }
+            json!({"kind": "loose_min", "element": el, "kg": 1})
+        }
+        _ => return None,
+    })
+}
+
+/// **判据自愈**：LLM 发明/缺失的判据 → 先按节点的 goal 兜底成机器可判的默认判据
+///   （见 [`default_check_for_goal`]）；goal 没有默认判据时才降级为 manual（可执行但永不自动完成）。
 ///
 /// 为什么不直接拒绝整份计划：一个未知判据只影响**一个节点**的验收，
 ///   拒绝整份计划会让其它 10 个正确节点陪葬（实测首跑：T1 被发明 material_min，
-///   整份计划被拒 → 代理继续跑旧 playbook）。降级 + 告警 = 可用且可见。
+///   整份计划被拒 → 代理继续跑旧 playbook）。兜底/降级 + 告警 = 可用且可见。
 /// 返回告警清单。
 pub fn repair_plan_checks(plan: &mut Plan) -> Vec<String> {
     let mut warns = Vec::new();
     for node in &mut plan.nodes {
         let Some(v) = node.success_check.as_mut() else { continue };
         let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
-        if !CHECK_KINDS.contains(&kind.as_str()) {
-            warns.push(format!("{} 的判据 kind {:?} 不在白名单 → 降级为 manual", node.id, kind));
-            *v = serde_json::json!({"kind": "manual"});
+        if CHECK_KINDS.contains(&kind.as_str()) && kind != "manual" { continue; }
+        // 白名单外的 kind，或 LM 自己写了 manual：先看节点的 goal 能不能推出默认判据
+        let goal = node.actions.iter().find_map(|a| match a {
+            crate::exec::Action::Auto { goal, .. } => Some(goal.clone()),
+            _ => None,
+        });
+        match goal.as_deref().and_then(default_check_for_goal) {
+            Some(c) => {
+                let dk = c.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+                warns.push(format!("{} 的判据 {:?} 不可机器判定 → 按 goal 兜底为 {}", node.id, kind, dk));
+                *v = c;
+            }
+            None if !CHECK_KINDS.contains(&kind.as_str()) => {
+                warns.push(format!("{} 的判据 kind {:?} 不在白名单 → 降级为 manual", node.id, kind));
+                *v = serde_json::json!({"kind": "manual"});
+            }
+            None => {} // 显式 manual 且该 goal 没有默认判据 → 保持
         }
     }
     warns
@@ -519,6 +564,35 @@ pub fn plan_author_is_ai(plan_text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LLM 写了 goal 却没给可解析判据 → 按 goal 兜底成机器可判的判据，而不是永不完成的 manual。
+    ///   锁住的不变量：窗口节点有结构化 goal 时，判据一定可机器判定（除非该 goal 没有诚实判据）。
+    ///   实测 23:53 窗口三节点全 manual → 窗口"枷锁"整窗重算，W1→W2 推进观察不到。
+    #[test]
+    fn repair_checks_falls_back_to_goal_default() {
+        let mut plan: Plan = serde_json::from_value(serde_json::json!({
+            "nodes": [
+                {"id": "W1", "name": "建厕所", "actions": [{"kind": "auto", "goal": "toilet", "why": ""}],
+                 "success_check": {"kind": "toilet_built"}, "requires": []},
+                {"id": "W2", "name": "挖铜", "actions": [{"kind": "auto", "goal": "element:Cuprite", "why": ""}],
+                 "success_check": {"kind": "manual"}, "requires": []},
+                {"id": "W3", "name": "觅食", "actions": [{"kind": "auto", "goal": "forage", "why": ""}],
+                 "success_check": {"kind": "manual"}, "requires": []},
+                {"id": "W4", "name": "采建材", "actions": [{"kind": "auto", "goal": "material", "why": ""}],
+                 "success_check": {"kind": "material_min"}, "requires": []},
+            ]
+        })).unwrap();
+        let warns = repair_plan_checks(&mut plan);
+        let c = |i: usize| plan.nodes[i].success_check.clone().unwrap();
+        assert_eq!(c(0), serde_json::json!({"kind": "building_min", "key": "toilets", "n": 1}), "{warns:?}");
+        assert_eq!(c(1), serde_json::json!({"kind": "loose_min", "element": "Cuprite", "kg": 1}));
+        assert_eq!(c(2), serde_json::json!({"kind": "manual"}), "forage 没有诚实的状态判据，保持 manual");
+        assert_eq!(c(3).get("kind").and_then(|k| k.as_str()), Some("loose_any_min"));
+        assert!(warns.iter().any(|w| w.contains("W1") && w.contains("building_min")), "{warns:?}");
+        // 兜底出来的判据必须真的能被 judge 求值（不是又一个 None）
+        let snap = crate::sense::Snapshot::default();
+        assert_eq!(crate::agent::check_success(&snap, &c(0)), Some(false), "空快照下厕所判据应为 Some(false)");
+    }
     use crate::decide::Plan;
 
     fn node(id: &str, check: Option<Value>) -> Node {

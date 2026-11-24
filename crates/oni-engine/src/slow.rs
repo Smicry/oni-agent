@@ -697,24 +697,12 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
         }
         p.push_str("  - 本轮必须换策略：选上述可用目标之一，或用 commands 下精确工单。\n\n");
     }
-    p.push_str("== 当前局面 ==\n");
-    let diag = snap.get("diagnostics").unwrap_or(&Value::Null);
-    p.push_str(&format!("周期={} 暂停={} 食物={}kcal 氧气={}kg\n",
-        snap.get("cycle").unwrap_or(&Value::Null),
-        snap.get("paused").unwrap_or(&Value::Null),
-        diag.get("foodKcal").unwrap_or(&Value::Null),
-        diag.get("oxygenKgVisible").unwrap_or(&Value::Null)));
-    if let Some(dupes) = snap.get("dupes").and_then(|d| d.as_array()) {
-        p.push_str("复制人:\n");
-        for d in dupes {
-            p.push_str(&format!("  {} @({},{}) {} 膀胱={}\n",
-                d.get("name").unwrap_or(&Value::Null),
-                d.get("x").unwrap_or(&Value::Null),
-                d.get("y").unwrap_or(&Value::Null),
-                d.get("chore").unwrap_or(&Value::Null),
-                d.get("bladder").unwrap_or(&Value::Null)));
-        }
-    }
+    p.push_str("== 当前局面（传感器统一简报，与窗口规划同一口径）==\n");
+    // ★ 事实只走 window::facts_summary（sense::Snapshot 访问器）：之前这里自己手写了一份
+    //   只有周期/暂停/食物/氧气 + 名字/位置/chore/膀胱，LLM 看不到建筑/电力/建材/续航/
+    //   在途工单/游戏告警/传感器失败 → 按想象选目标、在 Tile 地板上放梯子。
+    let cycle = snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0);
+    p.push_str(&crate::window::facts_summary(snap, cycle));
     if !cmds.is_empty() {
         p.push_str("\n== 🎮 用户指令模式（优先于自主决策；世界已暂停） ==\n");
         for c in cmds {
@@ -806,6 +794,11 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
 ///   ① 带坐标的精确工单：`build x,y Prefab [Mat] [--apply]`、`order 挖 @(x,y):N`、`preflight ...`
 ///   ② 元命令：window / policy / hold / release / pause / resume / resolve / decision / note
 /// 拒绝：无坐标的 build、不存在的子命令、任何"use/让/去"类自然语言
+/// 总开关类子命令：hold 期间大脑不得触碰（见 [`validate_llm_command`]）。
+pub fn is_control_plane(sub: &str) -> bool {
+    matches!(sub, "hold" | "release" | "pause" | "resume" | "window")
+}
+
 pub fn validate_llm_command(cmd: &str) -> Result<Vec<String>, String> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     let Some(sub) = parts.first() else { return Err("空命令".into()) };
@@ -825,7 +818,15 @@ pub fn validate_llm_command(cmd: &str) -> Result<Vec<String>, String> {
         }
         // 元命令：不需要坐标
         "window" | "policy" | "hold" | "release" | "pause" | "resume" | "resolve"
-        | "decision" | "note" | "command" | "escalations" | "plan-check" => Ok(parts.iter().map(|s| s.to_string()).collect()),
+        | "decision" | "note" | "command" | "escalations" | "plan-check" => {
+            // ★ 总开关类命令在 hold 期间对大脑封口：hold = 用户关闭 AI 总开关，是"唯一的
+            //   用户停止信号"（AGENTS.md §7），解除只能是人（oni release / Web「启动 AI」）。
+            //   大脑能发 release/window 就等于能掀自己的总开关。
+            if is_control_plane(sub) && crate::agent::hold_active() {
+                return Err("hold 期间（用户已关闭 AI 总开关）大脑不能操作 hold/release/pause/resume/window；解除 hold 只能由用户执行".into());
+            }
+            Ok(parts.iter().map(|s| s.to_string()).collect())
+        },
         _ => Err(format!("'{sub}' 不是可执行的 oni 子命令。可用：带坐标的 build/order/preflight，或元命令 window/policy/resolve。建造走 goal")),
     }
 }
@@ -1246,6 +1247,47 @@ fn decode_unicode_escapes(s: &str) -> String {
 }
 
 /// 跑一轮慢系统决策。返回决策摘要。
+/// 终局判定（纯函数，可测）：只有**确知**复制人名单且全员倒地/死亡才返回终局原因。
+///
+/// 为什么必须门控"确知"：慢系统第一拍可能早于快系统第一次采集，live_snapshot 还是 Null
+///   → dupes 缺失 → alive 折叠成 0 → 实测三人呼吸 100 却被判"全员失去行动能力"，
+///   还往总线发了一条 7200s 的 Critical（大脑接下来两小时都看得到）。
+///   规则（AGENTS.md §9：人口读不到 ≠ 人口为 0）：
+///     · dupes 缺失 / 为空 → None（数据源可疑，真正的人口 0 由快系统检测）
+///     · 有人 breath > 0 且 chore 不含倒地 → 活着
+///     · 只有全员 breath ≤ 0 或 chore 明确倒地/死亡 → Some(终局原因)
+/// 本进程首次调用的时间戳（慢系统"只信本进程传感器"的基准）。
+fn process_start_ts() -> i64 {
+    static T: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *T.get_or_init(now)
+}
+
+/// 传感器快照是否可用于规划：ts 不早于本进程启动、传感器已报出人口、且**心跳正常**（不是过期缓存）。
+pub fn sensor_snapshot_fresh(snap: &Value, process_start: i64) -> bool {
+    let ts = snap.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    let has_pop = snap.get("dupes").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let stale = snap.get("health").and_then(|v| v.as_str()) == Some("stale");
+    ts >= process_start && has_pop && !stale
+}
+
+pub fn colony_lost(snap: &Value) -> Option<&'static str> {
+    let arr = snap.get("dupes")?.as_array()?;
+    if arr.is_empty() { return None; }
+    let alive = arr.iter().filter(|d| {
+        let chore = d.get("chore").and_then(|v| v.as_str()).unwrap_or("");
+        let downed = chore.contains("失去行动") || chore.contains("倒地")
+            || chore.contains("Downing") || chore.contains("Unconscious")
+            || chore.contains("死亡");
+        let breath = d.get("breath").and_then(|v| v.as_f64()).unwrap_or(100.0);
+        !downed && breath > 0.0
+    }).count();
+    if alive == 0 {
+        Some("☠️ 全员失去行动能力且无法自救（无人能执行工单）→ 停止决策，建议回滚存档或新开一局")
+    } else {
+        None
+    }
+}
+
 pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     let (escs, cmds, snap) = {
         let sd = save_dir();
@@ -1274,26 +1316,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     //     · dupes 数组缺失/为空 → **不判全灭**（数据源可疑，交给快系统的人口检测）
     //     · 有人 breath > 0 且 chore 不含倒地 → 算活着
     //     · 只有全员 breath==0 或 chore 明确倒地/死亡 → 才判全灭
-    let dupes_arr = snap.get("dupes").and_then(|v| v.as_array()).cloned();
-    let dupes_known = dupes_arr.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
-    let alive = dupes_arr.as_ref().map(|a| {
-        a.iter().filter(|d| {
-            let chore = d.get("chore").and_then(|v| v.as_str()).unwrap_or("");
-            let downed = chore.contains("失去行动") || chore.contains("倒地")
-                || chore.contains("Downing") || chore.contains("Unconscious")
-                || chore.contains("死亡");
-            let breath = d.get("breath").and_then(|v| v.as_f64()).unwrap_or(100.0);
-            !downed && breath > 0.0
-        }).count()
-    }).unwrap_or(0);
-    // dupes 数据缺失 ≠ 人口为 0：不判终局（避免采集中间态误判全灭而放弃一局活的殖民地）
-    let no_pop = dupes_known && dupes_arr.as_ref().map(|a| a.is_empty()).unwrap_or(false);
-    if no_pop || alive == 0 {
-        let reason = if no_pop {
-            "☠️ 人口为0：殖民地已全员死亡，代理无法自救 → 停止决策，建议回滚存档或新开一局"
-        } else {
-            "☠️ 全员失去行动能力且无法自救（无人能执行工单）→ 停止决策，建议回滚存档或新开一局"
-        };
+    if let Some(reason) = colony_lost(&snap) {
         let sd = save_dir();
         // 节流：终局是稳定状态，首次写完整记录 + bus 告警即可，后续轮次只更新 view，
         // 避免每 5 秒刷一条 meta_give_up 污染 decisions.jsonl。
@@ -1313,7 +1336,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
             }
             let _ = crate::bus::publish(
                 crate::bus::Kind::AuditFinding, crate::bus::Priority::Critical,
-                "meta", reason, serde_json::json!({"alive": alive, "no_pop": no_pop}), 7200,
+                "meta", reason, serde_json::json!({"dupes": snap.get("dupes").and_then(|v| v.as_array()).map(|a| a.len())}), 7200,
             );
         }
         let summary = format!("[meta][P0] ☠️ 终局判定：{}", reason);
@@ -1328,7 +1351,13 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     //   把机械 planner 永久锁死）→ 换一张地图（水世界/金属星）节点图就不适用。
     //   兜底链：LLM 失败/校验不过 → 保持模板基线继续跑 +
     //   快系统的机械重规划建议继续走 suggestions 通道；失败冷却 30 分钟不刷屏。
-    {
+    // ★ 传感器新鲜度：慢系统只规划**本进程快系统采到的**快照。
+    //   实测：serve 重启后慢系统第一拍读到的是上一个进程留下的 live_snapshot.json
+    //   （那个进程的 session 已冻结：cycle 1 / 膀胱 86 / 厕所 0）→ 用它重算窗口 → 排错优先级。
+    //   快照 ts 早于本进程启动，或传感器还没报人口 → 本轮不重算窗口，等下一拍。
+    let sensor_fresh = sensor_snapshot_fresh(&snap, process_start_ts());
+    if !sensor_fresh { eprintln!("[slow:diag] 传感器快照未就绪（ts 早于本进程或缺 dupes）→ 本轮不重算窗口"); }
+    if sensor_fresh {
         let sd = save_dir();
         let plan_text = std::fs::read_to_string("plan.json").unwrap_or_default();
         let need = !crate::opening::plan_author_is_ai(&plan_text);
@@ -1387,7 +1416,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     // ★ v3 滚动窗口：plan.json 是 horizon-3 的短视窗口，过期就重算（MPC 式）。
     //   为什么：静态长链在世界变化后变成枷锁（实测 7 节点全锁死，殖民地失去方向）。
     //   过期条件见 window::window_stale（空 / 全完成 / 枷锁 / 跨 ≥2 周期）。
-    {
+    if sensor_fresh {
         let sd = save_dir();
         let plan_path = "plan.json";
         let snap_cycle = snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1625,6 +1654,69 @@ pub fn run(cfg: SlowConfig, once: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// hold = 用户关闭 AI 总开关（唯一用户停止信号，AGENTS.md §7）：大脑不得发总开关类命令。
+    ///   旧白名单含 hold/release/pause/resume/window 且不看 hold 状态 → 大脑能掀自己的总开关。
+    #[test]
+    fn llm_cannot_flip_master_switch_during_hold() {
+        crate::agent::isolate_state_dir();
+        let _ = crate::agent::clear_hold();
+        for c in ["release", "window 120", "resume", "pause", "hold x"] {
+            assert!(validate_llm_command(c).is_ok(), "非 hold 期 {c} 应放行");
+        }
+        crate::agent::write_hold("test", 7).expect("write hold");
+        assert!(crate::agent::hold_active(), "isolate 后 hold 必须可见（且不碰真实目录）");
+        for c in ["release", "window 120", "resume", "pause", "hold x"] {
+            let e = validate_llm_command(c).unwrap_err();
+            assert!(e.contains("总开关"), "{c}: {e}");
+        }
+        assert!(validate_llm_command("policy set co2_max_kg=3").is_ok(), "非总开关元命令不受影响");
+        assert!(validate_llm_command("resolve 1").is_ok());
+        assert!(validate_llm_command("preflight dig 124,192").is_ok(), "精确工单不受影响");
+        crate::agent::clear_hold();
+        assert!(!crate::agent::hold_active());
+    }
+
+    /// 慢系统只规划**本进程**快系统采到的快照：上一个进程留下的文件（session 已冻结）不算。
+    #[test]
+    fn sensor_snapshot_fresh_requires_this_process_and_population() {
+        let start = 1000;
+        let fresh = serde_json::json!({"ts": 1005, "dupes": [{"name": "t"}]});
+        assert!(sensor_snapshot_fresh(&fresh, start));
+        let from_old_process = serde_json::json!({"ts": 900, "dupes": [{"name": "t"}]});
+        assert!(!sensor_snapshot_fresh(&from_old_process, start), "早于本进程启动的快照不能用来规划");
+        let no_pop = serde_json::json!({"ts": 1005, "dupes": []});
+        assert!(!sensor_snapshot_fresh(&no_pop, start), "传感器没报人口 → 不规划");
+        assert!(!sensor_snapshot_fresh(&Value::Null, start), "Null 快照 → 不规划");
+        let stale = serde_json::json!({"ts": 1005, "dupes": [{"name": "t"}], "health": "stale"});
+        assert!(!sensor_snapshot_fresh(&stale, start), "心跳未推进的过期快照 → 不规划");
+        let degraded = serde_json::json!({"ts": 1005, "dupes": [{"name": "t"}], "health": "degraded"});
+        assert!(sensor_snapshot_fresh(&degraded, start), "降级但心跳正常 → 仍可规划（简报里已标注不可信字段）");
+    }
+
+    /// 终局判定必须门控"确知名单"：快照 Null / dupes 缺失 / 空数组都不算全灭。
+    ///   实测慢系统首拍读到上一局的 Null 快照 → 三人活着却判死 + 发 7200s Critical。
+    #[test]
+    fn colony_lost_requires_known_dupe_list() {
+        assert_eq!(colony_lost(&Value::Null), None, "快照 Null ≠ 全灭");
+        assert_eq!(colony_lost(&serde_json::json!({"cycle": 1})), None, "dupes 缺失 ≠ 全灭");
+        assert_eq!(colony_lost(&serde_json::json!({"dupes": []})), None, "dupes 为空 ≠ 全灭");
+    }
+
+    /// 有人活着就不判终局；全员倒地或呼吸 0 才判。
+    #[test]
+    fn colony_lost_only_when_everyone_down() {
+        let alive = serde_json::json!({"dupes": [
+            {"chore": "空闲", "breath": 100.0},
+            {"chore": "Downing", "breath": 0.0},
+        ]});
+        assert_eq!(colony_lost(&alive), None, "还有一人活着");
+        let lost = serde_json::json!({"dupes": [
+            {"chore": "Downing", "breath": 0.0},
+            {"chore": "空闲", "breath": 0.0},
+        ]});
+        assert!(colony_lost(&lost).is_some(), "全员倒地/呼吸 0 → 终局");
+    }
 
     /// 战略状态机：只挑 requires 全 done 的节点，跳过来满足依赖的。
     #[test]

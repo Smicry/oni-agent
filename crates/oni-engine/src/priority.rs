@@ -358,6 +358,7 @@ mod tests {
             element: element.into(),
             blocked: 0,
             schedule: String::new(),
+            work_scheduled: None,
         }
     }
 

@@ -70,6 +70,17 @@ pub fn write_hold(reason: &str, cycle: i64) -> std::io::Result<()> {
     std::fs::write(path.with_extension("cycle"), cycle.to_string())
 }
 
+/// 测试用：把代理状态目录指到临时目录（绝不碰真实 ~/.oni-agent）。
+///
+/// 为什么需要：`hold_roundtrip` 曾对**真实** `~/.oni-agent/hold` 做 clear_hold → 主 agent /
+///   用户的 hold 被测试解掉 → 世界在不知情下恢复运行（两次实测，都在 cargo test 之后）。
+#[cfg(test)]
+pub fn isolate_state_dir() {
+    let d = std::env::temp_dir().join(format!("oni-test-state-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&d);
+    std::env::set_var("ONI_STATE_DIR", &d);
+}
+
 /// 清除 hold 标记（主 agent 改完代码后调用）。
 pub fn clear_hold() {
     let _ = std::fs::remove_file(hold_path());
@@ -154,6 +165,8 @@ pub fn read_window_request() -> Option<u64> {
 
 pub struct Agent {
     pub session: McpSession,
+    /// 上次传感器 session 重连时刻（周期重连用，见 `SESSION_REFRESH_EVERY`）
+    last_session_refresh: Instant,
     pub catalog: Catalog,
     pub cfg: AgentConfig,
     paused_by_us: bool,
@@ -246,6 +259,7 @@ impl Agent {
     pub fn new(session: McpSession, catalog: Catalog, cfg: AgentConfig) -> Self {
         Self {
             session,
+            last_session_refresh: Instant::now(),
             catalog,
             cfg,
             paused_by_us: false,
@@ -294,6 +308,15 @@ impl Agent {
     /// 为什么需要：没有冷却 → 暂缓 → 下一轮前置仍满足 → 立刻恢复 → 又失败
     ///   又暂缓…… 代理在同一节点上空转。
     const DEFER_COOLDOWN: u64 = 8;
+
+    /// 传感器 session 的最长寿命：到期重新握手（见 `McpSession::refresh`）。
+    ///
+    /// 为什么需要：mod 端对**长连接 session** 的"可见世界扫描"类字段（cycle / buildings /
+    ///   体征 / paused）会在游戏长时间暂停后停止更新，而同一响应里的实时字段还在变 →
+    ///   半冻结快照（实测 14 小时 hold 后 serve 持续 25 分钟看 cycle 1 / 厕所 0 / 膀胱 86，
+    ///   新进程直读同一 URI 是 cycle 2 / 厕所 1）。传感器不能无限信任一条 channel：
+    ///   周期重连兜底 + 世界运行态变化（代理恢复游戏）后立即重连。
+    const SESSION_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
     /// 实时查游戏是否暂停（读 oni://colony/status，该 URI 走 1s TTL 的秒级新鲜度）。
     ///
@@ -449,6 +472,22 @@ impl Agent {
         eprintln!("⛔ 已暂停游戏：{why}");
     }
 
+    /// 恢复游戏 + **立即重连传感器 session**。
+    ///
+    /// 为什么重连：世界运行态变了，mod 对旧 session 的缓存视图可能还停在"暂停时的世界"
+    ///   （实测 14 小时 hold 后：快照 paused=true / 厕所 0 / 膀胱 86，真值是运行中 / 1 / 0）。
+    ///   属传感器层：channel 在世界状态跳变后重新建立，不解释、不猜。
+    fn resume_world(&mut self, task: String) {
+        let _ = self.session.call_text(
+            "game_control",
+            serde_json::json!({ "domain": "speed", "action": "resume", "task": task }),
+        );
+        if self.session.refresh().is_ok() {
+            self.last_session_refresh = Instant::now();
+            eprintln!("[sensor] 🔌 世界恢复 → session 已重连");
+        }
+    }
+
     fn resume(&mut self, why: &str) {
         // 暂停所有权：只有 agent 自己暂停的世界才能由 agent 恢复。
         //   若 owner=User（hook/用户手动）却被 agent 恢复 = 越权 → 拒绝。
@@ -456,10 +495,7 @@ impl Agent {
             eprintln!("⛔ 代理恢复被拒（owner 不是 agent）：{why}");
             return;
         }
-        let _ = self.session.call_text(
-            "game_control",
-            serde_json::json!({ "domain": "speed", "action": "resume", "task": format!("代理: {why}") }),
-        );
+        self.resume_world(format!("代理: {why}"));
         self.paused_by_us = false;
         self.left_running = true;
         eprintln!("▶ 已恢复游戏：{why}");
@@ -491,12 +527,23 @@ pub fn cycle(&mut self) -> CycleReport {
 
     fn cycle_inner(&mut self) -> CycleReport {
         self.cycles += 1;
+        // ★ 传感器 session 周期重连（见 SESSION_REFRESH_EVERY）：失败不打断循环，下轮再试。
+        if self.last_session_refresh.elapsed() > Self::SESSION_REFRESH_EVERY && self.session.refresh().is_ok() {
+            self.last_session_refresh = Instant::now();
+            eprintln!("[sensor] 🔌 session 已周期重连");
+        }
         // ---- 换存档检测（每轮最先做）----------------------------------
         // 指纹变了 = 换了一局 → 旧计划归档 + 计划按模板重置 +
         // 局内状态（目标锁/侦察/趋势样本/实时快照）切到新存档的目录。
         // 不做这一步 → 新局继承旧局的 plan（全 done）→ 代理空转几十分钟。
         let mut save_switch: Option<String> = None;
         if let Some(sw) = crate::saveswitch::ensure(&self.session, &self.cfg.plan_path) {
+            // ★ 换了对局 → 立即重连传感器 session：mod 对旧 session 的"可见世界扫描"可能
+            //   还会喂几拍旧世界的数据（与 stale 自愈同一条规则：世界身份变了就重建 channel）。
+            if self.session.refresh().is_ok() {
+                self.last_session_refresh = Instant::now();
+                eprintln!("[sensor] 🔌 换档 → session 已重连");
+            }
             let old_fp = sw
                 .old
                 .as_ref()
@@ -674,11 +721,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 const RESCUE_TICK: u64 = 30;
                 self.window_until = Some(Instant::now() + Duration::from_secs(RESCUE_TICK));
                 self.window_owned_by_us = true;
-                let _ = self.session.call_text(
-                    "game_control",
-                    serde_json::json!({ "domain": "speed", "action": "resume",
-                                       "task": "代理: 紧急态救援窗口（30s 后立即冻回）" }),
-                );
+                self.resume_world("代理: 紧急态救援窗口（30s 后立即冻回）".to_string());
                 self.left_running = true;
                 can_execute = true;
                 report.notes.push(format!(
@@ -821,11 +864,7 @@ pub fn cycle(&mut self) -> CycleReport {
                     self.rhythm_streak = 0;
                 self.window_until = Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
                 self.window_owned_by_us = true;
-                let _ = self.session.call_text(
-                    "game_control",
-                    serde_json::json!({ "domain": "speed", "action": "resume",
-                                       "task": format!("代理: AI自主恢复（原 owner={:?}）开施工窗口", ctl.owner) }),
-                );
+                self.resume_world(format!("代理: AI自主恢复（原 owner={:?}）开施工窗口", ctl.owner));
                 self.left_running = true;
                 can_execute = true;
                 report.notes.push(
@@ -846,11 +885,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 self.paused_by_us = false;
                     self.idle_stopped = false;
                 self.frozen = false;
-                let _ = self.session.call_text(
-                    "game_control",
-                    serde_json::json!({ "domain": "speed", "action": "resume",
-                                       "task": format!("代理: 开 {secs}s 施工窗口") }),
-                );
+                self.resume_world(format!("代理: 开 {secs}s 施工窗口"));
                 self.left_running = true;
                 can_execute = true;
                 report.notes.push(format!("▶ 已按请求开 {secs}s 施工窗口（到点自动冻回暂停）"));
@@ -863,11 +898,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 self.paused_by_us = false;
                     self.idle_stopped = false;
                 self.frozen = false;
-                let _ = self.session.call_text(
-                    "game_control",
-                    serde_json::json!({ "domain": "speed", "action": "resume",
-                                       "task": format!("代理: 紧急态开 {rescue}s 短窗口（让人能行动）") }),
-                );
+                self.resume_world(format!("代理: 紧急态开 {rescue}s 短窗口（让人能行动）"));
                 self.left_running = true;
                 can_execute = true;
                 report.notes.push(format!(
@@ -886,6 +917,12 @@ pub fn cycle(&mut self) -> CycleReport {
         // 3) 执行闸门：世界不跑 ⇒ 只观察
         //    （不下工单、不计进展、不熔断 ——  的直接止血点）
         // =====================================================================
+        // ★ 传感器数据可能过期（mod 心跳未推进）→ 和"世界不跑"同一条纪律：不下工单、不计进展。
+        //   sense() 已在检测到 stale 时重连 session，下一拍应为新鲜数据。
+        if can_execute && snap.health == crate::sense::SensorHealth::Stale {
+            can_execute = false;
+            report.notes.push("⚠ 传感器数据可能过期（mod 心跳未推进）→ 本轮不下工单；已重连 session".into());
+        }
         if !can_execute {
             report.notes.push(
                 "⏸ 世界没在跑 → 本轮只观察（不下工单、不计进展、不熔断）".into(),
@@ -1609,6 +1646,14 @@ pub fn cycle(&mut self) -> CycleReport {
                             "[{}] 成功判据达成 → 标记 done，下一轮换下一个目标",
                             node.id
                         ));
+                    } else if !snap.anyone_on_duty() {
+                        // ★ 没人在工作日程（全员睡觉/娱乐）→ 判据没达成是正常的，不计 stall。
+                        //   和"世界不跑 ⇒ 不计进展"（§7.1）同一条规则：世界在跑但没人上班也一样。
+                        //   旧逻辑每 10s 计一轮，一觉下来在途节点全部"让位"→ 醒来全在冷却 → 窗口枷锁。
+                        report.notes.push(format!(
+                            "[{}] 判据未达成，但全员不在工作时段 → 不计 stall，等开工",
+                            node.id
+                        ));
                     } else {
                         // ★ 连续没达成 → 累加 stall：
                         //   达到 decide::STALL_LIMIT 就把这个节点让给别人。
@@ -1736,17 +1781,21 @@ pub fn cycle(&mut self) -> CycleReport {
         let mut loop_hit: Option<(String, usize)> = None;
         // 本轮出现过的动作指纹（连续性判定：本轮没出现 = 中断 → 计数归零）
         let fps: Vec<String> = out.results.iter().filter_map(action_fingerprint).collect();
-        for fp in &fps {
-            // 保留本轮出现过的 + 上一轮累计的（上一轮没出现的已在下面清零）
-            let c = self.action_loops.entry(fp.clone()).or_insert(0);
-            *c += 1;
-            if *c >= Self::ACTION_LOOP_MAX {
-                loop_hit = Some((fp.clone(), *c));
-                break;
+        // ★ 没人在工作日程（全员睡觉/娱乐）→ 同一动作重复出现是正常的（没人去执行），
+        //   不计循环、不升级、不暂缓（与 stall 门控同一条规则）。
+        if snap.anyone_on_duty() {
+            for fp in &fps {
+                // 保留本轮出现过的 + 上一轮累计的（上一轮没出现的已在下面清零）
+                let c = self.action_loops.entry(fp.clone()).or_insert(0);
+                *c += 1;
+                if *c >= Self::ACTION_LOOP_MAX {
+                    loop_hit = Some((fp.clone(), *c));
+                    break;
+                }
             }
+            // 连续性中断的指纹（这轮没出现）→ 计数归零
+            self.action_loops.retain(|k, _| fps.contains(k));
         }
-        // 连续性中断的指纹（这轮没出现）→ 计数归零
-        self.action_loops.retain(|k, _| fps.contains(k));
         if let Some((fp, times)) = loop_hit {
             let detail = format!(
                 "执行层循环：动作 {} 连续 {} 轮重复执行仍未产生效果。{}",
@@ -2103,12 +2152,29 @@ fn crit_str<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|n| v.get(*n).and_then(|x| x.as_str()))
 }
 
+/// 把 LLM 写的建筑类别键对齐到传感器 `diagnostics.buildings` 里真实存在的键（大小写 / 单复数）。
+/// 对不上就原样返回（judge 给 Some(false)，不猜新键）。
+pub fn resolve_building_key(snap: &Snapshot, key: &str) -> String {
+    let Some(obj) = snap.diagnostics.get("buildings").and_then(|b| b.as_object()) else { return key.to_string() };
+    if obj.contains_key(key) { return key.to_string(); }
+    let lower = key.to_ascii_lowercase();
+    let plural = format!("{lower}s");
+    let singular = lower.strip_suffix('s').map(|s| s.to_string()).unwrap_or_else(|| lower.clone());
+    for want in [lower, plural, singular] {
+        if let Some(k) = obj.keys().find(|k| k.to_ascii_lowercase() == want) { return k.clone(); }
+    }
+    key.to_string()
+}
+
 pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
     let kind = v.get("kind")?.as_str()?;
     match kind {
         "building_min" => {
             let key = crit_str(v, &["key", "building", "name"])?;
-            Some(snap.building(key) as i64 >= crit_num(v, &["n", "count", "min", "target"], 1.0) as i64)
+            // ★ 键名归一化：LLM 写 "toilet"，传感器报 "toilets"（实测差一个 s → 判据永不满足
+            //   → W2 反复建第二座厕所）。只在传感器**实际报出**的键集合里做大小写/单复数对齐。
+            let key = resolve_building_key(snap, key);
+            Some(snap.building(&key) as i64 >= crit_num(v, &["n", "count", "min", "target"], 1.0) as i64)
         }
         "rooms_min" => {
             let key = v.get("key")?.as_str()?;
@@ -2728,12 +2794,28 @@ mod tests {
     /// hold 标记：存在时守护进程只观察，不自动恢复。
     #[test]
     fn hold_roundtrip() {
+        isolate_state_dir();
         let _ = clear_hold();
         assert!(!hold_active());
         write_hold("test", 7).expect("write hold");
         assert!(hold_active());
+        assert!(!hold_path().starts_with(oni_mcp::state_dir().parent().unwrap().join(".oni-agent")),
+            "测试不得写真实 ~/.oni-agent/hold（曾把用户的 hold 清掉）：{:?}", hold_path());
         clear_hold();
         assert!(!hold_active());
+    }
+
+    /// LLM 写 "toilet"、传感器报 "toilets" → 判据必须按真实键求值，而不是永远 false。
+    ///   实测：差一个 s → W2 建厕所永不 done → 反复建第二座。
+    #[test]
+    fn building_min_key_normalizes_singular_plural() {
+        let mut snap = Snapshot::default();
+        snap.diagnostics = serde_json::json!({"buildings": {"toilets": 1, "oxygenProducers": 0}});
+        assert_eq!(check_success(&snap, &serde_json::json!({"kind": "building_min", "key": "toilet", "n": 1})), Some(true));
+        assert_eq!(check_success(&snap, &serde_json::json!({"kind": "building_min", "key": "Toilets", "n": 1})), Some(true));
+        assert_eq!(check_success(&snap, &serde_json::json!({"kind": "building_min", "key": "oxygenProducer", "n": 1})), Some(false),
+            "键能对上（单复数）→ 按真值 0 求值，而不是键不存在");
+        assert_eq!(check_success(&snap, &serde_json::json!({"kind": "building_min", "key": "whatever", "n": 1})), Some(false));
     }
 
     /// 食物判据必须是"续航"而不是绝对值。
