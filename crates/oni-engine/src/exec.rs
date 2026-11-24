@@ -738,6 +738,35 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         best_focus = is_focus;
                     }
                 }
+                // ★ 向下梯子预铺（v3 ②）：focus 目标在可达区下方且站立格无梯子 → 先铺梯子。
+                //   只在 pick 为空（横向无格可挖）时才用；方向由 focus 决定。
+                let down_ladder_pending: Option<(i32, i32)> = match focus {
+                    Some((fx, fy)) if best_idx.is_none() => {
+                        oni_world::preflight::load_reach(session, Some(catalog))
+                            .and_then(|r| oni_world::preflight::ladder_step_down(&r, *fx, *fy))
+                    }
+                    _ => None,
+                };
+                let mut down_ladder_failed = false;
+                if let Some((lx, ly)) = down_ladder_pending {
+                    down_ladder_failed = true; // 走到这里且没 return = 没铺成
+                    // 铺梯子（与向上分支同样的 apply_build 流程）
+                    let mut placements = BTreeMap::new();
+                    placements.insert((lx, ly), "Ladder:7#SandStone".to_string());
+                    match crate::mapedit::apply_build(session, &placements, true) {
+                        Ok((true, _)) => {
+                            match crate::mapedit::apply_build(session, &placements, false) {
+                                Ok((true, _)) => { results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok: true,
+                                    detail: format!("向下预铺：在站立格 ({},{}) 铺梯子，下一轮挖脚下 ({},{})", lx, ly, lx, ly - 1) });
+                                    return ExecOutcome { results, ok: true }; }
+                                Ok((false, out)) => { ladder_note = Some(format!("向下梯子落地失败 @({},{}): {}", lx, ly, compact_error(&out))); }
+                                Err(e) => { ladder_note = Some(format!("向下梯子落地失败 @({},{}): {}", lx, ly, e)); }
+                            }
+                        }
+                        Ok((false, out)) => { ladder_note = Some(format!("向下梯子 dry-run 未通过: {}", first_line(&out).unwrap_or_default())); }
+                        Err(e) => { ladder_note = Some(format!("向下梯子 dry-run 失败: {}", e)); }
+                    }
+                }
                 let pick = best_idx.map(|i| fresh[i]);
                 // 每轮只挖**一格**：挖掉一格会抽走下一格的支撑（竖井就没地板了），
                 //   一次挖一整批会把阶梯挖成无地板的竖井 → 没人能站 → 下一轮又挖不动。
@@ -777,6 +806,10 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 let (ok, detail) = if pick.is_some() {
                     (true, format!("{}{}前沿 {} 格（新 {} / 已有标记 {}），本轮挖 1 格：新标记 {}，已在位 {}",
                         note_prefix, out_note, ready.len(), fresh.len(), marked.len(), issued, already))
+                } else if let (Some(f), true) = (focus, down_ladder_failed) {
+                    // 走到这里 = 向下梯子**没铺成**（铺成已 return）。如实报失败并带原因。
+                    (false, format!("{}目标 ({},{}) 在可达区下方，需先铺梯子但未成功",
+                        note_prefix, f.0, f.1))
                 } else {
                     (false, format!("{}{}前沿 {} 格无可下单曲（全部需梯子或已有标记）→ 零进展，等梯子/复制人消化；该目标当前推不动",
                         note_prefix, out_note, ready.len()))

@@ -400,6 +400,13 @@ pub fn preflight_dig(session: &McpSession, targets: &[(i32, i32)], catalog: Opti
         let mut is_floor = false;
         for n in neighbors(*x, *y) {
             if n.1 == y + 1 && grid.walkable(n) && set.contains(&n) {
+                // ★ 上方格本身是梯子 → 人站在梯子上，不依赖脚下支撑 → 挖了不塌。
+                //   这是"向下挖掘"的前置：先在站立格铺梯子，再挖脚下。
+                //   执行器（exec.rs）负责在目标位于可达区下方且站立格无梯子时先铺梯子；
+                //   这里只负责正确感知"有梯子就不算唯一支撑"。
+                if grid.kind(n) == Kind::Ladder {
+                    continue;
+                }
                 // 上方格 (n.x, n.y) 的支撑：它下方 8 格里有多少个实的？
                 let mut supports = 0;
                 for k in 1..=8 {
@@ -881,6 +888,62 @@ pub fn ladder_step(reach: &Reach, x: i32, y: i32) -> Option<(i32, i32)> {
         }
     }
     Some((x, y - 1))
+}
+
+/// **向下挖掘**的梯子位置：目标 (x,y) 在可达区下方，人站在 (x,y+1) 往下挖。
+///
+/// 物理：挖开 (x,y) 后 (x,y+1) 失去脚下支撑，人掉到 (x,y) 爬不回来。
+/// 解法：**先在站立格 (x,y+1) 铺梯子**（梯子不占站立位，人可站梯子上），
+///   再挖 (x,y)——挖开后梯子留在 (x,y+1)，人能上下。
+///
+/// 与 `ladder_step`（向上）对称：向上是"正下方空、要爬上去"，向下是"正下方实、要爬回来"。
+/// 返回 None = 不需要（站立格已有梯子 / 站立格不可站 / 目标不在下方）。
+pub fn ladder_step_down(reach: &Reach, x: i32, y: i32) -> Option<(i32, i32)> {
+    let stand = (x, y + 1);
+    // 站立格必须是人**现在就能站**的（可达集内）
+    if !reach.set.contains(&stand) && !reach.climbable.contains(&stand) {
+        return None;
+    }
+    // 站立格已有梯子 → 不需要再铺
+    if reach.grid.kind(stand) == Kind::Ladder {
+        return None;
+    }
+    // 目标格必须是实心（挖它才有意义）且确实是"往下"
+    if reach.grid.kind((x, y)) != Kind::Solid {
+        return None;
+    }
+    Some(stand)
+}
+
+#[cfg(test)]
+mod ladder_down_tests {
+    use super::*;
+    fn reach_with(stand_in_set: bool, stand_kind: Kind, target_kind: Kind) -> Reach {
+        let mut cells = std::collections::HashMap::new();
+        cells.insert((5, 5), stand_kind);
+        cells.insert((5, 4), target_kind);
+        let g = Grid { cells, ..Default::default() };
+        let mut set = std::collections::HashSet::new();
+        if stand_in_set { set.insert((5, 5)); }
+        Reach {
+            grid: g, set,
+            climbable: std::collections::HashSet::new(),
+            official: std::collections::HashSet::new(),
+            bbox: std::collections::HashSet::new(),
+            dupes: vec![], dupe_hood: std::collections::HashSet::new(),
+        }
+    }
+    #[test]
+    fn down_ladder_goes_on_the_standing_cell() {
+        let r = reach_with(true, Kind::Gas, Kind::Solid);
+        assert_eq!(ladder_step_down(&r, 5, 4), Some((5, 5)), "梯子铺在人站的格");
+    }
+    #[test]
+    fn no_down_ladder_if_standing_cell_already_has_one_or_not_reachable() {
+        assert_eq!(ladder_step_down(&reach_with(true, Kind::Ladder, Kind::Solid), 5, 4), None, "已有梯子");
+        assert_eq!(ladder_step_down(&reach_with(false, Kind::Gas, Kind::Solid), 5, 4), None, "站立格不可达");
+        assert_eq!(ladder_step_down(&reach_with(true, Kind::Gas, Kind::Gas), 5, 4), None, "目标不是实心");
+    }
 }
 
 /// 同一列在 [y_low, y_high] 之间有没有梯子（可攀爬的退路）。
