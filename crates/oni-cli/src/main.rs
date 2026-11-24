@@ -997,9 +997,43 @@ fn read_agent_toml() -> Option<(u64, u64, u64, u16, String, String, String, Stri
     Some((fast_i, fast_w, slow_i, port, ep, key, model, fmt))
 }
 
+/// ★ 进程互斥：同一时间只允许一个快系统守护进程（serve / agent）。
+///
+/// 事故：改代码时 pkill -f "oni serve" 杀不到早先 nohup 起的 oni agent（命令名不同），
+/// 残留的旧二进制 agent 继续裸跑 1 小时（没有慢系统、没有 v3 修复），
+/// 它开紧急窗口把游戏放跑了 13 个周期 → 全灭。
+///
+/// 做法：pid 文件 + 进程存活探测（kill -0，macOS/Linux 自带，不引第三方 crate）。
+/// 不是猜意图，是进程生命周期的硬约束。
+fn acquire_daemon_lock(cmd: &str) -> anyhow::Result<DaemonLock> {
+    let path = oni_mcp::state_dir().join("daemon.pid");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(pid) = text.lines().next().and_then(|l| l.trim().parse::<i32>().ok()) {
+            let alive = std::process::Command::new("kill").args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()
+                .map(|s| s.success()).unwrap_or(false);
+            if alive {
+                let what = text.lines().nth(1).unwrap_or("?").to_string();
+                anyhow::bail!(
+                    "⛔ 已有守护进程在跑（pid {pid}，{what}）。\n   先停它：kill {pid}（或 pkill -f \"release/oni (serve|agent)\"），再启动。\n   不要让两个快系统同时操作同一个世界。"
+                );
+            }
+        }
+    }
+    std::fs::write(&path, format!("{}\n{}\n{}", std::process::id(), cmd, chrono::Local::now().format("%m-%d %H:%M")))
+        .map_err(|e| anyhow::anyhow!("写 pid 文件失败: {e}"))?;
+    Ok(DaemonLock { path })
+}
+
+struct DaemonLock { path: std::path::PathBuf }
+impl Drop for DaemonLock {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); }
+}
+
 /// 统一启动：一个进程同时跑快系统(agent循环) + 慢系统(LLM决策+Web)。
 /// 配置从项目根 agent.toml 读取（复制 agent.example.toml 填写）。
 fn cmd_serve() -> anyhow::Result<()> {
+    let _lock = acquire_daemon_lock("serve")?;
     use oni_engine::agent::{Agent, AgentConfig};
     let s = connect()?;
     let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1068,6 +1102,7 @@ fn cmd_slow(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn cmd_agent(args: &[String]) -> anyhow::Result<()> {
+    let _lock = acquire_daemon_lock("agent")?;
     use oni_engine::agent::{Agent, AgentConfig};
     let s = connect()?;
     let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
