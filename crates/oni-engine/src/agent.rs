@@ -587,9 +587,16 @@ pub fn cycle(&mut self) -> CycleReport {
         //   circuit_breaks 全部残留 → LLM 决策窗口被污染、产氧目标开局即熔断
         //   （实测缺口：回滚后 oxygen fail=4 的熔断记录直接封锁新局的产氧目标）。
         //   阈值 2：读档通常回退多个周期；正常跨周期是 +1，不会误触。
-        if self.last_cycle > 0 && (snap.cycle as i64) + 2 <= self.last_cycle {
+        // ★ 世界不连续 = 回退 **或** 跳跃（|Δcycle| ≥ 2）。
+        //   跳跃的实测场景：hold 期间世界被手动快进了 13 个周期（2→15），release 后代理
+        //   看到的是一个人口 0 的死局，但 decisions/goal_outcomes 里还是周期 2 的旧记录，
+        //   窗口也还是旧世界的。回退清、跳跃不清 → 代理用旧世界的记忆面对新世界。
+        //   传感器只负责说"世界变了"，怎么回应用清上下文表达（LLM 从零重排）。
+        let dcycle = snap.cycle as i64 - self.last_cycle;
+        if self.last_cycle > 0 && dcycle.abs() >= 2 {
             crate::saveswitch::clear_save_state();
-            report.notes.push(format!("🔁 检测到回滚（周期 {} → {}）→ 已清局内决策上下文（LLM 从零重排）", self.last_cycle, snap.cycle));
+            report.notes.push(format!("🔁 检测到世界不连续（周期 {} → {}，{}）→ 已清局内决策上下文（LLM 从零重排）",
+                self.last_cycle, snap.cycle, if dcycle < 0 { "回退/读档" } else { "跳跃/手动快进" }));
         }
         self.last_cycle = snap.cycle as i64;            self.window_until = None;
             self.window_owned_by_us = false;
