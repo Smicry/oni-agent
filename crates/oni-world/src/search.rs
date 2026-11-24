@@ -1,11 +1,7 @@
 //! 元素搜索：跨出本地网格视野，用 mod 的权威搜索找元素位置。
 //!
-//! 为什么需要：
-//!   本地 Grid::load 只覆盖**相机视野**。
-//!   深埋资源根本不在网格里
-//!   → grid.kind() 判不出实心 → 元素搜索永远找不到 → 节点卡死
-//!   （报错："语义目标在当前地图上找不到（element:IronOre）"）。
-//!   mod 的 world search 能搜全图 → 返回候选坐标。
+//! 本地 `Grid::load` 只覆盖相机视野，深埋资源不在网格里，`grid.kind()` 判不出实心；
+//! mod 的 world search 能搜全图，返回候选坐标。
 
 use oni_mcp::McpSession;
 use serde::Deserialize;
@@ -13,8 +9,7 @@ use serde::Deserialize;
 /// mod 的元素搜索结果（oni://world/search?query=<元素>&kinds=cells）。
 #[derive(Debug, Clone, Deserialize)]
 struct SearchCluster {
-    // mod 返回的是 camelCase（elementId / suggestedCells）——
-    //   不写 rename 的话 serde 找不到字段 → 整段解析失败 → 搜索永远返回空！
+    // mod 返回 camelCase（elementId / suggestedCells）：不 rename 则 serde 解析失败，搜索返回空。
     #[serde(default, rename = "elementId")]
     element_id: String,
     #[serde(default, rename = "suggestedCells")]
@@ -65,8 +60,7 @@ pub fn search_element(
 mod tests {
     use super::*;
 
-    /// mod 的 world search 返回 camelCase（elementId / suggestedCells）。
-    ///   字段名写错 → serde 静默丢字段 → 搜索返回空 → 元素目标永远找不到。
+    /// mod 的 world search 返回 camelCase（elementId / suggestedCells）：字段名写错则 serde 静默丢字段，搜索返回空。
     #[test]
     fn parses_camel_case_search_result() {
         let raw = r#"{"clusters":[{"elementId":"IronOre","suggestedCells":[[107,171],[108,172]]}]}"#;

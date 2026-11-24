@@ -43,6 +43,8 @@ fn main() -> ExitCode {
         "audit" => cmd_audit(),
         "bus" => cmd_bus(&rest),
         "brief" => cmd_brief(),
+        "research" => cmd_research(&rest),
+        "pod" => cmd_pod(&rest),
         "command" => cmd_command(&rest),
         "decision" => cmd_decision(&rest),
         "scout" => cmd_scout(),
@@ -109,6 +111,9 @@ const HELP: &str = r#"oni <子命令>
   order <命令>          原样执行一条运维命令并打印完整返回
   build <x,y> <Prefab> [材料] [--apply]   建造落点：地图 token 补丁（默认 dry-run，--apply 落地）
   raw <oni://URI>        打印任意 MCP 资源的原始 JSON（审计用）
+  brief                打印大脑此刻看到的事实简报（审计传感器信息是否准确/足够）
+  research <TechId>    设定研究方向（大脑的决定；执行器只建研究站）
+  pod [claim <index>]  打印舱可领取项 / 领取第 index 个物品包（大脑的决定）
   call <tool> <json>   直接调用任意 MCP 工具（绕过语义封装，调试用）
   agent [--interval N]  常驻循环守护进程（后台跑，不依赖主 agent 的回合速度）
   slow [--port=N] [--interval=N]   只起慢系统（LLM 决策 + Web 控制台）
@@ -179,11 +184,6 @@ fn cmd_doctor() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **用模板重置 plan**（换存档时用）：把 plan.json 恢复成 plan.template.json 的开局状态。
-///
-/// 为什么需要：换存档后 plan.json 里上一局的 done 状态会被继承，
-///   代理以为建材/产氧已经做过 → 跳过关键步骤 → 开局就卡住。
-
 // ---- 存档相关命令------------------------
 
 /// 识别当前存档并设为进程内"当前存档"。
@@ -232,11 +232,9 @@ fn cmd_state() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// ★ 选址策略：把"什么算安全落点"从硬编码变成**慢系统可调参数**。
+/// 选址策略：把"什么算安全落点"做成慢系统可调参数。
 ///
-/// 为什么需要：开局氧气稀薄时"厕所必须纯氧"的硬编码判据会把所有落点否掉 →
-///   反复挖同一格 → 厕所永远建不成（实测）。这类权衡属于慢系统的活，
-///   但阈值必须能落到代码可执行的参数上，而不是每次改代码。
+/// "什么算安全落点"这类权衡属于慢系统，阈值必须落到代码可执行的参数上。
 ///
 /// 用法：
 ///   oni policy show                打印当前策略
@@ -317,7 +315,7 @@ fn cmd_policy(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-/// 局内笔记：写进**本存档**的 notes.md（只对有意义，不进通用记忆）。
+/// 局内笔记：写进本存档的 notes.md（只对本存档有意义，不进通用记忆）。
 fn cmd_note(args: &[String]) -> anyhow::Result<()> {
     let text = args.join(" ");
     if text.trim().is_empty() {
@@ -376,7 +374,7 @@ fn cmd_promote(args: &[String]) -> anyhow::Result<()> {
 /// 快慢分工的交接点：
 ///   快系统遇到规则解不开的情况 → 写 escalation + 停手；
 ///   慢系统（AI / 主 agent）用这个命令读出来 → 诊断 → 改计划 / 改代码 / 改策略
-/// P0-48 统一收口：同时确认 escalations + bus 两个通道的同一事件。
+/// 统一收口：同时确认 escalations + bus 两个通道的同一事件。
 ///   避免慢系统处理后只清一处、另一处残留过时升级误导后续判断。
 fn cmd_resolve(args: &[String]) -> anyhow::Result<()> {
     let _ = current_save();
@@ -406,7 +404,8 @@ fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-///   → `oni escalations ack` 告诉快系统"我处理了，继续"。
+/// 快系统升级请求工作台：列出待处理请求；`ack N` 告诉快系统"我处理了，继续"。
+/// 用法：oni escalations [ack N|clear|history]
 fn cmd_escalations(args: &[String]) -> anyhow::Result<()> {
     // 必须先识别当前存档：save::current() 是**进程内**状态，
     //   不先识别就读不到正确的存档目录（会读到 saves/unknown）。
@@ -426,7 +425,7 @@ fn cmd_escalations(args: &[String]) -> anyhow::Result<()> {
         "clear" => {
             let esc_n = oni_engine::escalate::read_pending().len();
             oni_engine::escalate::clear();
-            // P0-48：escalations 与 bus 是同一问题的两个通道，必须一起清，
+            // escalations 与 bus 是同一问题的两个通道，必须一起清，
             //   否则过时事件残留总线误导后续判断。
             let inbox = oni_engine::bus::inbox();
             let mut bus_n = 0;
@@ -637,10 +636,8 @@ fn cmd_command(args: &[String]) -> anyhow::Result<()> {
 
 /// **协同总线**：快慢系统的统一事件时间线。
 ///
-///   oni bus              待处理事件（QoS 过滤：过期剔除 + 去重 + 按优先级排序）
-///   oni bus timeline     全部事件（可回放）
-///   oni bus ack <id>     确认接手
-///   oni bus resolve <id> 确认已解决（正反馈回路）
+/// 慢系统决策记录：add <json> 留痕 / list [n] 最近决策 / suggestions 重规划建议 /
+/// resolve <id> <实际结果> 回填。
 fn cmd_decision(args: &[String]) -> anyhow::Result<()> {
     let _ = current_save();
     let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
@@ -761,7 +758,7 @@ fn cmd_bus(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn cmd_plan_reset() -> anyhow::Result<()> {
-    // ★ 新局不再复制模板 playbook（硬编码套路换地图就不适用，已删除）：
+    // 新局不复制模板 playbook（硬编码套路换地图就不适用）：
     //   落一份「待 LLM 规划」占位，随后**同步**采集本局事实并调 LLM 生成正式计划。
     //   同步 = 消除空窗：reset 返回时 plan 已就绪，不会出现 0 节点死锁期。
     let id = current_save();
@@ -820,7 +817,7 @@ fn cmd_plan_reset() -> anyhow::Result<()> {
 
 /// **开局资源侦察**：探测关键资源分布并落盘 ~/.oni-agent/scout.json。
 ///
-///  的对策：不知道资源在哪就深挖 → 挖开地下 CO₂ → 三人。
+/// 约束：不知道资源在哪就深挖会挖开地下 CO₂，先侦察再定挖掘方向。
 fn cmd_scout() -> anyhow::Result<()> {
     let s = connect()?;
     let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -835,8 +832,8 @@ fn cmd_scout() -> anyhow::Result<()> {
 /// 用法：`oni restart [存档索引]`（索引来自 `oni call game_control {"domain":"save","action":"list"}`）
 /// 不给索引时用最近的一个 auto_save（Cycle N）。
 ///
-/// 为什么需要：换存档后 plan.json 的 done 状态、目标锁、趋势样本都会继承上一局的脏数据，
-///   代理会以为关键步骤做过了 → 开局卡住（）。本命令一次性清干净。
+/// 为什么需要：换存档后 plan.json 的 done 状态、目标锁、趋势样本都会继承原存档的脏数据，
+///   代理会以为关键步骤做过了 → 开局卡住。本命令一次性清干净。
 fn cmd_restart(args: &[String]) -> anyhow::Result<()> {
     let s = connect()?;
     let list = s
@@ -936,10 +933,9 @@ fn cmd_hold(args: &[String]) -> anyhow::Result<()> {
 
 fn cmd_release(args: &[String]) -> anyhow::Result<()> {
     let force = args.iter().any(|a| a == "--force" || a == "-f");
-    // ★ 安全壳：release 前校验世界没有漂走。
+    // 安全壳：release 前校验世界没有漂走。
     //   hold 的语义是"冻结世界"，但只有代理进程在跑时才守得住——进程被 kill 后
-    //   游戏可能被手动/残留进程推进。实测：hold 期间游戏跑了 13 个周期、殖民地全灭，
-    //   而 release 脚本无脑解除 → 代理在一个已死的局上继续决策。
+    //   游戏可能被手动/残留进程推进，代理会在一个已变的局上用旧记忆继续决策。
     //   规则：hold 文件里记录 hold 时的周期；release 时周期变了 → 拒绝（除非 --force）。
     if !force {
         if let Some(held_cycle) = oni_engine::agent::hold_cycle() {
@@ -998,11 +994,10 @@ fn read_agent_toml() -> Option<(u64, u64, u64, u16, String, String, String, Stri
     Some((fast_i, fast_w, slow_i, port, ep, key, model, fmt))
 }
 
-/// ★ 进程互斥：同一时间只允许一个快系统守护进程（serve / agent）。
+/// 进程互斥：同一时间只允许一个快系统守护进程（serve / agent）。
 ///
-/// 事故：改代码时 pkill -f "oni serve" 杀不到早先 nohup 起的 oni agent（命令名不同），
-/// 残留的旧二进制 agent 继续裸跑 1 小时（没有慢系统、没有 v3 修复），
-/// 它开紧急窗口把游戏放跑了 13 个周期 → 全灭。
+/// 约束：serve 与 agent 命令名不同，按名字 pkill 可能杀不掉残留的旧 agent；
+/// 两个快系统同时操作同一个世界，会让世界在 hold 期间被推进。
 ///
 /// 做法：pid 文件 + 进程存活探测（kill -0，macOS/Linux 自带，不引第三方 crate）。
 /// 不是猜意图，是进程生命周期的硬约束。
@@ -1031,8 +1026,6 @@ impl Drop for DaemonLock {
     fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); }
 }
 
-/// 统一启动：一个进程同时跑快系统(agent循环) + 慢系统(LLM决策+Web)。
-/// 配置从项目根 agent.toml 读取（复制 agent.example.toml 填写）。
 /// 打印「大脑此刻看到的事实简报」（window::facts_summary，决策与窗口 prompt 共用）。
 /// 审计传感器信息是否准确、足够时，一条命令就能看到慢系统拿到什么。
 fn cmd_brief() -> anyhow::Result<()> {
@@ -1044,13 +1037,48 @@ fn cmd_brief() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 设定研究方向（大脑的决定）：oni research <TechId>
+fn cmd_research(args: &[String]) -> anyhow::Result<()> {
+    let Some(id) = args.first() else {
+        anyhow::bail!("用法: oni research <TechId>（如 oni research ImprovedOxygen）");
+    };
+    let s = connect()?;
+    let out = oni_engine::exec::set_research(&s, id).map_err(anyhow::Error::msg)?;
+    let shown: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).take(6).collect();
+    let joined = shown.join("\n");
+    println!("{}", if joined.is_empty() { "(无输出)" } else { joined.as_str() });
+    Ok(())
+}
+
+/// 打印舱：oni pod（看可领取项）/ oni pod claim <index>（领物品包，大脑的决定）
+fn cmd_pod(args: &[String]) -> anyhow::Result<()> {
+    let s = connect()?;
+    let (action, idx) = match (args.first().map(|a| a.as_str()), args.get(1)) {
+        (Some("claim"), Some(i)) => ("claim", i.parse::<u64>().map_err(|_| anyhow::anyhow!("index 必须是数字"))?),
+        _ => ("list", 0),
+    };
+    let mut call = serde_json::json!({
+        "domain": "side_surface", "surface": "facility", "kind": "printing_pod",
+        "action": action, "task": format!("oni pod {action}") });
+    if action == "claim" {
+        call["rewardIndex"] = serde_json::json!(idx);
+        call["confirm"] = serde_json::json!(true);
+    }
+    let text = s.call_text("building_control", call).map_err(anyhow::Error::msg)?;
+    let start = text.find("printingRewards:").unwrap_or(0);
+    println!("{}", text[start..].trim());
+    Ok(())
+}
+
+/// 统一启动：一个进程同时跑快系统(agent循环) + 慢系统(LLM决策+Web)。
+/// 配置从项目根 agent.toml 读取（复制 agent.example.toml 填写）。
 fn cmd_serve() -> anyhow::Result<()> {
     let _lock = acquire_daemon_lock("serve")?;
     use oni_engine::agent::{Agent, AgentConfig};
     let s = connect()?;
     let cat = Catalog::load(&s).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // ★ 加载本存档的选址策略（慢系统此前调整过的判据 → 跨进程保持生效）。
+    // 加载本存档的选址策略（慢系统此前调整过的判据 → 跨进程保持生效）。
     if let Some(id) = current_save() {
         let p = oni_mcp::save::save_dir(&id.fingerprint).join("site_policy.json");
         if let Ok(t) = std::fs::read_to_string(&p) {
@@ -1286,8 +1314,8 @@ fn cmd_pause_resume(args: &[String], pause: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// P1-57：一次读一层地图的 **Visual Spatial Summary**（水体/气室/建筑/植物/危险点），
-///   比逐格 probe 高效一个量级。图层按 32 行分块。
+/// 一次读一层地图的 Visual Spatial Summary（水体/气室/建筑/植物/危险点），
+/// 比逐格 probe 高效一个量级。图层按 32 行分块。
 fn cmd_area(args: &[String]) -> anyhow::Result<()> {
     let y0: i32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(192);
     let y1: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(223);
@@ -1404,13 +1432,8 @@ fn cmd_reach_cells(args: &[String]) -> anyhow::Result<()> {
 
 /// **依赖图体检**：列出每个节点的 status / 判据 / 判据当前是否成立。
 ///
-/// 为什么要这个命令（实测本局教训）：
-///   计划里的 status=done 可以**未经任何判据校验**就存在。
-///   实测：E1「地表换气」done 但可达上界只有 194（判据要 216）、
-///   B1「床位」done 但 beds=0 → 依赖图以为这些都完成了
-///   → 再没有任何节点要求产氧 → 基地慢慢耗尽。
-/// 用法：oni plan-check [fix]
-///       oni plan-check             （只打印，不改）
+/// 计划里的 status=done 可以未经任何判据校验就存在：假 done 会让依赖图以为关键步骤已完成，
+///   再没有任何节点要求它 → 基地慢慢耗尽。
 /// **手动触发 LLM 开局规划**：采集本局世界事实 → LLM 生成计划 → 强校验 → 落盘。
 ///
 /// 用途：换局/回滚后想立刻重新规划，不用等慢系统自动触发。
@@ -1451,9 +1474,8 @@ fn cmd_plan_check(args: &[String]) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("计划格式错误: {e}"))?;
     let nodes = v.get("nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
 
-    // ★ **真复核**：连游戏取一份快照，逐个 done 节点跑同一套判据。
-    //   只有静态打印等于"我看到这里写着 done"，那正是本局翻车的根源
-    //   （E1「地表换气」done 但可达上界只有 194 / B1「床位」done 但 beds=0）。
+    // 真复核：连游戏取一份快照，逐个 done 节点跑同一套判据；
+    //   只做静态打印等于"我看到这里写着 done"，发现不了假 done。
     let snap = match connect() {
         Ok(sess) => Some(oni_engine::sense::sense(&sess)),
         Err(e) => {
@@ -1534,11 +1556,10 @@ fn cmd_preflight(args: &[String]) -> anyhow::Result<()> {
             let anchor = args.get(1).ok_or_else(|| anyhow::anyhow!("用法: oni preflight build x,y Prefab"))?;
             let prefab = args.get(2).ok_or_else(|| anyhow::anyhow!("用法: oni preflight build x,y Prefab"))?;
             let def = cat.find(prefab).ok_or_else(|| anyhow::anyhow!("目录里没有 {prefab}"))?;
-            // 修正：**不能取目录第一个材料**（目录顺序 ≠ 地上有货）。
-            //   取**第一个真实可用量 > 0** 的；都没有就如实报"需要采建材"。
-            // **材料必须问实时 mod**（oni://buildings/materials），
-            //   不能用 catalog 缓存里的 available_kg —— 缓存 TTL 30 分钟，
-            //   库存早就变了。
+            // 不能取目录第一个材料（目录顺序 ≠ 地上有货）：取第一个真实可用量 > 0 的；
+            //   都没有就如实报"需要采建材"。
+            // 材料必须问实时 mod（oni://buildings/materials），不能用 catalog 缓存里的 available_kg：
+            //   缓存 TTL 30 分钟，库存早就变了。
             let live = oni_engine::exec::mod_materials_with_kg(&s, &def.prefab_id);
             let usable = live
                 .iter()

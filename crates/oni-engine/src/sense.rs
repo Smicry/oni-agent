@@ -16,6 +16,11 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("status_check", "oni://dupes/status-check"),
     ("atmos", "oni://atmosphere/breathability"),
     ("gas", "oni://fluid/gas/summary"),
+    // ★ 液体清单（清水是电解/研究/厕所的资源，污染水是卫生与 germs 的隐患）。
+    ("liquid", "oni://fluid/liquid/summary"),
+    // ★ 研究状态（§8「能不能造」三关之一：研究锁）与食物构成（士气/可持续性）
+    ("research", "oni://research/status"),
+    ("food_detail", "oni://resources/food"),
     ("rooms", "oni://rooms/list"),
     ("power", "oni://power/summary"),
     ("food", "oni://food/summary"),
@@ -32,15 +37,18 @@ pub struct Dupe {
     pub breath: Option<f64>,
     pub stress: Option<f64>,
     pub bladder: Option<f64>,
+    /// 体力（status-check 的 needs.stamina）：低 = 快去睡/需要床
+    #[serde(default)]
+    pub stamina: Option<f64>,
     pub reachable: Option<i64>,
     pub element: String,
     pub blocked: i64,
     pub schedule: String,
     /// 官方 `step_facts` 的 `workScheduled`：此人是否在**工作日程块**里。
     ///
-    /// 为什么用它而不是 chore 文本：日程块和当前动作会不一致（实测 schedule=工作 而 chore=睡觉），
-    ///   而两份"休息差事名单"（sense 的 resting_count / stuck 的 is_self_rescuing）互不一致，
-    ///   "放松"漏算 → 娱乐时段被当成全员真空闲 → 触发自救。None = 传感器没报（按"在上班"保守处理）。
+    /// 约束：不用 chore 文本判定——日程块和当前动作会不一致（schedule=工作 而 chore=睡觉），
+    ///   按差事名匹配会漏算"放松" → 娱乐时段被当成全员真空闲 → 触发自救。
+    ///   None = 传感器没报（按"在上班"保守处理）。
     #[serde(default)]
     pub work_scheduled: Option<bool>,
 }
@@ -48,9 +56,7 @@ pub struct Dupe {
 impl Dupe {
     /// 所在格是否**不可呼吸**（污染水 / CO₂ / 氯气 / 污染氧 / 真空）。
     ///
-    /// 为什么需要：三次都发生在"人泡在不可呼吸的格里"。
-    ///   代理以前只看得见全局气体比例，看不见**人具体泡在哪** ——
-    ///   这一项把人变成一等公民：判定看的是"人所在格"，不是地图平均。
+    /// 约束：判定看的是"人所在格"，不是地图平均——全局气体比例看不见**人具体泡在哪**。
     pub fn in_unbreathable(&self) -> bool {
         matches!(
             self.element.as_str(),
@@ -67,11 +73,38 @@ impl Dupe {
     }
 }
 
+/// 打印舱物品包（领哪个由大脑决定；mod 有意不支持自动选新人）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrintingRewards {
+    pub available: bool,
+    pub reward_count: i64,
+    /// 可选项（mod 文本行，原样保留）
+    pub rewards: Vec<String>,
+    pub claim_support: String,
+}
+
+/// 从打印舱 `list` 文本解析 `printingRewards` 段。
+pub fn parse_printing_rewards(text: &str) -> Option<PrintingRewards> {
+    let mut it = text.lines().skip_while(|l| !l.trim_start().starts_with("printingRewards:"));
+    it.next()?;
+    let mut r = PrintingRewards::default();
+    let mut in_rewards = false;
+    for l in it {
+        let t = l.trim();
+        if t.is_empty() || !l.starts_with(' ') { break; }
+        if let Some(v) = t.strip_prefix("available:") { r.available = v.trim() == "true"; in_rewards = false; }
+        else if let Some(v) = t.strip_prefix("rewardCount:") { r.reward_count = v.trim().parse().unwrap_or(0); in_rewards = false; }
+        else if let Some(v) = t.strip_prefix("claimSupport:") { r.claim_support = v.trim().to_string(); in_rewards = false; }
+        else if let Some(v) = t.strip_prefix("rewards:") { in_rewards = true; if v.trim() != "[]" && !v.trim().is_empty() { r.rewards.push(v.trim().to_string()); } }
+        else if in_rewards && t.starts_with('-') { r.rewards.push(t.trim_start_matches('-').trim().to_string()); }
+    }
+    Some(r)
+}
+
 /// 传感器健康：这份快照能不能信。
 ///
-/// 为什么需要：mod 对**长连接 session** 的"可见世界扫描"会在游戏长时间暂停后停止更新，
-///   而同一响应里的实时字段还在变（实测 14 小时 hold 后 serve 持续 25 分钟看 cycle 1/厕所 0）。
-///   光靠定时重连是盲目的；要用**必然递增的心跳**判断数据有没有过期，并让所有层看见。
+/// 环境事实：mod 对**长连接 session** 的"可见世界扫描"会在游戏长时间暂停后停止更新，
+///   而同一响应里的实时字段还在变。所以用**必然递增的心跳**判断数据有没有过期，并让所有层看见。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SensorHealth {
@@ -91,18 +124,24 @@ pub struct Snapshot {
     pub paused: bool,
     /// 游戏速度（来自 oni://colony/status 的 gameSpeed）。
     ///
-    /// 为什么需要：`isPaused` 只表示"暂停按钮"，而**速度 0 也等于停着**
-    ///   （mod 报 gameSpeed=0.0 但 isPaused=false 的组合出现过）。
-    ///   判定"世界在不在跑"要同时看这两个：任一为停 → 判停。
-    ///   两者来自同一次响应，零额外请求成本。
+    /// 约束：`isPaused` 只表示"暂停按钮"，**速度 0 也等于停着**
+    ///   （mod 会报 gameSpeed=0.0 且 isPaused=false 的组合）。
+    ///   判定"世界在不在跑"要同时看这两个：任一为停 → 判停。两者来自同一次响应。
     pub game_speed: f64,
     pub dupes: Vec<Dupe>,
     pub diagnostics: Value,
     pub atmos: Value,
     pub gas: Value,
+    pub liquid: Value,
     pub rooms: Value,
     pub power: Value,
     pub food: Value,
+    pub research: Value,
+    pub food_detail: Value,
+    /// 打印舱现在有没有可领取的（step_facts 的 immigrantsAvailable）：新人/物品是战略资源
+    pub immigrants_available: Option<bool>,
+    /// 打印舱物品包状态（`building_control side_surface facility printing_pod action=list`）
+    pub printing_rewards: Option<PrintingRewards>,
     pub storage: Value,
     pub inventory: Value,
     /// prefabId → 数量（官方建筑索引）
@@ -129,9 +168,8 @@ pub struct Snapshot {
     pub pending_orders: Option<i64>,
     /// **施工中**的建筑数（梯子/砖块等在施工队列里）。
     ///
-    /// 为什么单独统计：建筑施工**不是**工单（不在 remainingTrackedOrders 里），
-    ///   所以"全员空闲 + 无工单"会误判成空跑 → 代理停机 → 梯子永远铺不完。
-    ///   梯子在施工时复制人确实闲着，但那是**有意义的等待**，不能停机。
+    /// 约束：建筑施工**不是**工单（不在 remainingTrackedOrders 里）；梯子在施工时复制人闲着是**有意义的等待**，
+    ///   不能按"全员空闲 + 无工单 = 空跑"停机。
     pub under_construction: i64,
 }
 
@@ -146,9 +184,14 @@ impl Default for Snapshot {
             diagnostics: Value::Null,
             atmos: Value::Null,
             gas: Value::Null,
+            liquid: Value::Null,
             rooms: Value::Null,
             power: Value::Null,
             food: Value::Null,
+            research: Value::Null,
+            food_detail: Value::Null,
+            immigrants_available: None,
+            printing_rewards: None,
             storage: Value::Null,
             inventory: Value::Null,
             buildings: Value::Null,
@@ -222,6 +265,16 @@ pub fn parse_clock(text: &str) -> Option<(i64, f64)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockVerdict { NoBaseline, Forward, Backward }
 
+/// 去掉 mod 文本里的 `<link="X">名字</link>` 标记，只留名字。
+pub fn strip_link(s: &str) -> String {
+    let s = s.trim();
+    // `<link="X">名字</link>`：取第一个 '>' 之后、'</link>' 之前；没有标记就原样返回
+    match s.find('>') {
+        Some(i) => s[i + 1..].split("</link>").next().unwrap_or(&s[i + 1..]).trim().to_string(),
+        None => s.to_string(),
+    }
+}
+
 /// 游戏时钟只能前进：任何回退（哪怕同一周期内）= 读档/回到保存点，世界被改写了。
 pub fn clock_verdict(prev: Option<(i64, f64)>, now: Option<(i64, f64)>) -> ClockVerdict {
     match (prev, now) {
@@ -271,18 +324,22 @@ pub fn parse_work_scheduled(facts_text: &str) -> std::collections::HashMap<Strin
     out
 }
 
+impl Dupe {
+    /// 站在**污染水**里（本地化名/ID 两种写法都认；与气体无关）。
+    pub fn in_dirty_liquid(&self) -> bool {
+        matches!(self.element.as_str(), "污染水" | "DirtyWater" | "污水" | "SewageWater")
+    }
+}
+
 impl Snapshot {
     pub fn food_kcal(&self) -> f64 {
         self.food_kcal_opt().unwrap_or(0.0)
     }
     /// 食物读数（None = 传感器没报，**不等于 0**）。
     ///
-    /// 为什么要区分：给大脑的事实摘要把"没报"编成 0 → 大脑按假饥荒排优先级
-    ///   （实测周期 1 食物 16000kcal 被报成 0）。判死用 0 兜底可以，给大脑看不行。
+    /// 约束：给大脑的事实摘要不能把"没报"编成 0（会按假饥荒排优先级）。判死用 0 兜底可以，给大脑看不行。
     pub fn food_kcal_opt(&self) -> Option<f64> {
-        // P0-58：inventory 全量 totalCaloriesKcal 求和是权威源。
-        //   两次误判"收割无效"就是因为只读 diagnostics.foodKcal 这个派生单点
-        //   。权威源优先，派生值只做 fallback。
+        // inventory 全量 totalCaloriesKcal 求和是权威源；diagnostics.foodKcal 是派生单点，只做 fallback。
         let mut total = 0.0;
         let mut found = false;
         if let Some(items) = self.inventory.get("items").and_then(|i| i.as_array()) {
@@ -310,8 +367,7 @@ impl Snapshot {
     }
     /// **电力摘要**：`oni://power/summary` 的真实结构是
     /// `{circuits[], diagnostics, summary}` —— 计数都在 `summary` 里。
-    /// 之前读顶层 `generatorOperational` 永远是空 → "发电机没燃料"这条告警
-    /// **从来没触发过**（真 bug）。
+    /// 顶层没有 `generatorOperational` 等计数字段，读顶层永远是空。
     pub fn power_summary(&self) -> &Value {
         self.power.get("summary").unwrap_or(&self.power)
     }
@@ -347,9 +403,8 @@ impl Snapshot {
     }
     /// 最高的膀胱百分比。
     ///
-    /// 为什么要它：没有厕所时膀胱满 → 复制人随地排泄
-    ///   → 地面生成**污染水** → 三人泡在污染水里→ 差点重演/9。
-    ///   所以膀胱是"污染"的**一级预警信号**，必须进调度。
+    /// 约束：没有厕所时膀胱满 → 复制人随地排泄 → 地面生成**污染水**；
+    ///   膀胱是"污染"的**一级预警信号**，必须进调度。
     pub fn max_bladder(&self) -> f64 {
         self.dupes
             .iter()
@@ -394,6 +449,34 @@ impl Snapshot {
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
     }
+    /// 泡在污染水里的人数。
+    pub fn dirty_liquid_dupe_count(&self) -> usize {
+        self.dupes.iter().filter(|d| d.in_dirty_liquid()).count()
+    }
+    /// 液体清单条目 (element, kg, cells)：来自 `oni://fluid/liquid/summary`；源缺失返回 None。
+    pub fn liquids(&self) -> Option<Vec<(String, f64, i64)>> {
+        let arr = self.liquid.get("liquids")?.as_array()?;
+        Some(arr.iter().filter_map(|l| {
+            Some((
+                l.get("element")?.as_str()?.to_string(),
+                l.get("massKg")?.as_f64()?,
+                l.get("cellCount").and_then(|c| c.as_i64()).unwrap_or(0),
+            ))
+        }).collect())
+    }
+    /// 当前研究摘要 (名字, 进度%, 解锁建筑列表)；没有在研返回 None。
+    pub fn research_brief(&self) -> Option<(String, f64, Vec<String>)> {
+        let a = self.research.get("active")?;
+        let id = a.get("id")?.as_str()?;
+        if id.is_empty() { return None; }
+        let name = a.get("name").and_then(|n| n.as_str()).map(strip_link).unwrap_or_else(|| id.to_string());
+        let progress = a.get("progress").and_then(|p| p.as_f64()).unwrap_or(0.0) * 100.0;
+        let unlocks = a.get("unlocks").and_then(|u| u.as_array()).map(|us| {
+            us.iter().filter_map(|u| u.get("name").and_then(|n| n.as_str()).map(strip_link)).collect()
+        }).unwrap_or_default();
+        Some((name, progress, unlocks))
+    }
+
     /// **可呼吸气体比例** = 氧气 / (氧气 + CO₂)。
     ///
     /// 为什么用比例而不是绝对值：密闭空间里氧气总量可以还很可观，
@@ -417,9 +500,7 @@ impl Snapshot {
     }
     /// **进展指纹**：把"殖民地有没有变好"压成一个可比较的串。
     ///
-    /// 为什么需要：上一轮代理连续几十轮重复同一条无效命令
-    ///   （挖了但材料不涨、工单被 ONI 取消），看起来"在跑"其实零进展。
-    ///   有指纹才能识别"卡住"，进而熔断换方案。
+    /// 约束：有指纹才能识别"卡住"（看起来"在跑"其实零进展：挖了但材料不涨、工单被 ONI 取消），进而熔断换方案。
     pub fn progress_fingerprint(&self) -> String {
         let mut mat = 0.0;
         if let Some(items) = self.inventory.get("items").and_then(|i| i.as_array()) {
@@ -432,8 +513,7 @@ impl Snapshot {
             .as_object()
             .map(|m| m.values().filter_map(|v| v.as_i64()).sum())
             .unwrap_or(0);
-        // 只保留"真的变好"的信号：氧气质量每轮都在波动，放进指纹会让
-        // 熔断永远不触发（这正是上一轮"卡住却一直重复"的机制原因）。
+        // 只保留"真的变好"的信号：氧气质量每轮都在波动，放进指纹会让熔断永远不触发。
         format!(
             "mat={:.0}|bld={}|pop={}|air={:.2}",
             mat,
@@ -444,11 +524,8 @@ impl Snapshot {
     }
     /// **生活区（复制人真正待着的封闭气室）的氧气量**估算。
     ///
-    /// 为什么必须有这个指标：
-    ///   全局氧气 394kg、比例 99% —— 看着非常安全；
-    ///   但生活区是个**封闭气室**。
-    ///   全局指标把「殖民地根本够不到的气室」也算进去 → 空气红线**永远看不见**。
-    ///   上一局就是这么死的：全局比例正常，人在封闭区里窒息到 0。
+    /// 约束：全局指标把「殖民地根本够不到的气室」也算进去 → 空气红线**看不见**；
+    ///   全局氧气量/比例正常时，人仍可能在封闭的生活区里窒息。
     ///   口径：全局氧气密度（oxygenKgVisible / 可呼吸格）× 官方可达格数。
     pub fn living_oxygen_kg(&self) -> Option<f64> {
         let cells = self.reachable_cells;
@@ -484,12 +561,9 @@ impl Snapshot {
     }
     /// **不在工作日程**的人数（睡觉 / 娱乐 / 卫生时段；不算"真的没活干"）。
     ///
-    /// 为什么需要：
-    ///   官方的 workIdleCount 语义是"不在工作日程里" → **睡觉的复制人也算 idle**。
-    ///   于是 observe 常年显示"全员空闲 3/3"，看起来像代理卡住，其实他们只是在睡觉。
-    ///   这个误判会让守护进程误停机（空跑）或误判无进展（熔断好节点）。
-    /// 口径：官方 `step_facts.workScheduled == false`（见 [`parse_work_scheduled`]），
-    ///   不用 chore 文本匹配 —— 旧实现漏了"放松"，且和 stuck.rs 的名单不一致。
+    /// 环境事实：官方的 workIdleCount 语义是"不在工作日程里" → **睡觉的复制人也算 idle**；
+    ///   不排除会把睡觉误判成全员空闲 → 守护进程误停机（空跑）或误判无进展（熔断好节点）。
+    /// 口径：官方 `step_facts.workScheduled == false`（见 [`parse_work_scheduled`]），不用 chore 文本匹配。
     pub fn resting_count(&self) -> usize {
         self.dupes.iter().filter(|d| d.work_scheduled == Some(false)).count()
     }
@@ -521,9 +595,7 @@ impl Snapshot {
     }
     /// 是否有复制人**倒地/失去行动能力**。
     ///
-    /// 为什么必须单独识别：
-    ///   倒地的复制人**不会去执行任何差事** —— 代理还在下挖掘工单、以为工单会被完成，
-    ///   结果三个人在 CO₂ 泡到死。看见倒地就必须立刻转入救援（排毒/拖到有空气处/治疗）。
+    /// 约束：倒地的复制人**不会去执行任何差事**；看见倒地必须立刻转入救援（排毒/拖到有空气处/治疗）。
     pub fn downed_count(&self) -> usize {
         self.dupes
             .iter()
@@ -674,7 +746,6 @@ pub fn sense(session: &McpSession) -> Snapshot {
             .and_then(|l| l.split(':').nth(1))
             .and_then(|v| v.trim().parse::<i64>().ok())
     });
-    // 删掉了重复的 step_facts 调用（原来调了两次，白花一次 MCP 往返）。
 
     let mut raw: BTreeMap<&str, Value> = BTreeMap::new();
     let results: Vec<(&str, &str, Result<Value, String>)> = SOURCES
@@ -763,6 +834,7 @@ pub fn sense(session: &McpSession) -> Snapshot {
                 breath: needs.get("breath").and_then(|v| v.as_f64()),
                 stress: needs.get("stress").and_then(|v| v.as_f64()),
                 bladder: needs.get("bladder").and_then(|v| v.as_f64()),
+                stamina: needs.get("stamina").and_then(|v| v.as_f64()),
                 reachable: nav.get("reachableCells").and_then(|v| v.as_i64()),
                 element: env
                     .get("elementName")
@@ -798,9 +870,23 @@ pub fn sense(session: &McpSession) -> Snapshot {
         diagnostics,
         atmos: get("atmos"),
         gas: get("gas"),
+        liquid: get("liquid"),
         rooms: get("rooms"),
         power: get("power"),
         food: get("food"),
+        research: get("research"),
+        food_detail: get("food_detail"),
+        immigrants_available: facts_text.as_ref().and_then(|txt| {
+            txt.lines().find(|l| l.trim_start().starts_with("immigrantsAvailable:"))
+                .and_then(|l| l.split(':').nth(1)).and_then(|v| v.trim().parse::<bool>().ok())
+        }),
+        printing_rewards: session
+            .call_text("building_control", serde_json::json!({
+                "domain": "side_surface", "surface": "facility", "kind": "printing_pod",
+                "action": "list", "task": "SENSE: 打印舱可领取项" }))
+            .ok()
+            .as_deref()
+            .and_then(parse_printing_rewards),
         storage: get("storage"),
         inventory: get("inventory"),
         buildings,
@@ -833,6 +919,19 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// 打印舱 list 文本的 printingRewards 段：available / rewardCount / rewards / claimSupport。
+    #[test]
+    fn parse_printing_rewards_block() {
+        let txt = "telepad:\n  id: 96\n  immigrantsAvailable: true\nprintingRewards:\n  available: true\n  timeRemainingSeconds: 0\n  rewardCount: 2\n  rewards:\n    - name: SandStone 2000kg\n    - name: FieldRation\n  claimSupport: none_currently_safe\n  notes: No current care-package containers are materialized.\n";
+        let p = parse_printing_rewards(txt).expect("应解析到");
+        assert!(p.available && p.reward_count == 2, "{p:?}");
+        assert_eq!(p.rewards, vec!["name: SandStone 2000kg".to_string(), "name: FieldRation".to_string()]);
+        assert_eq!(p.claim_support, "none_currently_safe");
+        let empty = parse_printing_rewards("printingRewards:\n  available: true\n  rewardCount: 0\n  rewards: []\n  claimSupport: none_currently_safe\n").unwrap();
+        assert!(empty.rewards.is_empty() && empty.reward_count == 0);
+        assert!(parse_printing_rewards("nothing").is_none());
+    }
+
     /// mod 心跳判定：不变 = 过期缓存；回退 = 游戏重启；推进 = 活的；没基线不判。
     ///   锁住的不变量：只有"心跳不变"才判 stale —— 暂停/换档时心跳照样推进，不会误判。
     #[test]
@@ -845,6 +944,8 @@ mod tests {
         assert_eq!(probe_verdict(Some(96000.0), Some(12.0), 10), ProbeVerdict::Restarted, "回退 = 游戏进程重启");
         assert_eq!(parse_probe("cycle: 2\ntimeOfDayPercent: 17.3\nrealtimeSinceStartup: 96132\n"), Some(96132.0));
         assert_eq!(parse_probe("nothing"), None);
+        assert_eq!(strip_link("<link=\"FARMINGTECH\">基础耕种</link>"), "基础耕种");
+        assert_eq!(strip_link("朴素名字"), "朴素名字");
     }
 
     /// 游戏时钟只能前进：回退（哪怕同一周期内）= 读档。
@@ -884,7 +985,7 @@ mod tests {
     }
 
     /// 上不上班只看官方 workScheduled，不看 chore 文本：
-    ///   实测 schedule=工作 而 chore=睡觉；"放松"曾漏算 → 娱乐时段被当成全员真空闲 → 触发自救。
+    ///   锁住的不变量：按差事名匹配会漏算"放松" → 娱乐时段被当成全员真空闲 → 触发自救。
     #[test]
     fn resting_count_uses_official_work_scheduled_not_chore_text() {
         let snap = Snapshot { dupes: vec![ws("放松", Some(true)), ws("睡觉", Some(false)), ws("空闲", None)], ..Default::default() };

@@ -1,16 +1,15 @@
 //! 换存档检测与**自动隔离**。
 //!
-//! 为什么：
-//!   换存档后，上一局的 plan.json（全 done）、目标锁、侦察报告、趋势样本
-//!   全被新局继承 → 代理拿着旧计划空转 40 分钟（"依赖图里没有可执行目标"）。
+//! 约束：换存档后，上一局的 plan.json（全 done）、目标锁、侦察报告、趋势样本
+//!   不得被新局继承，否则代理会拿着旧计划空转。
 //!
 //! 隔离动作：
 //!   1. 旧存档的 plan.json 归档到 saves/<旧指纹>/plan.json（保留、可追溯、可回滚）
-//!   2. 工作区的 plan.json 按模板重置（全部 todo）并打上**新存档指纹**
+//!   2. 工作区的 plan.json 重置为「待 LLM 规划」占位，并打上**新存档指纹**
 //!   3. 当前存档切到新的状态目录 → 目标锁/侦察报告/趋势样本/实时快照自然隔离
 //!
-//! 指纹写在 plan.json 里（save_fingerprint 字段）→ 判断"这份计划属于哪一局"
-//!   不依赖外部记账，且计划文件自证出身（谁把它拷到别的存档里，一眼能看出来）。
+//! 指纹写在 plan.json 里（save_fingerprint 字段）：判断"这份计划属于哪一局"不依赖外部记账，
+//!   计划文件自证所属存档。
 
 use std::path::Path;
 
@@ -50,7 +49,6 @@ pub fn stamp_plan(plan_path: &str, fp: &str) -> bool {
     std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok()
 }
 
-/// 按模板重置计划（并打指纹）。
 /// 写回计划（带存档指纹）。
 ///
 /// 重规划与人工编辑都走这一条路径 → 指纹永远正确 → 换局不会误重置。
@@ -79,10 +77,10 @@ pub fn write_plan(plan_path: &str, plan: &crate::decide::Plan, fp: Option<&str>)
     std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok()
 }
 
+/// 重置为「待 LLM 规划」占位计划（并打指纹）。
 pub fn reset_plan(plan_path: &str, fp: &str) -> bool {
-    // ★ 新局不再复制模板 playbook（硬编码套路换地图就不适用，已删除）：
-    //   写一份「待 LLM 规划」的占位计划 —— 快系统照常跑保命层，
-    //   慢系统 LLM 依据 opening_brief.json（本局世界事实）生成正式计划。
+    // 新局不复制模板 playbook（硬编码套路换地图就不适用）：写一份「待 LLM 规划」的占位计划——
+    //   快系统照常跑保命层，慢系统 LLM 依据 opening_brief.json（本局世界事实）生成正式计划。
     let v = serde_json::json!({
         "author": "pending_llm",
         "locked": false,
@@ -93,16 +91,12 @@ pub fn reset_plan(plan_path: &str, fp: &str) -> bool {
     std::fs::write(plan_path, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok()
 }
 
-/// 清掉**当前存档**的局内状态（目标锁/侦察报告/趋势样本/实时快照）。
+/// 清掉**当前存档**的局内状态（目标锁/侦察报告/趋势样本/实时快照/决策上下文）。
 pub fn clear_save_state() {
-    // 局内状态不只是"目标锁/侦察/快照"——决策上下文也是局内的：
-    //   decisions.jsonl（LLM 决策滑动窗口）、goal_outcomes.jsonl（熔断统计）、
+    // 决策上下文也是局内的：decisions.jsonl（LLM 决策滑动窗口）、goal_outcomes.jsonl（熔断统计）、
     //   ai_goals.jsonl（未完成语义目标）、circuit_breaks.jsonl（失败熔断记录）。
-    //   不清的话：回滚存档重开同一局时，上一轮的"全灭/倒地/熔断"记录
-    //   会进入 LLM 的决策窗口 → 污染新运行的决策走向
-    //   （实测缺口：上一局 oxygen fail=4 的熔断会把新局的产氧目标开局就冷却封锁）。
-    // ★ 用户指令**归档**而不是删除：读档重开后旧周期的指令已不适用
-    //   （"彻底处理二氧化碳"是 Cycle 4 的事，这局才 Cycle 1），继续展示会误导人。
+    //   约束：回滚存档重开同一局时，上一轮的熔断/全灭记录不得进入新运行的 LLM 决策窗口。
+    // ★ 用户指令**归档**而不是删除：读档重开后旧周期的指令已不适用，继续展示会误导人；
     //   但指令是用户说的，不能丢——移到 commands.archive.jsonl 保留追溯，不再进对话流。
     {
         let src_p = save::save_file("commands.jsonl");
@@ -139,8 +133,7 @@ pub fn clear_save_state() {
 
 /// 计划看起来像"上一局残留"吗？
 ///
-/// 判据：**所有节点都已是 done/blocked** ⇒ 这份计划在没有任何可做的事
-///   ⇒ 极可能是上一局的残留⇒ 可以安全按模板重置。
+/// 判据：**所有节点都已是 done/blocked/deferred** ⇒ 极可能是上一局的残留 ⇒ 可以安全重置为占位计划。
 ///   反之（还有 todo 节点）就当作**人正在用的计划** ⇒ 只补指纹，不重置。
 pub fn plan_looks_stale(plan_path: &str) -> bool {
     let Ok(t) = std::fs::read_to_string(plan_path) else {
@@ -163,8 +156,8 @@ pub fn plan_looks_stale(plan_path: &str) -> bool {
 
 /// 是不是换了一条时间线：指纹变了，或**存档文件**变了（同名存档 / 同一局读到更早的自动存档）。
 ///
-/// 为什么加文件：指纹 = 存档名 + 世界 + 打印舱锚点，同名存档可能指纹相同；
-///   而读更早的自动存档（`auto_save/陨石坑 Cycle 3.sav`）名字、锚点都一样，只有**路径**不同。
+/// 为什么比文件：指纹 = 存档名 + 世界 + 打印舱锚点，同名存档可能指纹相同；
+///   读更早的自动存档时名字、锚点都一样，只有**路径**不同。
 ///   只在两边都知道路径时才比（mod 没报路径时不误判）。指纹公式本身不含路径（改公式会让所有存档首跑被判新局）。
 pub fn timeline_changed(last: Option<&SaveId>, new: &SaveId, plan_fp: Option<&str>) -> bool {
     let file_changed = last
@@ -189,11 +182,8 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
 
     // 同一存档：只刷新进程内的当前存档指针
     //
-    // **计划文件里的指纹才是权威**。
-    //   旧逻辑要求 meta 的 last_seen **和** 计划指纹同时匹配才算「同一局」；
-    //   meta 一旦丢了（换机器 / 换存档读档 / 手改 plan.json 没打指纹）就会误报
-    //   「检测到换存档」→ 归档 + 刷屏，
-    //   让人以为计划被重置（实际只是补了个指纹）。
+    // 约束：**计划文件里的指纹才是权威**；不能要求 meta 的 last_seen 与计划指纹同时匹配才算「同一局」
+    //   （meta 丢失时会把同一局误报成换存档 → 归档 + 刷屏）。
     if !timeline_changed(last.as_ref(), &new, plan_fp.as_deref()) {
         save::set_current(new);
         return None;
@@ -218,7 +208,7 @@ pub fn ensure(session: &McpSession, plan_path: &str) -> Option<Switch> {
 
     // 2) 重置计划 + 打指纹
     //    - 计划文件不存在 → 落「待 LLM 规划」占位（新局的第一步）
-    //    - 明显是上一局残留（所有节点 done/blocked）→ 按占位重置
+    //    - 明显是上一局残留（所有节点 done/blocked/deferred）→ 重置为占位
     //    - 其它（人在用的计划）→ 只补指纹，绝不冲掉
     if !Path::new(plan_path).exists() {
         reset_plan(plan_path, &new.fingerprint);

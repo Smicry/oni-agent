@@ -88,7 +88,6 @@ impl Report {
 }
 
 /// 慢系统主动能力：把体检发现持久化到协同总线（可回放、可去重、有 TTL）。
-///   此前 audit 只在 CLI 打印，发现过眼就忘；写入 bus 后慢系统一处看全、不丢事件。
 ///   用 code 当 node，命中 bus::inbox 的 (kind,node) 去重（同一问题不刷屏）。
 ///   返回本次新发布的事件数。
 pub fn persist(report: &Report) -> usize {

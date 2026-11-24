@@ -4,17 +4,16 @@
 //!   DDS 的核心价值是「**多节点/多进程的实时数据分发** + QoS + 服务发现」。
 //!   我们的场景是「单游戏 + 单快进程 + 一个慢系统」：
 //!     - 没有多节点分发问题 → DDS 的核心能力用不上；
-//!     - 多一个常驻进程 = 多一个故障点，而我们的系统已经因"慢系统离线"吃过亏
-//!       ；
+//!     - 多一个常驻进程 = 多一个故障点；
 //!     - 事件量极小→ 文件通道完全够。
 //!   ⇒ 结论：**不引入 DDS**，但**借鉴它的三个设计**，做一个零进程、零依赖的总线：
 //!     ① **发布/订阅**（而不是点对点请求-响应）：双方都只发布/订阅事件，互不直接调用；
 //!     ② **QoS 语义**：优先级 / 时效(TTL) / 去重 / 批量窗口；
 //!     ③ **可回放的事件日志**（append-only）→ 支持慢系统"回放这一局做复盘"。
 //!
-//! 相比原来的三个专用通道（escalate / commands / audit）：
+//! 设计目标（escalate / commands / audit 的事件都汇到这里）：
 //!   - **统一时间线**：慢系统在一个地方看到所有协同事件；
-//!   - **生命周期闭环**：raised → acknowledged → resolved（修「只有单向确认」的弱点）；
+//!   - **生命周期闭环**：raised → acknowledged → resolved；
 //!   - **时效**：过期的问题自动失效（持续卡住的旧报告没有意义）。
 
 use std::io::Write;
@@ -186,7 +185,7 @@ pub fn acknowledge(id: u64, note: &str) -> bool {
     set_state(id, State::Acknowledged, note)
 }
 
-/// 确认已解决（**正反馈回路**：修「升级只有单向确认」的弱点）。
+/// 确认已解决（**正反馈回路**：升级不能只有单向确认）。
 pub fn resolve(id: u64, note: &str) -> bool {
     set_state(id, State::Resolved, note)
 }
@@ -217,7 +216,7 @@ fn set_state(id: u64, st: State, note: &str) -> bool {
 
 /// 回放（慢系统复盘用）：取某时间点之后的事件。
 ///
-/// 修「慢系统复盘节奏未定」的弱点：慢系统可以按周期回放这一局的事件流，
+/// 慢系统可以按周期回放这一局的事件流，
 ///   看问题是怎么出现、升级、被处理的 —— 而不是只看当前快照。
 pub fn replay(since_ts: i64) -> Vec<Event> {
     timeline().into_iter().filter(|e| e.ts >= since_ts).collect()

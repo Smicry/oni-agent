@@ -1,4 +1,4 @@
-//! DECIDE —— 按**依赖图**选本轮唯一目标，而不是按"当前最痛的问题"乱修。
+//! DECIDE —— 按**依赖图**选本轮唯一目标，不按"当前最痛的问题"选。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,25 +29,22 @@ pub struct Node {
     pub success: String,
     /// **救援节点**：有人倒地/窒息时，代理必须优先执行这类节点。
     ///
-    /// 为什么需要：
-    ///   倒地的复制人**不会执行任何差事** —— 代理还在下挖掘工单也白搭，
-    ///   人继续泡在 CO2 里直到死亡。救援节点优先级高于一切普通施工。
+    /// 约束：倒地的复制人**不会执行任何差事**，救援节点优先级高于一切普通施工。
     #[serde(default)]
     pub rescue: bool,
     #[serde(default)]
     pub note: String,
-    /// P0-54 显式优先级：survival/rescue/urgent/normal。
-    ///   decide() 先按 priority，再按 unlocks，最后按文件顺序。
-    ///   解决"食物只剩 2 周期却因 unlocks=0 排最后"的问题。
+    /// 显式优先级：survival/rescue/urgent/normal/low。
+    ///   decide() 先比 priority，再比 stall（少者优先），再比 unlocks 数，平局取文件靠前。
+    ///   用途：食物只剩 2 周期的节点 unlocks=0 也必须排在前面。
     #[serde(default)]
     pub priority: Option<String>,
     /// **暂不可执行的原因**（如被研究锁）。
     ///
     /// 与 `blocked`（熔断）严格区分：
-    ///   - `blocked` = 连续无进展熔断 → 代理反复试同一个方案 → 必须换方案；
+    ///   - `blocked` = 连续无进展熔断 → 必须换方案；
     ///   - `research_locked` = **外部条件未满足**（研究没完成）→ 试多少次都一样，
-    ///     但**不是代理的错** → 不该反复试、也不该冻回停摆，应该跳过它做别的。
-    ///   旧逻辑把两者混为一谈 → 被研究锁的节点反复失败 → 殖民地反复停摆。
+    ///     不该反复试、也不该冻回停摆，应该跳过它做别的。
     #[serde(default)]
     pub deferred: Option<String>,
     /// 暂缓发生的**轮次**（用于冷却期计算，避免"暂缓-恢复"抖动）。
@@ -55,13 +52,8 @@ pub struct Node {
     pub deferred_at: Option<u64>,
     /// **连续未达成判据的轮数**（"做了但没达成"）。
     ///
-    /// ★ 为什么需要（实测：本局 P1 供电节点 0 次被选中）：
-    ///   依赖图按 (priority, unlocks 数, 文件顺序) 选节点，
-    ///   一个"解锁下游多"的节点（AIR unlocks=5）会**永久压住**解锁数少的节点（P1 unlocks=3），
-    ///   只要它每轮都能"做点什么"（下了一格挖掘工单）就永远轮不到别人。
-    ///   结果：供电节点从没被选中 → 氧气扩散器建成了但**没有电**（净 -120W、consumerOperational=0）
-    ///   → 造出来 = 不产氧 → 基地耗尽。
-    ///   正解：连续没达成的节点**降权让位**，让别的节点有机会。
+    /// 约束：只按 (priority, unlocks 数, 文件顺序) 选节点时，"解锁下游多"的节点会永久压住解锁数少的节点；
+    ///   所以连续没达成的节点**降权让位**，达到 STALL_LIMIT 本轮排除。
     #[serde(default)]
     pub stall: Option<u64>,
 }
@@ -112,7 +104,7 @@ pub struct Plan {
     /// 一句话目标（LLM 填，人读）。
     #[serde(default)]
     pub objective: String,
-    /// v3 滚动窗口：本 plan 生成时的游戏周期。0 = 非窗口（旧静态 plan）。
+    /// v3 滚动窗口：本 plan 生成时的游戏周期。0 = 非滚动窗口（静态 plan）。
     /// 快系统据此判断窗口是否过期（跨 ≥2 周期 → 重算）。
     #[serde(default)]
     pub window_cycle: i64,
@@ -126,9 +118,8 @@ pub struct Decision {
     /// 死锁解锁：正常模式下没有任何可选节点（全被熔断/完成），
     /// 复活了这批 blocked 节点。agent 需把它们写回 todo。
     ///
-    /// 为什么必须有：熔断是"换方案"，不是"让依赖图永远死掉"。
-    ///   N1 被熔断后 N2/N3/N4 全 requires N1 → 整张图没有 ready
-    ///   日志刷屏"依赖图里没有可执行目标"，代理彻底停摆（真事故）。
+    /// 约束：熔断是"换方案"，不是"让依赖图永远死掉"——
+    ///   N1 被熔断后依赖它的下游全部无 ready，整张图停摆。
     pub revived: Vec<String>,
 }
 
@@ -140,7 +131,7 @@ pub fn load_plan(path: &Path) -> Result<Plan, String> {
 /// **连续未达成判据多少轮后，本节点让位给别人**。
 ///
 /// 3 轮 = "做了三件事都没达成" → 换方案（多半是这个节点的判据/路径本身不成立）。
-/// 太短会被正常施工误伤（挖地表本来就慢）；太长会饿死其它节点（实测 P1 供电 0 次被选中）。
+/// 太短会被正常施工误伤（挖地表本来就慢）；太长会饿死其它节点。
 pub const STALL_LIMIT: u64 = 3;
 
 fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(String, String)>) {
@@ -156,13 +147,9 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
         if n.is_done() || (n.is_blocked() && !revive) {
             continue;
         }
-        // 暂不可执行（研究锁 / 连续失败）→ 本轮跳过。
-        //   但**不阻塞下游**：
-        //     旧逻辑把 deferred 当成"没完成" → requires 判定不通过
-        //     下游全被挡 → 整张图没有可执行目标 → 代理彻底停摆。
-        //     暂缓 4 个节点 → 下游 7 个节点全被堵 → "依赖图里没有可执行目标"。
-        //   正解：暂缓 = "这条现在做不了"，不是"这条永远做不了"
-        //     下游照常参与调度（它自己可能不依赖暂缓节点的效果）。
+        // 暂不可执行（研究锁 / 连续失败）→ 本轮跳过，但**不阻塞下游**：
+        //   暂缓 = "这条现在做不了"，不是"这条永远做不了"；下游照常参与调度
+        //   （它自己可能不依赖暂缓节点的效果；真做不了时它会自己失败并被暂缓）。
         if n.is_deferred() {
             blocked.push((n.id.clone(), format!("暂缓: {}", n.deferred.clone().unwrap_or_default())));
             continue;
@@ -195,23 +182,13 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
     }
     // Tie-break: prefer the node that unlocks the most; on a tie keep the
     // one appearing EARLIER in the plan file (file order = author priority).
-    // Rust's max_by_key returns the LAST max on ties, which made the plan pick
-    // a later node and starve the earlier one (air ventilation got skipped).
+    // Constraint: compare with strict `>` (Rust's max_by_key returns the LAST max on ties).
     let mut best: Option<&Node> = None;
     for n in &ready {
         match best {
             None => best = Some(n),
             Some(b) => {
-                // P0-54：先比显式 priority，再比 unlocks。
-                // ★ 再比 **stall**（连续未达成判据的轮数）：
-                //   同一 priority 下，连续"做了但没达成"的节点要让位。
-                //   实测事故：AIR（unlocks=5）每轮都能下几格挖掘工单 → 永远选它
-                //   → P1 供电（unlocks=3）**一次都没被选中**
-                //   → 氧气扩散器建成了但没电（consumerOperational=0）→ 不产氧 → 全灭。
-                //   解法：stall 高的排后面；stall 达到上限直接本轮跳过。
-                // ★ 顺序很重要：**stall 比 unlocks 数量优先**。
-                //   否则"解锁下游多但连续没达成"的节点仍然赢 →
-                //   供电节点（解锁少）永远轮不到（实测 P1 被选中 0 次）。
+                // 排序键：(priority, stall 少者优先, unlocks 多者优先)。
                 let nk = (n.priority_rank(), std::cmp::Reverse(n.stall.unwrap_or(0)), n.unlocks.len());
                 let bk = (b.priority_rank(), std::cmp::Reverse(b.stall.unwrap_or(0)), b.unlocks.len());
                 if nk > bk {
@@ -220,8 +197,7 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
             }
         }
     }
-    // stall 超限的节点本轮**完全排除**（不是排在后面）：
-    //   排在后面仍然可能被选中（ready 里只剩它时）→ 饿死依旧。
+    // stall 超限的节点本轮**完全排除**（不是排在后面）：排在后面仍可能在 ready 里只剩它时被选中。
     let mut skipped_stalled: Vec<&Node> = Vec::new();
     let mut ready: Vec<&Node> = ready
         .into_iter()
@@ -239,9 +215,7 @@ fn decide_inner(plan: &Plan, revive: bool) -> (Option<Node>, Vec<String>, Vec<(S
         match best {
             None => best = Some(n),
             Some(b) => {
-                // ★ 顺序很重要：**stall 比 unlocks 数量优先**。
-                //   否则"解锁下游多但连续没达成"的节点仍然赢 →
-                //   供电节点（解锁少）永远轮不到（实测 P1 被选中 0 次）。
+                // 顺序很重要：**stall 比 unlocks 数量优先**，否则"解锁下游多但连续没达成"的节点仍然赢。
                 let nk = (n.priority_rank(), std::cmp::Reverse(n.stall.unwrap_or(0)), n.unlocks.len());
                 let bk = (b.priority_rank(), std::cmp::Reverse(b.stall.unwrap_or(0)), b.unlocks.len());
                 if nk > bk {
@@ -284,10 +258,7 @@ mod tests {
         }
     }
 
-    /// 暂缓节点**不能阻塞下游**。
-    ///
-    /// 旧逻辑：deferred 当成"没完成" → requires 不通过 → 下游全被挡
-    /// 整张图没有可执行目标 → 代理彻底停摆。
+    /// 暂缓节点**不能阻塞下游**（否则整张图没有可执行目标）。
     #[test]
     fn deferred_node_does_not_block_downstream() {
         let plan = Plan {
@@ -320,10 +291,7 @@ mod tests {
         assert!(chosen.is_none(), "暂缓节点本轮不应被选中");
     }
 
-/// ★ **饿死防护**：连续没达成的节点必须让位。
-    ///
-    /// 实测事故：AIR（unlocks=5）每轮都能下几格挖掘工单 → 永远压住
-    /// P1 供电（unlocks=3）→ P1 被选中 **0 次** → 氧气扩散器建了没电 → 全灭。
+/// **饿死防护**：连续没达成的节点（stall 更高）必须让位给其它 ready 节点。
     #[test]
     fn stalled_node_yields_to_other_ready_node() {
         let mut stalled = mk("AIR", &[], false);
@@ -391,7 +359,7 @@ mod tests {
         );
     }
 
-    /// P0-54：显式 priority 优先于 unlocks 数量。
+    /// 显式 priority 优先于 unlocks 数量。
     ///   食物告急节点 unlocks=0 但 priority=urgent，必须排在 unlocks=3 的 normal 节点前。
     #[test]
     fn priority_beats_unlock_count() {
@@ -412,7 +380,7 @@ mod tests {
     }
 }
 
-/// 选节点：只看"前置已完成"的节点；在这些里选**能解锁最多下游**的那个。
+/// 选节点：只看"前置已完成"的节点；按 (priority, stall 少者优先, unlocks 多者优先) 选，平局取文件靠前。
 ///
 /// 死锁兜底：正常模式无任何可选节点时，复活所有 blocked 节点重试。
 ///   熔断是为了换方案，不是让整张依赖图停摆。agent 会把 revived 里的节点写回 todo。

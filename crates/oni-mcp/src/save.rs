@@ -1,8 +1,7 @@
 //! 存档身份 + **按存档隔离的状态目录**。
 //!
-//! 为什么：
-//!   换存档后，上一局的 plan.json（全 done）、目标锁、侦察报告、趋势样本
-//!   全被新局继承 → 代理拿着旧计划空转 40 分钟（"依赖图里没有可执行目标"）。
+//! 为什么：状态不按存档隔离时，原存档的 plan.json（全 done）、目标锁、侦察报告、趋势样本
+//!   全被新局继承 → 代理拿着旧计划空转。
 //!
 //! 记忆分层（三层，各司其职，别混）：
 //!   1. **局内缓存**（本存档）：saves/<指纹>/ 下的 plan 归档 / 目标锁 / 侦察报告 /
@@ -185,7 +184,7 @@ pub fn identify(session: &McpSession) -> Option<SaveId> {
     }
     let anchor = printing_pod_anchor(session).unwrap_or_default();
     let fingerprint = fingerprint_of(&[&name, &world, &world_id.to_string(), &anchor]);
-    // ★ 存档文件身份：同名存档 / 读更早的自动存档 → 路径不同 → 时间线不同（切换判定单独比它）
+    // 存档文件身份：同名存档 / 读更早的自动存档 → 路径不同 → 时间线不同（切换判定单独比它）
     let save_file = session
         .call_text("game_control", serde_json::json!({
             "domain": "launch", "action": "status", "task": "存档身份：当前加载的存档文件" }))
@@ -236,10 +235,8 @@ fn printing_pod_anchor(session: &McpSession) -> Option<String> {
 
 /// 存档名归一化：去掉自动存档的「 Cycle N」后缀。
 ///
-/// 踩坑：ONI 的自动存档叫「存档名 Cycle 6」，
-///   读一次自动存档 = 存档名变了 = 指纹变了 = 代理以为换存档
-///   **把正在跑的计划冲成模板**（就这么丢过一次定制计划）。
-///   周期号是"第几个周期"，不是"哪一局" ⇒ 不能进指纹。
+/// ONI 的自动存档叫「存档名 Cycle 6」：周期号是"第几个周期"，不是"哪一局"，不能进指纹——
+/// 否则读一次自动存档 = 指纹变了 = 代理以为换存档，正在跑的计划被当成新局。
 pub fn normalize_save_name(raw: &str) -> String {
     let t = raw.trim();
     match t.rfind(" Cycle ") {

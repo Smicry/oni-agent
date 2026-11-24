@@ -27,12 +27,10 @@ pub struct Transport {
     agent: ureq::Agent,
     session_id: Mutex<Option<String>>,
     next_id: AtomicI64,
-    /// **并发闸门**：所有 MCP 请求共用，保证同时在飞的请求不超过许可数。
+    /// 并发闸门：所有 MCP 请求共用，保证同时在飞的请求不超过许可数。
     ///
-    /// 为什么需要：
-    ///   mod 的 HTTP 端点扛不住几百个并发请求 —— `graph --full` 逐格读全图时
-    ///   单次查询就是几百个请求，多个查询叠加直接 503（ 6 个并发查询
-    ///   每个 300+ 格读取失败）。没有闸门时 rayon 的并行度会直接压垮服务端。
+    /// 为什么需要：mod 的 HTTP 端点扛不住几百个并发请求 —— `graph --full` 逐格读全图时
+    ///   单次查询就是几百个请求，多个查询叠加直接 503。没有闸门时 rayon 的并行度会直接压垮服务端。
     gate: Gate,
     /// 503/超时 的重试次数（带指数退避）。
     retries: u32,
@@ -56,10 +54,8 @@ impl Transport {
     /// 带并发闸门 + 指数退避重试的请求。
     ///
     /// 所有 MCP 请求都必须走这里：
-    ///   1) **闸门**限制同时在飞的请求数
-    ///      —— 防止几百个并发把 mod 端点打成 503。
-    ///   2) **退避重试**：503/502/504/429 是"暂时过载"，退避后重试往往就成功了。
-    ///      之前是直接失败 → 上层看到大面积"读取失败"，误判成地图问题。
+    ///   1) 闸门限制同时在飞的请求数——防止几百个并发把 mod 端点打成 503。
+    ///   2) 退避重试：503/502/504/429 是"暂时过载"，退避后重试往往就成功了。
     fn post_gated(&self, payload: &Value) -> Result<Value, McpError> {
         let attempts = self.retries.max(1);
         let mut last: Option<McpError> = None;
@@ -134,11 +130,9 @@ impl Transport {
 
     /// 重新握手：丢弃旧 `Mcp-Session-Id`，重新 `initialize`。
     ///
-    /// 为什么需要：mod 端对**长连接 session** 的"可见世界扫描"类字段
+    /// 为什么需要（AGENTS.md §7.1）：mod 端对长连接 session 的"可见世界扫描"类字段
     ///   （cycle / buildings / 体征 / paused）在游戏长时间暂停后会停止更新，
-    ///   而同一响应里的实时字段（foodKcal）还在变 → 半冻结快照。
-    ///   新 session 一切正常（实测：serve 看到 cycle 1/厕所 0/膀胱 86 持续 25 分钟，
-    ///   新进程直读同一 URI 是 cycle 2/厕所 1/膀胱 0）。
+    ///   而同一响应里的实时字段（foodKcal）还在变 → 半冻结快照；新 session 一切正常。
     ///   传感器不能无限信任一条 session：世界运行态变化后 / 周期性重连。
     pub fn reinitialize(&self) -> Result<(), McpError> {
         if let Ok(mut g) = self.session_id.lock() {

@@ -15,8 +15,7 @@
 //!   | 遇到卡点 | —— | **escalation：喊人 + 停手** |
 //!
 //! 一条铁律：**喊人之后不许继续瞎试**。
-//!   旧行为是"保命节点失败就重置计数 → 下一轮再试"→ 无限重试、白烧周期；
-//!   现在失败到阈值就**升级上报并停手**，等慢系统改计划。
+//!   失败到阈值就**升级上报并停手**，等慢系统改计划（AGENTS.md §8）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -128,10 +127,10 @@ fn pending_path() -> PathBuf {
     dir().join("pending.json")
 }
 
-/// C: 放行冷静期 —— ack 后同一 kind+node+category 静默 N 秒，防止误报无限重生。
+/// 放行冷静期 —— ack 后同一 kind+node+category 静默 N 秒，防止误报无限重生。
 ///
-/// 为什么用墙钟而非 cycle：cycle 在游戏暂停/低推进时**卡住不动**，
-/// 用 cycle 做水位会让静默**永不到期** → 真危机（如膀胱94%）被永久压制。
+/// 约束：用墙钟而非 cycle —— cycle 在游戏暂停/低推进时**卡住不动**，
+/// 用 cycle 做水位会让静默**永不到期** → 真危机被永久压制。
 /// 墙钟一定前进 → 静默必然到期 → 误报不刷屏、真危机仍能重报。
 const SILENCE_SECS: i64 = 180;
 
@@ -180,7 +179,7 @@ fn should_silence(silence: &HashMap<String, SilenceEntry>, key: &str, now: i64, 
         Some(e) => {
             if now >= e.until { return false; }
             // ★ 死锁/无目标是**结构性**状态：氧气自然下降不会让依赖图自己解锁，
-            //   指标恶化判定对它没有意义，只会让同一死锁每 10s 重报一次（实测连报 7 次）。
+            //   指标恶化判定对它没有意义，只会让同一死锁每 10s 重报一次。
             //   这类卡点只在依赖图真的变化时才值得重报——由快系统复活节点时显式触发。
             if key.starts_with("Deadlock|") || key.starts_with("NoFeasibleTarget|") {
                 return true;
@@ -232,7 +231,7 @@ fn raise_impl(
     kind: Kind, node: &str, detail: String, suggestion: String,
     ctx: Ctx, category: &str, context: EscContext,
 ) -> u64 {
-    // C: 放行冷静期内不再重报（墙钟 + 恶化打破；返回 0 = 跳过）。
+    // 放行冷静期内不再重报（墙钟 + 恶化打破；返回 0 = 跳过）。
     //   静默 key = kind|node|category：只压「同一问题」，不误伤另一个问题。
     let key = silence_key(kind, node, category);
     if should_silence(&read_silence(), &key, now(), &ctx) {
@@ -318,7 +317,7 @@ pub fn ack(id: u64) -> bool {
     let Some(target) = list.iter().find(|e| e.id == id) else {
         return false;
     };
-    // C: 写静默条目 —— 墙钟到期 + ack 时指标基线（恶化可提前打破）。
+    // 写静默条目 —— 墙钟到期 + ack 时指标基线（恶化可提前打破）。
     let key = silence_key(target.kind, &target.node, &target.category);
     let entry = SilenceEntry {
         until: now() + SILENCE_SECS,
@@ -340,8 +339,7 @@ pub fn ack(id: u64) -> bool {
         pending_path(),
         serde_json::to_string_pretty(&remaining).unwrap_or_default(),
     );
-    // ★ 徽章翻转：history.jsonl 是 UI 的「待处理/已处理」数据源，
-    //   旧代码只删 pending、不改 history → 已处理条目永远显示「待处理」。
+    // ★ 徽章翻转：history.jsonl 是 UI 的「待处理/已处理」数据源，ack 必须同时回写它。
     mark_history_acked(id);
     true
 }
@@ -427,7 +425,7 @@ mod tests {
         assert_eq!(Kind::NoFeasibleTarget.label(), "找不到任何可行目标");
     }
 
-    /// C: 墙钟静默 —— 到期内静默、到期后恢复、恶化提前打破、不同 key 隔离。
+    /// 墙钟静默 —— 到期内静默、到期后恢复、恶化提前打破、不同 key 隔离。
     #[test]
     fn silence_is_scoped_expires_and_breaks_on_deterioration() {
         let ctx = Ctx { cycle: 3, dupes: 3, oxygen_kg: 100.0, food_kcal: 1000.0, ..Default::default() };

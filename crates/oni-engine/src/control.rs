@@ -58,7 +58,7 @@ impl Default for ControlState {
 /// 路径必须**跨进程稳定**：CLI（`oni pause`/`window`）与守护进程是两个进程，
 ///   `save::current()` 是**进程内**状态 —— CLI 没跑 ensure 时是 None，
 ///   会把 control.json 写到 state 根，而守护进程写到 saves/<fp>/ → 两边读不到对方的 owner。
-///   正解：用 `last_seen()`（从 meta 文件读，跨进程一致）拼存档目录。
+///   约束：用 `last_seen()`（从 meta 文件读，跨进程一致）拼存档目录。
 fn path() -> PathBuf {
     match oni_mcp::save::last_seen() {
         Some(id) => oni_mcp::save::save_dir(&id.fingerprint).join("control.json"),

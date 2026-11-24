@@ -1,11 +1,10 @@
 //! 下单前预检 —— 拦下"指令 ok 但没人能干活"的订单。
 //!
 //! 三道关：
-//! 1. **目标可挖/可建**（实心岩 / 空格子）
-//! 2. **支撑成立**
-//! 3. **落脚点在复制人真正走得到的连通域里**（世界模型 BFS，不是"几何上能站"）
-//!
-//! 第 3 条是血泪教训：几何成立但走不到 → 死标记 → 复制人一直空闲 → 空跑。
+//! 1. 目标可挖/可建（实心岩 / 空格子）
+//! 2. 支撑成立
+//! 3. 落脚点在复制人真正走得到的连通域里（世界模型 BFS，不是"几何上能站"）；
+//!    几何成立但走不到会变成死标记，复制人一直空闲。
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,14 +27,9 @@ pub struct TargetCheck {
     /// 是否属于"竖井"：正下方是空的且不可达 → 需要先铺梯子才能往上挖
     pub needs_ladder: bool,
     pub hard_rock: bool,
-    /// 该格**已有挖掘标记**（之前已经下过单）。
-    ///
-    /// 为什么需要：代理每轮都取第一个前沿格，结果每轮重复对同一格下单，
-    ///   既浪费又掩盖真实进展。
-    ///   知道有没有标记，就能优先挑**没标记**的格子推进。
+    /// 该格已有挖掘标记（之前已经下过单），用于优先挑没标记的格子推进。
     pub has_marker: bool,
-    /// 液体陷阱：目标格正上方有大质量液体，挖穿会被淹没。
-    ///   基地正上方是 5 万吨水袋，挖穿会淹死全殖民地 → 必须硬拦截。
+    /// 液体陷阱：目标格正上方有大质量液体，挖穿会被淹没，预检层硬拦截。
     pub flood_risk: bool,
     pub reasons: Vec<String>,
 }
@@ -87,14 +81,10 @@ pub fn dupe_positions(session: &McpSession) -> Vec<(i32, i32)> {
 pub struct Reach {
     pub grid: Grid,
     pub set: HashSet<(i32, i32)>,
-    /// **爬梯可达集** = 官方可达集 + 顺着梯子链往上能爬到的格。
+    /// 爬梯可达集 = 网格 BFS 可达集 + 顺着梯子链往上能爬到的格。
     ///
-    /// 为什么必须单独算：
-    ///   官方 reachability 查询**不反映"梯子可爬的格"** ——
-    ///   连续铺好梯子、复制人真的踩着梯子挖开了头顶之后，
-    ///   可达区查询仍然只显示原来的走廊那几格。
-    ///   预检只信官方集 → 梯子井上方所有格都被判成"没有复制人站得到的落脚格"
-    ///   → 竖井挖到一半就卡死。
+    /// 约束：必须单独算——官方 reachability 查询不反映"梯子可爬的格"（mod 行为），
+    /// 预检只信官方集会把梯子井上方所有格判成"没有落脚格"。
     pub climbable: HashSet<(i32, i32)>,
     /// 官方导航的真实可达格（samples）——落脚点的权威依据
     pub official: HashSet<(i32, i32)>,
@@ -113,12 +103,8 @@ pub fn load_reach(session: &McpSession, catalog: Option<&Catalog>) -> Option<Rea
     let official = official_samples(session);
     let mut r = reach_from_grid(grid, dupes.clone(), bbox.clone(), official.clone());
 
-    // S1：**视野不够就自动升级全图**。
-    //   viewport.md 只有**相机视野**→ 相机一移开基地，
-    //   预检的世界模型里就没有基地 → 所有「人能不能到那」的判断全错
-    //   → 合法目标被判「没有落脚点」→ 代理反复失败/冻回。
-    //   判据：**官方可达样本里出现了本地网格看不到（或标成未知）的格**
-    //   → 说明本地视野没覆盖复制人真正能活动的区域 → 用全图层重算。
+    // 视野不够就自动升级全图：viewport.md 只有相机视野，相机移开基地后世界模型里没有基地，
+    // 「人能不能到那」的判断全错。判据：官方可达样本里出现了本地网格看不到（或标成未知）的格 → 用全图层重算。
     if !view_covers_world(&r) {
         if let Some(full) = full_grid(session, catalog) {
             r = reach_from_grid(full, dupes.clone(), bbox.clone(), official.clone());
@@ -176,20 +162,15 @@ fn reach_from_grid(
             dupe_hood.insert((d.0 + dx, d.1 + dy));
         }
     }
-    // 修正（长竖井卡死的**根因**）：
-    //   爬梯可达集必须从**网格 BFS 的可达集**（r.set）出发，而不是从**官方稀疏样本**。
-    //   官方 samples 只有十几个格（且是"离复制人近"的抽样），
-    //   竖井顶端的梯子格根本不在里面 → 梯子链的**根部缺失** → 整条链断
-    //   → 复制人爬不上去 → 上方的挖掘工单永远挂着 → 代理看到"已有标记"就不下新单
-    //   → 双方互等。
-    //   r.set 是网格 BFS（含梯子规则）算出来的，**根部一定正确**。
+    // 爬梯可达集必须从网格 BFS 的可达集（set）出发，不能从官方稀疏样本出发：
+    // 官方 samples 只是"离复制人近"的少量抽样，梯子链的根部可能不在里面。
     let climbable = compute_climbable(&grid, &set);
     Reach { grid, set, climbable, official, bbox, dupes, dupe_hood }
 }
 
-/// **爬梯可达集**：从官方可达集出发，顺着梯子链一格格往上扩。
+/// 爬梯可达集：从起始可达集出发，顺着梯子链一格格往上扩。
 ///
-/// 规则（定论）：站在**梯子格**上的复制人可以再往上爬一格。
+/// 规则：站在梯子格上的复制人可以再往上爬一格。
 /// 所以：某格是梯子且在可达集里 → 它的正上方（若为空）也可达。
 /// 反复扩展直到不动点（梯子链可以有多级）。
 pub fn compute_climbable(grid: &Grid, official: &HashSet<(i32, i32)>) -> HashSet<(i32, i32)> {
@@ -218,17 +199,10 @@ pub fn compute_climbable(grid: &Grid, official: &HashSet<(i32, i32)>) -> HashSet
     set
 }
 
-/// 读取**游戏官方**的复制人可达区（navigator 算出的每人可达包围盒）。
+/// 读取游戏官方的真实可达格（`/active/dupes/reachability.md` 的 samples 数组，navigator 算出）。
 ///
-/// 为什么不用我们自己从渲染 token 猜的：打印舱门廊、口粮箱这类
-/// "占格但实际能走"的建筑会被判成墙 → 17 格走廊被算成 8 格
-/// 所有工位都判"没人走得到"→ 预检 → 一格也挖不动（真 bug）。
-/// 官方 navigator 的包围盒才是真值。
-/// 官方导航的**真实可达格**（`/active/dupes/reachability.md` 的 samples 数组）。
-///
-/// 关键：samples 才是真值，bounds 只是包围盒。
-///   用包围盒会把"框内但走不到"的格子也算成可达 → 下了没人能执行的工单
-///   。
+/// samples 才是真值，bounds 只是包围盒：用包围盒会把"框内但走不到"的格子也算成可达，
+/// 下了没人能执行的工单。
 pub fn official_samples(session: &McpSession) -> HashSet<(i32, i32)> {
     let mut set = HashSet::new();
     let Ok(text) = session.call_text(
@@ -316,8 +290,7 @@ pub fn preflight_dig(session: &McpSession, targets: &[(i32, i32)], catalog: Opti
     let dupe_cells = dupe_positions(session);
     // 读目标格的标记状态（哪些格已经下过单）
     let marker_cells = fetch_many(session, targets);
-    // P0-65 液体陷阱：批量读目标格正上方 3 格，挖穿大质量液体会淹没殖民地。
-    //   基地正上方是 5 万吨水袋 —— 必须在预检层硬拦截，不能靠运气。
+    // 液体陷阱：批量读目标格正上方 3 格，挖穿大质量液体会淹没殖民地，必须在预检层硬拦截。
     const FLOOD_MASS_KG: f64 = 500.0;
     let mut above_cells: Vec<(i32, i32)> = Vec::new();
     for (x, y) in targets {
@@ -357,20 +330,12 @@ pub fn preflight_dig(session: &McpSession, targets: &[(i32, i32)], catalog: Opti
             if !grid.walkable(n) {
                 continue;
             }
-            // 落脚点必须是**复制人真的走得到**的格（或复制人当前就站在那）。
-            //
-            // 修正：
-            //   /active/dupes/reachability.md 的 samples 是**稀疏子集**
-            //   。
-            //   只认 samples → 合法落脚点被判"没有复制人走得到的落脚格"
-            //   → 预检不过 → 代理每轮失败 → 反复"冻回暂停" → 殖民地全程没活干。
-            //   
-            //
-            // 正确判据 = 网格 BFS ∩ 官方包围盒（r.set，乐观但有界）
-            //           ∪ 爬梯可达集（r.climbable：官方集 + 梯子链）
-            //           ∪ 复制人当前所在格。
-            //   梯子链必须留着：官方集不含"踩着梯子能爬到的格"，
-            //   只用官方集会把梯子井上方误判成没有落脚点 → 竖井卡死（）。
+            // 落脚点必须是复制人真的走得到的格（或复制人当前就站在那）。
+            // 判据 = 网格 BFS ∩ 官方包围盒（r.set，乐观但有界）
+            //       ∪ 爬梯可达集（r.climbable）
+            //       ∪ 复制人当前所在格。
+            // 约束：不能只认官方 samples——它是稀疏子集，也不含"踩着梯子能爬到的格"，
+            // 会把合法落脚点误判成没有落脚点。
             if !r.set.contains(&n)
                 && !r.climbable.contains(&n)
                 && !dupe_cells.iter().any(|d| *d == n)
@@ -392,15 +357,12 @@ pub fn preflight_dig(session: &McpSession, targets: &[(i32, i32)], catalog: Opti
         if wp.is_none() && !needs_ladder {
             reasons.push("✖ 没有复制人走得到的落脚格 → 没人能过去挖（工位不可达）".into());
         }
-        // 不许挖"唯一支撑"：挖掉这格 → 它上方那个可达站立格失去地板
-        //   人掉下去 → 可能掉进没地板的洞里爬不回来 → CO₂ 沉底 → 全员窒息。
-        //   修正：旧判定只看"正上方有可达格"，把**头顶空腔**也误判成地板，
-        //   导致"往上挖"永远被拦。
-        //   正确条件：目标格是上方站立格的**唯一**支撑。
+        // 不许挖"唯一支撑"：挖掉这格会让上方可达站立格失去地板，人掉进没地板的洞里爬不回来。
+        // 判定条件：目标格是上方站立格的唯一支撑（不是"正上方有可达格"——那会把头顶空腔误判成地板）。
         let mut is_floor = false;
         for n in neighbors(*x, *y) {
             if n.1 == y + 1 && grid.walkable(n) && set.contains(&n) {
-                // ★ 上方格本身是梯子 → 人站在梯子上，不依赖脚下支撑 → 挖了不塌。
+                // 上方格本身是梯子 → 人站在梯子上，不依赖脚下支撑 → 挖了不塌。
                 //   这是"向下挖掘"的前置：先在站立格铺梯子，再挖脚下。
                 //   执行器（exec.rs）负责在目标位于可达区下方且站立格无梯子时先铺梯子；
                 //   这里只负责正确感知"有梯子就不算唯一支撑"。
@@ -422,11 +384,8 @@ pub fn preflight_dig(session: &McpSession, targets: &[(i32, i32)], catalog: Opti
         if is_floor {
             reasons.push("是复制人站立格的唯一支撑，挖了会塌层（不作为挖掘目标）".into());
         }
-        // 挖掘目标的**正下方必须有可站立的落脚点**（实心岩或梯子）。
-        //   否则这一格是"悬空下挖"：挖完复制人就掉进没有地板的洞里，
-        //   再挖下一层就更深 → 爬不回来 → CO₂ 沉底 → 全员窒息。
-        //   就是这么把三个人封进竖井里的。
-        //   
+        // 挖掘目标的正下方必须有可站立的落脚点（实心岩或梯子）。
+        //   否则是"悬空下挖"：挖完复制人掉进没有地板的洞里，越挖越深爬不回来。
         let below = (*x, *y - 1);
         let below_ok = grid.is_support(below) || grid.kind(below) == Kind::Ladder;
         if !below_ok {
@@ -442,7 +401,7 @@ pub fn preflight_dig(session: &McpSession, targets: &[(i32, i32)], catalog: Opti
     }
     let ready: Vec<(i32, i32)> = checks
         .iter()
-        // P0-65：液体陷阱格硬排除（挖穿会淹没殖民地）
+        // 液体陷阱格硬排除（挖穿会淹没殖民地）
         .filter(|c| c.diggable && (c.work_position.is_some() || c.needs_ladder) && !c.is_floor && !c.flood_risk)
         .map(|c| (c.x, c.y))
         .collect();
@@ -466,10 +425,8 @@ pub fn preflight_build(
             material_ok, material_note, reasons: vec!["读不到世界模型".into()], ok: false,
         };
     };
-    // **占格判定用实时 cell**，不用渲染网格。
-    //   渲染网格（viewport.md）是**陈旧快照**：刚拆掉的口粮箱仍显示为 Building
-    //   → 预检判「占格不是空的」→ 永远铺不上砖 → 厕所/发电机永远建不成。
-    //   只查这 2~4 个占格 → 代价可忽略。
+    // 占格判定用实时 cell，不用渲染网格：viewport.md 是陈旧快照（已拆除的建筑仍显示为 Building）。
+    // 只查这几个占格，代价可忽略。
     let fp_cells = footprint(anchor.0, anchor.1, size.0, size.1);
     let live = crate::cell::fetch_many(session, &fp_cells);
     preflight_build_in(&r, anchor, size, material_note, material_ok, prefab_id, Some(&live))
@@ -511,9 +468,7 @@ pub fn preflight_build_in(
         let kind = live_kind.unwrap_or_else(|| grid.kind(*c));
         match kind {
             Kind::Gas => {}
-            // 液体可以建：ONI 会把液体挤开。
-            //   之前这里判"不是空的"→ 预检 → 走廊里什么都建不了
-            //   （人力发电机就建在污染水走廊里，游戏照单全收）。
+            // 液体可以建：ONI 会把液体挤开（人力发电机可建在污染水走廊里）。
             Kind::Liquid => {}
             // 关键建筑保护区：打印舱（唯一新人来源）/ 人力发电机（唯一电源）
             //   压上去 = 直接断电或断人。
@@ -525,10 +480,7 @@ pub fn preflight_build_in(
     // 支撑必须覆盖**整个底边**：2 格宽的建筑要 2 格都有地板。
     //   只查锚点那一格 → 会挑中"悬空一半"的落点 → 游戏报 missing_support。
     let supports: Vec<(i32, i32)> = (0..size.0.max(1)).map(|dx| (anchor.0 + dx, anchor.1 - 1)).collect();
-    // ★ 支撑判定**用实时 cell**：渲染网格是陈旧快照 —— 刚挖开/刚铺的格还没进网格
-    //   → 用网格判支撑会把"其实已经实心了"的落点判成悬空（或反过来）。
-    //   实测踩坑：预检说 (116,193),(117,193) 不实心，其实那两格是气体，
-    //   而第 1 座旱厕就建在天然砂岩上 —— 支撑到底成不成立**要问游戏**。
+    // 支撑判定用实时 cell：渲染网格是陈旧快照（刚挖开/刚铺的格还没进网格），支撑成不成立要问游戏。
     let live_support = |c: (i32, i32)| -> Option<bool> {
         live.and_then(|m| m.get(&c)).map(|cd| cd.is_solid() || cd.has_building())
     };
@@ -544,31 +496,23 @@ pub fn preflight_build_in(
     if !supported {
         reasons.push(format!("支撑格 {unsupported:?} 不实心 → 会报 missing_support"));
     }
-    // OnFloor 建筑只认**地板砖**当支撑（天然岩石不算）。
-    //   mod 原文：Unsupported OnFloor building: place floor/support tiles below。
-    //   旧预检把天然岩石也当支撑 → 选中其实不行的落点 → 落地必失败。
+    // OnFloor 建筑按规则要有地板砖支撑（mod 原文：Unsupported OnFloor building: place floor/support tiles below）。
     let no_tile_supports: Vec<(i32, i32)> = supports
         .iter()
         .copied()
         .filter(|c| !grid.is_floor_tile(*c))
         .collect();
-    // 修正：**地板砖自己不需要"支撑是地板砖"**。
-    //   旧逻辑对所有建筑都要求"支撑格是地板砖" → 给 Tile（砖块）做预检时变成**自指循环**：
-    //   要铺砖得先有砖 → 代理永远铺不上砖 → 厕所/发电机/研究站的底边永远准备不出来。
-    //   正解：只有**非 Tile 的 OnFloor 建筑**才要求支撑是地板砖；
-    //     Tile 只要支撑是实心（岩/砖都行）即可。
-    // ⚠ 这里只作**排序提示**（has_tile 优先），不作硬判据：
-    //   实测 mod 允许天然岩石作 OnFloor 支撑（第1座旱厕就建在砂岩上），
-    //   若强求地板砖 → 开局无砖时厕所永远建不成。
+    // 约束：Tile 自己不要求"支撑是地板砖"（否则自指循环：要铺砖得先有砖），Tile 只要支撑是实心即可。
+    // ⚠ 这里只作提示（has_tile 优先），不作硬判据：mod 允许天然岩石作 OnFloor 支撑，
+    //   开局无砖时若强求地板砖，厕所建不成。
     if !no_tile_supports.is_empty() && prefab_id != "Tile" {
         reasons.push(format!("支撑格 {no_tile_supports:?} 没有地板砖 → OnFloor 建筑可能报 missing_support"));
     }
     let mut wp = None;
     'outer: for c in &fp {
         for n in neighbors(c.0, c.1) {
-            // 修正：官方 samples 是**稀疏子集**（每个复制人只列 12 个样本，
-            //   实际可达 19~24 格）→ 只认 samples 会把合法落脚点判成「没人能来施工」。
-            //   与挖掘预检同一口径：网格 BFS ∩ 官方包围盒 ∪ 爬梯可达集 ∪ 复制人当前格。
+            // 与挖掘预检同一口径：网格 BFS ∩ 官方包围盒 ∪ 爬梯可达集 ∪ 复制人当前格。
+            // 官方 samples 只是稀疏子集，只认 samples 会把合法落脚点判成「没人能来施工」。
             let ok = r.set.contains(&n)
                 || r.climbable.contains(&n)
                 || dupe_cells.iter().any(|d| *d == n);
@@ -591,11 +535,9 @@ pub fn preflight_build_in(
     }
 }
 
-/// ★ 选址策略（可被慢系统调整）——把"什么算安全落点"从硬编码变成可调参数。
+/// 选址策略（可被慢系统调整）：把"什么算安全落点"做成可调参数。
 ///
-/// 为什么需要参数化：开局氧气稀薄时，"厕所必须纯氧"的硬编码判据会把所有落点否掉
-///   → 反复挖同一格 → 厕所永远建不成（实测）。这类**权衡**属于慢系统的活，
-///   但阈值得能落到代码可执行的参数上，而不是每次都改代码。
+/// "什么算安全落点"这类权衡属于慢系统，阈值得落到代码可执行的参数上。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SitePolicy {
     /// 选址允许的 CO₂ 浓度上限（kg/格）。超过 → 视为危险格。
@@ -606,11 +548,8 @@ pub struct SitePolicy {
     pub relax_after_fail: usize,
     /// 选址搜索半径的额外扩大量（格）。
     ///
-    /// ★ 快系统自动放宽**只动这个**，绝不动 CO₂ 阈值：
-    ///   CO₂ 上限是**保命判据**（人要在那儿待着）。
-    ///   实测把上限自动放宽到 8kg/格 → 厕所建在 CO₂ 里 →
-    ///   复制人如厕时呼吸掉到 66 → 触发一串假紧急态 → 慢系统反复暂停游戏。
-    ///   "放宽"应该是**扩大候选集**（多找几块地方），不是**放宽安全线**。
+    /// 约束：快系统自动放宽只动这个，绝不动 CO₂ 阈值——CO₂ 上限是保命判据（人要在那儿待着）。
+    /// "放宽"是扩大候选集（多找几块地方），不是放宽安全线。
     #[serde(default)]
     pub site_radius_boost: i32,
 }
@@ -685,10 +624,7 @@ pub fn find_build_site(
 ) -> Option<((i32, i32), BuildPreflight)> {
     let reach = load_reach(session, catalog)?;
     let dupes = dupe_positions(session);
-    // ：
-    //   代理把 4 张床 + 2 个厕所建在 Y=189 的 CO2 聚集区 -> 复制人睡在 CO2 里
-    //   -> 呼吸归零 -> 。
-    //   => **所有**自动建造的落点都必须可呼吸，不只是发电机。
+    // 所有自动建造的落点都必须可呼吸（不只是发电机）。
     let cands = find_build_site_all(&reach, &dupes, region, size, material_ok, prefab_id, None);
     if cands.is_empty() {
         return None;
@@ -699,15 +635,11 @@ pub fn find_build_site(
         .flat_map(|((x, y), _, _)| footprint(*x, *y, size.0, size.1))
         .collect();
     let cells = fetch_many(session, &probes);
-    // ★ 分级呼吸判据：
-    //   - 人要**长时间待**的（床 Bed / 发电机 Generator 等）→ 严格纯氧 is_safer_for_occupied；
-    //   - 人**短暂使用**的设施（旱厕 Outhouse / 洗手盆 / 医疗）→ 宽松 is_hazardous：
-    //     排除污染水/真空/污染氧/氯气/高浓度CO₂，但允许低浓度 CO₂（0.5~1.5kg 的普通气室）。
-    //   旧逻辑对所有建筑都用严格判据 → 开局氧气稀薄时厕所落点全被否 →
-    //   find_build_site 永远返回 None → 反复走 dig_space_for 挖同一格 → 厕所永远建不成。
-    // ★ 判据来自**全局选址策略**（慢系统可调），不再硬编码：
-    //   严格纯氧的建筑（床/发电机/电解器，看策略）用 is_safer_for_occupied；
-    //   短暂使用设施（旱厕等）按策略的 co2_max_kg 判 CO₂ 是否可接受。
+    // 分级呼吸判据，来自全局选址策略（慢系统可调）：
+    //   - 人要长时间待的建筑（策略 strict_prefabs：床/发电机/电解器）→ 严格纯氧 is_safer_for_occupied；
+    //   - 人短暂使用的设施（旱厕/洗手盆/医疗）→ 宽松判据：排除污染水/真空/污染氧/氯气，
+    //     CO₂ 按策略的 co2_max_kg 判。
+    // 约束：短暂使用的设施必须用宽松判据，否则开局氧气稀薄时厕所落点全被否、厕所建不成。
     let policy = site_policy();
     let strict_occupancy = policy.is_strict(prefab_id);
     let safe = |a: (i32, i32)| -> bool {
@@ -770,10 +702,8 @@ pub fn find_build_site_all(
         for x in x1.min(x2)..=x1.max(x2) {
             let pf = preflight_build_in(r, (x, y), size, None, material_ok, prefab_id, live);
             if !pf.ok {
-                // ★ 放行"占格空 + 复制人走得到、**只差支撑**"的候选：
-                //   执行层会**先铺地板砖**把这格支撑补齐，下一轮再建造。
-                //   旧逻辑一刀切跳过 → 永远选不到落点 → 厕所/发电机永远建不成
-                //   （实测第 2 座旱厕：候选全被"支撑不实心"否掉 → 反复挖同一格）。
+                // 放行"占格空 + 复制人走得到、只差支撑"的候选：
+                //   执行层会先铺地板砖把支撑补齐，下一轮再建造。
                 let preparable = pf.empty_cells && pf.work_position.is_some();
                 if !preparable {
                     continue;
@@ -785,9 +715,7 @@ pub fn find_build_site_all(
                 .min()
                 .unwrap_or(999);
             // 底边每格都有地板砖 → 0（优先）；否则 1
-            // OnFloor 建筑（发电机/旱厕/洗手盆）只认地板砖支撑，天然岩石不算。
-            //   发电机连撞 10+ 次全失败：选点只按"离复制人近"排
-            //   总挑到天然岩石支撑的位置 → 落地必失败 → 无限重试。
+            // OnFloor 建筑按规则要地板砖支撑：只按"离复制人近"排序会总挑到天然岩石支撑的位置。
             let has_tile = (0..size.0.max(1))
                 .all(|dx| r.grid.is_floor_tile((x + dx, y - 1)));
             let key = (if has_tile { 0i32 } else { 1i32 }, dist);
@@ -798,28 +726,15 @@ pub fn find_build_site_all(
     all
 }
 
-/// 这一列里复制人**真正站得到**的最低格（官方可达集）。
+/// 这一列里复制人站得到的最低格（列基座）。
 ///
-/// 为什么必须用 official 而不是自算的 set：
-///   自算 BFS 是**乐观**的（忽略"不能凭空往上爬"的规则），
-///   会把够不到的格算成可达 —— 旧版梯子逻辑就栽在这：
-///   梯子修在 (126,196)（自算可达、官方不可达）→ 复制人根本爬不上去 → 竖井永远挖不动。
+/// 用地图网格从目标正下方往下找：梯子 → 可站立基座；空格且脚下有地板 → 基座；实心岩 → 列到此为止。
+/// 不用 reach.climbable 找基座：官方可达集是半径受限的局部窗口，基座常常不在窗口里。
 pub fn column_base(reach: &Reach, x: i32, y: i32) -> Option<i32> {
-    // 修正：
-    //   旧实现用 reach.climbable（= 官方可达集 ∪ 梯子链）找列基座，
-    //   而**官方可达集是"半径受限的局部窗口"**
-    //   ，不是全局可达集
-    //   → 基座常常不在窗口里 → ladder_step 返回 None → 梯子分支永不生效。
-    //   正解：**用地图网格**（世界的真值）从目标正下方往下找：
-    //     梯子 → 继续往下；空格且**脚下有地板** → 就是基座；实心岩 → 列到此为止。
     let mut base: Option<i32> = None;
     for yy in (y - 24..y).rev() {
         match reach.grid.kind((x, yy)) {
-            // ★ 梯子格本身就是**可站立的基座**。
-            //   旧写法 "Kind::Ladder => continue" 把梯子格直接跳过 →
-            //   第一段梯子铺好后，列基座找不到任何有支撑的空格 → 返回 None
-            //   → ladder_step 交不出候选 → 梯子链**铺一格就断**
-            //   → 竖井永远只够到第一格。
+            // 梯子格本身就是可站立的基座（跳过它会让梯子链铺一格就断）。
             Kind::Ladder => {
                 base = Some(yy);
             }
@@ -836,44 +751,28 @@ pub fn column_base(reach: &Reach, x: i32, y: i32) -> Option<i32> {
     base
 }
 
-/// **梯子列**：为了让目标 (x,y) 的正下方 (x,y-1) 可达，该把梯子铺在哪。
+/// 梯子列：为了让目标 (x,y) 的正下方 (x,y-1) 可达，该把梯子铺在哪。
 ///
-/// ONI 的竖井标准做法：
-///   梯子必须**从复制人站得到的那一格开始，连续往上铺**：
-///     梯子(125,194) → 爬到 (125,195) → 梯子(125,195) → 爬到 (125,196) → 站上去挖头顶。
-///   证据：连续铺 (125,194)+(125,195) 后，复制人成功踩梯子挖开了 (125,196)。
-///
-/// 旧逻辑返回 (x, y-2)（目标的支撑格）—— 那一格复制人**根本站不到**
-///   → 梯子修好了也没人能爬 → 竖井永远挖不动（梯子修在 (126,196)，
-///   而官方可达区只有 row 193..194）。
-///
-/// 另一个事实：**官方 reachability 查询不反映"梯子可爬的格"**
-///   。
-///   所以"能不能爬"只能靠**梯子链是否连续**判断，不能信可达集。
+/// ONI 规则：梯子必须从复制人站得到的那一格开始，连续往上铺，复制人才能逐格爬上去挖头顶。
+/// 约束：返回的必须是复制人站得到的格（不是目标的支撑格），否则梯子铺好了也没人能爬。
+/// 官方 reachability 查询不反映"梯子可爬的格"（mod 行为）：
+/// "能不能爬"只能靠梯子链是否连续判断，不能信可达集。
 pub fn ladder_step(reach: &Reach, x: i32, y: i32) -> Option<(i32, i32)> {
     // 目标 (x,y) 的正下方 (x,y-1) 是空的但**不可达** → 需要梯子。
     let below = (x, y - 1);
     if !matches!(reach.grid.kind(below), Kind::Gas | Kind::Liquid | Kind::Dupe) {
         return None; // 正下方是实心 → 直接挖就行，不需要梯子
     }
-    // 修正：
-    //   旧代码用 reach.climbable（官方可达集 ∪ 梯子链）判断「已经能站上去 → 不需要梯子」。
-    //   而官方可达集是**半径受限的局部窗口**、且**不反映梯子**
-    //   → 它会说「能站上去」（其实没梯子，复制人根本爬不上来）
-    //   → 梯子分支被整体跳过 → 代理只会下「死工单」。
-    //   正解：**能不能爬只看梯子链**（格子里到底有没有梯子）。
+    // 能不能爬只看梯子链（格子里到底有没有梯子），不用 reach.climbable 判断：
+    // 官方可达集是半径受限的局部窗口，且不反映梯子。
     if reach.grid.kind(below) == Kind::Ladder {
         return None; // 正下方本身是梯子格 → 复制人能从下面爬上来
     }
     // 从站得到的那一格开始，连续往上铺。
-    // 链要**自下而上连续** —— 找出基座往上的第一处「缺梯子」的格，
-    //     补上它；全都有梯子时，补目标正下方那一格。
-    //
-    // ★ 基座之上**第一格**才轮到铺梯子（base + 1），不是基座本身：
-    //   基座是复制人**已经站得到**的那格（脚下有地板）；
-    //   在基座上铺梯子等于把复制人埋在自己脚下 → mod 落地失败 / 白铺一格。
-    //   正确节奏：基座(194) → 铺 195 → 复制人爬上去 → 铺 196 → 爬 → 铺 197
-    //   → 复制人站上 197 → 挖 198 的头顶。
+    // 链要自下而上连续：找出基座往上的第一处「缺梯子」的格补上它；全都有梯子时，补目标正下方那一格。
+    // 约束：基座之上第一格（base + 1）才轮到铺梯子，不是基座本身——
+    // 基座是复制人已经站得到的那格（脚下有地板），在基座上铺梯子 mod 落地失败 / 白铺一格。
+    // 节奏：铺 base+1 → 复制人爬上去 → 铺 base+2 → … → 站在梯子上挖头顶。
     let base = column_base(reach, x, y)?;
     // 基座必须复制人**真的走得到**（否则梯子链铺在够不到的列上，纯浪费）。
     let base_reachable = reach.set.contains(&(x, base))

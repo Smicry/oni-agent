@@ -2,7 +2,7 @@
 //!
 //! 快系统（oni agent）每10s采快照、发现卡点，写结构化 escalation + live_snapshot。
 //! 慢系统（本模块）常驻轮询：escalation → 调 LLM 从候选里选 → 执行 → 留痕。
-//! 用户指令（oni command add 已实现入队+暂停）：LLM 决策 → 执行 → 回执 → 恢复自主。
+//! 用户指令（oni command add 入队）：LLM 决策 → 执行 → 回执 → 恢复自主。
 //! LLM 可插拔：ONI_LLM_ENDPOINT / ONI_LLM_KEY / ONI_LLM_MODEL，无配置用 mock。
 
 use std::io::{Read, Write};
@@ -158,8 +158,7 @@ pub struct SlowView {
     pub last_decision: String,
     /// AI 助手是否启用（false = hold 停止状态）
     pub ai_enabled: bool,
-    /// 当前存档指纹 + 局内会话纪元：前端据此判断"换局/读档"→ 清空对话流。
-    ///   没有它，前端会把上一周期的对话一直挂着（实测用户看到 Cycle 4 的指令而这局才 Cycle 1）。
+    /// 当前存档指纹 + 局内会话纪元：前端据此判断"换局/读档"→ 清空对话流（否则上一周期的对话会一直挂着）。
     pub save_fingerprint: String,
     pub session_epoch: i64,
     /// 方向盘模式：指令模式（有未完成用户指令）/ 自主模式。前端显示。
@@ -310,6 +309,7 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
   例: 断粮时填 forage；要产氧填 oxygen；要建材填 material；没新目标留空。
   **重要**: 想让游戏做事就填 goal（这是你真正的执行力），别只在 reason 里写文字描述。
 - commands: 可直接执行的oni子命令(如 'build 139,197 Ladder SandStone --apply')或留空[]；优先用 goal，少用 commands。
+  战略类元命令（不需要坐标）：'research <TechId>' 设定研究方向（研究站就绪且无在研时由你决定，如 research ImprovedOxygen / research FarmingTech / research PowerRegulations）；'pod claim <index>' 领取打印舱物品包（第 index 项；新人只能在游戏里选，不要为此发命令）。
 - policy: **可选**，当卡点是落点判据太严或太松时调整选址策略（会落盘并立刻生效）：
   co2_max_kg=3.0 放宽选址允许的CO₂上限；strict_prefabs=[Bed] 改哪些建筑仍要求纯氧；
   relax_after_fail=1 让快系统失败1次就自动放宽。不需要时留空或省略。";
@@ -317,13 +317,12 @@ P4 目标：完成本局胜利条件（火箭/本局目标）。
 /// 失败熔断阈值：同一 goal 连续失败达到此次数 → 禁止再选，强制换策略。
 const FAIL_CIRCUIT_THRESHOLD: usize = 3;
 /// 熔断冷却：曾成功过的 goal，失败后多少秒内不再允许（超时后可重试）。
-/// ★ 从未成功过的 goal（total_ok==0）连续失败≥阈值 → 永久熔断，不靠冷却放行
-///   （实测 oxygen 0/8 却冷却到期后被反复重试，拖垮整局）。
+/// ★ 从未成功过的 goal（total_ok==0）连续失败≥阈值 → 永久熔断，不靠冷却放行。
 const FAIL_CIRCUIT_COOLDOWN_SECS: i64 = 1800;
 
 /// ★ 主动规划心跳周期（秒）：即使无 escalation/用户指令，慢系统也周期性唤起 LLM，
 /// 依据战略进度（plan.json）主动选下一个 goal 推进，而不是干等卡点。
-/// 60s = 12 轮慢系统循环（每轮 5s），够快又不会把 LLM 打爆。
+/// 60s = 12 轮慢系统循环（每轮 5s）。
 const PROACTIVE_PLAN_INTERVAL_SECS: i64 = 60;
 
 fn proactive_state_path() -> std::path::PathBuf {
@@ -386,10 +385,8 @@ fn compute_goal_status(lines: &[&str]) -> Vec<GoalStatus> {
             });
         }
         let e = m.get_mut(&goal).unwrap();
-        // ★ 不只信 ok 字段：detail 明确说"零进展/无可下单曲/推不动"时，
-        //   即使历史上被记成 ok=true，也必须按失败计。
-        //   旧 bug：execute() 末尾硬编码 ok:true → 零进展被记成成功 →
-        //   熔断计数永不增长 → 慢系统无限重复入队推不动的目标。
+        // ★ 不只信 ok 字段（AGENTS.md §9）：detail 明确说"零进展/无可下单曲/推不动"时，
+        //   即使被记成 ok=true，也按失败计——否则熔断计数不增长，慢系统会无限重复入队推不动的目标。
         let zero_progress = detail.contains("无可下单曲")
             || detail.contains("零进展")
             || detail.contains("推不动");
@@ -474,9 +471,8 @@ fn recent_decision_history() -> String {
     out.push_str("\n失败历史是开头「失败熔断」的硬依据：连续失败≥3次的目标本轮禁止再选。\n");
     out
 }
-/// ★ 幂等决策节流：检测最近连续 N 次决策都是同一个 goal。
-/// 慢系统以前会连续十几轮选 material/oxygen 却没实质推进（决策/执行比 17:1）。
-/// 这里把"连续重复"显式告警注入 prompt，逼迫 LLM 换策略或升级诊断。
+/// ★ 幂等决策节流：检测最近连续 N 次决策都是同一个 goal，把"连续重复"显式告警注入 prompt，
+/// 促使 LLM 升级手段或诊断根因（连续重复同一 goal 而无实质进展 = 决策空转）。
 fn recent_goal_streak() -> (String, usize, String) {
     let sd = save_dir();
     let Ok(text) = std::fs::read_to_string(sd.join("decisions.jsonl")) else {
@@ -520,9 +516,8 @@ fn next_actionable_names(nodes: &[Value], done_ids: &std::collections::HashSet<S
 
 /// ★ 当前目标（滚动窗口 W1）—— prompt 的**第一段**。
 ///
-/// 为什么放第一：LLM 每 5s 决策一次，如果第一眼看到的是卡点列表，它会去"解决卡点"
-/// 而不是"推进目标"——实测在 research/scout 之间来回跳，没有一个方向持续推进超过 3 轮。
-/// 自动驾驶的对照：导航先有目的地，再算怎么绕过障碍；不是每 100ms 重新选目的地。
+/// 约束：必须放在卡点列表之前——LLM 第一眼看到卡点列表会去"解决卡点"而不是"推进目标"，
+/// 在无关目标之间来回跳。自动驾驶的对照：导航先有目的地，再算怎么绕过障碍。
 ///
 /// 输出：目标是什么 + 已尝试几次 + 失败原因 + **本轮该做什么**（推进/绕过/标记失败让窗口重排）。
 fn current_objective() -> String {
@@ -589,14 +584,10 @@ fn goal_recent_outcome(goal: &str) -> (usize, String) {
 }
 
 /// ★ 战略状态机：读 plan.json（AI 拥有的 locked plan），生成"我在哪、该往哪走"摘要。
-/// 慢系统以前完全不读 plan.json，只看当前快照 → 纯应激式决策，没有全局推进感。
-/// 现在每轮 prompt 开头注入战略进度，让 LLM 知道已完成里程碑与下一个可推进节点。
+/// 每轮 prompt 注入战略进度，让 LLM 知道已完成里程碑与下一个可推进节点（不只看当前快照做应激式决策）。
 fn strategy_progress() -> String {
-    // ★ 修路径：快系统运行时用的是**仓库根目录**的 plan.json（cfg.plan_path，CWD 相对），
-    //   旧代码读 save_dir()/plan.json（每存档目录）——那里根本没有这个文件
-    //   → 慢系统每轮的"战略进度"是**空的**，LLM 从来没看到过计划状态
-    //   → 只能发 material/surface 这类应激目标（实测：material 32 次，power 0 次规划成功）。
-    //   两者必须读**同一个文件**，慢系统才能"看见"计划。
+    // ★ 路径约束：快系统运行时用的是**仓库根目录**的 plan.json（cfg.plan_path，CWD 相对），
+    //   不是 save_dir()/plan.json（每存档目录）。两者必须读**同一个文件**，慢系统才能"看见"计划。
     let plan_path = std::path::Path::new("plan.json");
     let Ok(text) = std::fs::read_to_string(plan_path) else {
         return String::new();
@@ -668,9 +659,8 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
     let (streak_summary, streak, cur_goal) = recent_goal_streak();
     if !streak_summary.is_empty() { p.push_str(&streak_summary); }
     if streak >= 3 {
-        // ★ 语义修正：连续不进展**不是"换目标"的理由**，是"升级诊断"的理由。
-        //   旧文案"禁止再选它"→ LLM 跳到 scout 等无关目标 → 没有方向被持续推进（实测）。
-        //   挖矿/建厕所/研究都要 3 轮以上，"禁止"只会打断所有需要多轮的目标。
+        // ★ 约束：连续不进展**不是"换目标"的理由**，是"升级手段/诊断"的理由——
+        //   挖矿/建厕所/研究都要 3 轮以上，"禁止再选它"只会打断所有需要多轮的目标。
         p.push_str(&format!("🔁 幂等节流：goal={} 已连续 {} 次无实质进展 → **不要换目标，要升级手段**：① 用 commands 下一条精确工单绕过障碍（挖通/铺梯子/换落点）；② 若判断它在本局确实不可达，说明根因并标记失败，让窗口重排。原地重选同一个 goal 而不改变手段 = 失职。\n\n",
             cur_goal, streak));
     }
@@ -698,9 +688,7 @@ fn build_prompt(escs: &[Value], cmds: &[Value], snap: &Value, proactive: bool) -
         p.push_str("  - 本轮必须换策略：选上述可用目标之一，或用 commands 下精确工单。\n\n");
     }
     p.push_str("== 当前局面（传感器统一简报，与窗口规划同一口径）==\n");
-    // ★ 事实只走 window::facts_summary（sense::Snapshot 访问器）：之前这里自己手写了一份
-    //   只有周期/暂停/食物/氧气 + 名字/位置/chore/膀胱，LLM 看不到建筑/电力/建材/续航/
-    //   在途工单/游戏告警/传感器失败 → 按想象选目标、在 Tile 地板上放梯子。
+    // ★ 事实只走 window::facts_summary（sense::Snapshot 访问器），不手写另一份简报。
     let cycle = snap.get("cycle").and_then(|v| v.as_i64()).unwrap_or(0);
     p.push_str(&crate::window::facts_summary(snap, cycle));
     if !cmds.is_empty() {
@@ -780,7 +768,7 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
     if goal.trim().is_empty() { return false; }
     // 只接受合法语义目标，防止 LLM 输出乱字符串
     if crate::autoact::parse_goal(goal).is_none() { return false; }
-    // ★ 写进独立 ai_goals.jsonl（不再混进 commands.jsonl 伪装成用户指令）
+    // ★ 写进独立 ai_goals.jsonl（不混进 commands.jsonl，ai_goal 不是用户指令）
     crate::commands::push_ai_goal(goal, reason) != 0
 }
 
@@ -792,7 +780,7 @@ fn push_ai_goal(goal: &str, reason: &str) -> bool {
 ///
 /// 放行：
 ///   ① 带坐标的精确工单：`build x,y Prefab [Mat] [--apply]`、`order 挖 @(x,y):N`、`preflight ...`
-///   ② 元命令：window / policy / hold / release / pause / resume / resolve / decision / note
+///   ② 元命令：window / policy / hold / release / pause / resume / resolve / decision / note / research / pod
 /// 拒绝：无坐标的 build、不存在的子命令、任何"use/让/去"类自然语言
 /// 总开关类子命令：hold 期间大脑不得触碰（见 [`validate_llm_command`]）。
 pub fn is_control_plane(sub: &str) -> bool {
@@ -818,7 +806,8 @@ pub fn validate_llm_command(cmd: &str) -> Result<Vec<String>, String> {
         }
         // 元命令：不需要坐标
         "window" | "policy" | "hold" | "release" | "pause" | "resume" | "resolve"
-        | "decision" | "note" | "command" | "escalations" | "plan-check" => {
+        | "decision" | "note" | "command" | "escalations" | "plan-check"
+        | "research" | "pod" => {
             // ★ 总开关类命令在 hold 期间对大脑封口：hold = 用户关闭 AI 总开关，是"唯一的
             //   用户停止信号"（AGENTS.md §7），解除只能是人（oni release / Web「启动 AI」）。
             //   大脑能发 release/window 就等于能掀自己的总开关。
@@ -840,7 +829,7 @@ mod llm_command_tests {
         assert!(validate_llm_command("order 挖 @(120,195):9").is_ok());
         assert!(validate_llm_command("window 90").is_ok());
         assert!(validate_llm_command("policy set co2_max_kg=3").is_ok());
-        // 实测 LLM 下过的三条无效命令，全部要被拒且给出可操作的原因
+        // 三条无效命令，全部要被拒且给出可操作的原因
         let e1 = validate_llm_command("build Outhouse --apply").unwrap_err();
         assert!(e1.contains("坐标") && e1.contains("goal"), "{e1}");
         let e2 = validate_llm_command("use toilet 128,192").unwrap_err();
@@ -852,10 +841,8 @@ mod llm_command_tests {
 
 /// ★ 大脑事件驱动门控（v3 ⑤）：同一事件只触发一次 LLM 决策。
 ///
-/// 实测 392 分钟 744 次 LLM 调用（每 32s 一次），其中大量是**同一个卡点被反复看到**：
-/// 快系统每 10s 上报一次，慢系统每 5s 轮询一次，resolve 之前同一 id 会被 LLM 看 2~3 次，
-/// 每次都是完整 prompt（~4k token）却没有新信息。
-/// 智驾对照：大脑是事件驱动的，同一个传感器事件不会触发两次重新规划。
+/// 约束：快系统每 10s 上报、慢系统每 5s 轮询，resolve 之前同一卡点会被看到多次，
+/// 每次都是完整 prompt 却没有新信息——同一个事件不触发两次重新规划。
 ///
 /// 规则：escalation 按 id、用户指令按 id 去重，处理过的记入 processed.json（带 TTL，避免无限膨胀）。
 /// 无新事件 + 无用户指令 → 走 60s 心跳（should_proactive），否则本轮不调 LLM。
@@ -968,7 +955,7 @@ fn execute_decision(dec: &LlmDecision, escs: &[Value], cmds: &[Value]) -> String
     }
     for c in &dec.commands {
         // ★ 接口契约：大脑只能给带坐标的精确工单或元命令，其余拒绝并把原因回执进对话流，
-        //   否则 LLM 不知道自己没做成，下一轮还会试（实测 $ oni build Outhouse --apply 静默失败三次）。
+        //   否则 LLM 不知道自己没做成，下一轮还会试。
         match validate_llm_command(c) {
             Ok(parts) => {
                 let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
@@ -1093,7 +1080,7 @@ fn build_conversation() -> Vec<Value> {
             let detail: String = e.get("detail").and_then(|v| v.as_str()).unwrap_or("").chars().take(90).collect();
             let node = e.get("node").and_then(|v| v.as_str()).unwrap_or("");
             // ★ 有 resolve note = 慢系统已处理且有结论；否则待处理。
-            //   不再依赖 history.acked（append-only 日志不该被重写）。
+            //   不依赖 history.acked（append-only 日志不该被重写）。
             let result = resolve_notes.get(&ts).cloned().unwrap_or_default();
             let handled = !result.is_empty();
             let (status, label) = if handled { ("success", "已处理") } else { ("pending", "待处理") };
@@ -1224,7 +1211,6 @@ fn decode_unicode_escapes(s: &str) -> String {
     // 兼容两种输入：
     //   1) Web 输入框提交的**真实 UTF-8**（优先）—— 原样返回，绝不能逐字节拆
     //   2) 旧 commands.jsonl 里的 \uXXXX **字面串** —— 只解码这种
-    // 旧实现逐字节 b[i] as char 把 UTF-8 中文拆成 Latin-1（æµè¯...），已修。
     if !s.contains("\\u") {
         return s.to_string();
     }
@@ -1246,16 +1232,6 @@ fn decode_unicode_escapes(s: &str) -> String {
     out
 }
 
-/// 跑一轮慢系统决策。返回决策摘要。
-/// 终局判定（纯函数，可测）：只有**确知**复制人名单且全员倒地/死亡才返回终局原因。
-///
-/// 为什么必须门控"确知"：慢系统第一拍可能早于快系统第一次采集，live_snapshot 还是 Null
-///   → dupes 缺失 → alive 折叠成 0 → 实测三人呼吸 100 却被判"全员失去行动能力"，
-///   还往总线发了一条 7200s 的 Critical（大脑接下来两小时都看得到）。
-///   规则（AGENTS.md §9：人口读不到 ≠ 人口为 0）：
-///     · dupes 缺失 / 为空 → None（数据源可疑，真正的人口 0 由快系统检测）
-///     · 有人 breath > 0 且 chore 不含倒地 → 活着
-///     · 只有全员 breath ≤ 0 或 chore 明确倒地/死亡 → Some(终局原因)
 /// 本进程首次调用的时间戳（慢系统"只信本进程传感器"的基准）。
 fn process_start_ts() -> i64 {
     static T: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
@@ -1270,6 +1246,12 @@ pub fn sensor_snapshot_fresh(snap: &Value, process_start: i64) -> bool {
     ts >= process_start && has_pop && !stale
 }
 
+/// 终局判定（纯函数，可测）：只有**确知**复制人名单且全员倒地/死亡才返回终局原因。
+///
+/// 规则（AGENTS.md §9：人口读不到 ≠ 人口为 0）——慢系统首拍可能早于快系统第一次采集，live_snapshot 还是 Null：
+///     · dupes 缺失 / 为空 → None（数据源可疑，真正的人口 0 由快系统检测）
+///     · 有人 breath > 0 且 chore 不含倒地 → 活着
+///     · 只有全员 breath ≤ 0 或 chore 明确倒地/死亡 → Some(终局原因)
 pub fn colony_lost(snap: &Value) -> Option<&'static str> {
     let arr = snap.get("dupes")?.as_array()?;
     if arr.is_empty() { return None; }
@@ -1288,6 +1270,7 @@ pub fn colony_lost(snap: &Value) -> Option<&'static str> {
     }
 }
 
+/// 跑一轮慢系统决策。返回决策摘要。
 pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     let (escs, cmds, snap) = {
         let sd = save_dir();
@@ -1306,15 +1289,10 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         (e.as_array().cloned().unwrap_or_default(), c, s)
     };
 
-    // ★ 元决策（救不回来）：全员倒地/人口0 → 跳过 LLM，直接给出回滚建议。
-    //   快系统已识别并暂停不白烧；慢系统这里必须给出明确的"这局救不回来"信号，
-    //   而不是继续傻选 goal（实测全灭后还在决策"改用OxyRock供氧"）。
-    // ★ 全灭判定用**结构化信号**（breath），不靠 chore 文本：
-    //   实测三人呼吸 100 却被判"全员失去行动能力→建议回滚"——chore 为"空闲"/空时
-    //   旧逻辑仍能算对，但 dupes 数组在采集中间态可能为空 → alive=0 → 误判全灭。
-    //   规则（AGENTS.md §9：人口为 0 先确认数据源没失败）：
-    //     · dupes 数组缺失/为空 → **不判全灭**（数据源可疑，交给快系统的人口检测）
-    //     · 有人 breath > 0 且 chore 不含倒地 → 算活着
+    // ★ 元决策：全员倒地/人口0 → 跳过 LLM，直接给出回滚建议（快系统已识别并暂停，慢系统不再选 goal）。
+    // ★ 全灭判定规则（AGENTS.md §9：人口为 0 先确认数据源没失败）：
+    //     · dupes 数组缺失/为空 → **不判全灭**（采集中间态可能为空，交给快系统的人口检测）
+    //     · 有人 breath > 0 且 chore 不含倒地 → 算活着（用结构化信号 breath，不靠 chore 文本）
     //     · 只有全员 breath==0 或 chore 明确倒地/死亡 → 才判全灭
     if let Some(reason) = colony_lost(&snap) {
         let sd = save_dir();
@@ -1345,16 +1323,11 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     }
 
     // ★ **开局规划**（慢系统契约 §4：战略层负责"往哪走"）：
-    //   计划不是 AI 生的（模板/机械兜底）且快系统已采好世界事实（opening_brief.json）
-    //   → 用 LLM 依据**本局事实**重新规划（author=ai，名副其实）→ 强校验 → 落盘。
-    //   旧实现：每局计划来自 plan.template.json（硬编码 playbook，自带 author=ai 假身份
-    //   把机械 planner 永久锁死）→ 换一张地图（水世界/金属星）节点图就不适用。
-    //   兜底链：LLM 失败/校验不过 → 保持模板基线继续跑 +
-    //   快系统的机械重规划建议继续走 suggestions 通道；失败冷却 30 分钟不刷屏。
-    // ★ 传感器新鲜度：慢系统只规划**本进程快系统采到的**快照。
-    //   实测：serve 重启后慢系统第一拍读到的是上一个进程留下的 live_snapshot.json
-    //   （那个进程的 session 已冻结：cycle 1 / 膀胱 86 / 厕所 0）→ 用它重算窗口 → 排错优先级。
-    //   快照 ts 早于本进程启动，或传感器还没报人口 → 本轮不重算窗口，等下一拍。
+    //   计划不是 AI 生的且快系统已采好世界事实（opening_brief.json）
+    //   → 用 LLM 依据**本局事实**重新规划（author=ai）→ 强校验 → 落盘。
+    //   兜底链：LLM 失败/校验不过 → 本轮无战略计划（快系统保命层照常），失败冷却 10 分钟。
+    // ★ 传感器新鲜度：慢系统只规划**本进程快系统采到的**快照（上一个进程留下的 live_snapshot.json
+    //   对应的 session 可能已冻结）。快照 ts 早于本进程启动，或传感器还没报人口 → 本轮不重算窗口，等下一拍。
     let sensor_fresh = sensor_snapshot_fresh(&snap, process_start_ts());
     if !sensor_fresh { eprintln!("[slow:diag] 传感器快照未就绪（ts 早于本进程或缺 dupes）→ 本轮不重算窗口"); }
     if sensor_fresh {
@@ -1406,7 +1379,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
                         let out = format!("[opening] ⚠ LLM 开局规划失败，plan 保持空占位；快系统保命反射弧照常（不依赖 plan），10 分钟后重试：{reason}");
                         if let Ok(mut v) = view.lock() { v.last_decision = out.clone(); }
                         eprintln!("[slow] {}", out);
-                        // 不 return：模板基线照常执行，本轮继续正常决策
+                        // 不 return：本轮继续正常决策（快系统保命层不依赖 plan）
                     }
                 }
             }
@@ -1414,7 +1387,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
     }
 
     // ★ v3 滚动窗口：plan.json 是 horizon-3 的短视窗口，过期就重算（MPC 式）。
-    //   为什么：静态长链在世界变化后变成枷锁（实测 7 节点全锁死，殖民地失去方向）。
+    //   静态长链在世界变化后变成枷锁。
     //   过期条件见 window::window_stale（空 / 全完成 / 枷锁 / 跨 ≥2 周期）。
     if sensor_fresh {
         let sd = save_dir();
@@ -1423,7 +1396,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         let plan: Option<crate::decide::Plan> = std::fs::read_to_string(plan_path)
             .ok().and_then(|t| serde_json::from_str(&t).ok());
         // 开局规划失败留下的空占位（author=pending_llm）也允许滚动窗口接管：
-        //   否则 opening 的 10 分钟冷却期里 plan 一直是空的，殖民地没战略（实测空窗）。
+        //   否则 opening 的 10 分钟冷却期里 plan 一直是空的，殖民地没战略。
         //   滚动窗口只要 3 节点 / 8000 token，比 14 节点的 opening 图稳得多。
         let author = plan.as_ref().and_then(|p| p.author.as_deref()).unwrap_or("");
         let author_is_ai = author == "ai" || author == "pending_llm";
@@ -1435,7 +1408,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
             // 事实来源：**优先用当前快照**（滚动窗口要的是"现在"，不是开局时的 brief）。
             //   开局 brief 成功后会被重命名为 .done 或被 plan-reset 清掉，不能依赖它。
             // ★ 事实要**结构化摘要**，不是整坨快照 JSON：LLM 在大 JSON 里找不到关键数字
-            //   （实测：inventory 为空它没推出"零建材 → 必须先挖"，窗口 W1 直接排建造 → 全部失败）。
+            //   （如 inventory 为空推不出"零建材 → 必须先挖"，窗口 W1 直接排建造 → 全部失败）。
             let brief = crate::window::facts_summary(&snap, snap_cycle);
             {
                 let fp = oni_mcp::save::last_seen().map(|s| s.fingerprint);
@@ -1464,9 +1437,7 @@ pub fn run_once(cfg: &SlowConfig, view: &Arc<Mutex<SlowView>>) -> String {
         }
     }
 
-    // ★ v3 ⑤ 事件驱动：同一 escalation / 用户指令只触发一次 LLM 决策。
-    //   快系统每 10s 上报、慢系统每 5s 轮询 → resolve 前同一卡点会被看 2~3 次，
-    //   每次都是完整 prompt 却没有新信息（实测 392 分钟 744 次调用）。
+    // ★ v3 ⑤ 事件驱动：同一 escalation / 用户指令只触发一次 LLM 决策（见 event_gate）。
     let fresh = event_gate(&escs, &cmds);
     let has_fresh = !fresh.is_empty();
     // ★ 主动规划心跳：无新事件时才走 60s 心跳；有新事件直接决策。
@@ -1527,9 +1498,8 @@ fn json_response(stream: &mut TcpStream, status: &str, body: &str, content_type:
 
 fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
     let addr = format!("0.0.0.0:{}", cfg.web_port);
-    // ★ 绑定失败要**重试**，不能一失败就退出：重启 serve 时旧进程的端口还在
-    //   TIME_WAIT → "Address already in use" → web 线程静默死掉 → 控制台整个不可用
-    //   （实测反复出现：进程活着但 :8789 连不上）。
+        // ★ 绑定失败要**重试**，不能一失败就退出：重启 serve 时旧进程的端口还在 TIME_WAIT
+        //   → "Address already in use" → web 线程静默死掉 → 控制台整个不可用。
     let listener = {
         let mut last_err = None;
         let mut listener = None;
@@ -1571,7 +1541,7 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
             }
             ("GET", "/api/state") => {
                 // 实时读快系统落盘的快照，不返回慢循环缓存的 view ——
-                // 旧实现在 LLM 推理(可能几十秒)期间 view 不刷新，页面看起来卡住。
+                // LLM 推理(可能几十秒)期间 view 不刷新，页面看起来卡住。
                 // collect_state 只读文件(<1ms)，每次请求都拿最新真值。
                 // last_decision 是慢系统独有的，从缓存保留；其余字段全部实时。
                 let mut fresh = collect_state(cfg);
@@ -1583,8 +1553,7 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
             }
             ("POST", "/api/command") => {
                 // ★ 前端发 JSON {"text": ...}；裸 body 只作兼容回退。
-                //   乱码根因：旧实现把中文 UTF-8 当 \u 转义解码（ä¸ºä»€ä¹ˆ…），
-                //   且裸 body 经过 from_utf8_lossy 后多字节字符可能被截断在 8192 缓冲边界。
+                //   裸 body 经过 from_utf8_lossy 后多字节字符可能被截断在 8192 缓冲边界。
                 let text = serde_json::from_str::<Value>(body).ok()
                     .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
                     .unwrap_or_else(|| decode_unicode_escapes(body.trim()));
@@ -1606,7 +1575,7 @@ fn serve_web(cfg: &SlowConfig, view: Arc<Mutex<SlowView>>) {
                     //   stop = hold（持久停 agent+游戏）
                     //   start = release（清 hold）+ window（授权 agent 恢复游戏并接管）
                     //   只 release 不 window 的话：游戏暂停来源是原生/owner=none，
-                    //   快系统保守判「用户暂停」不越权恢复 → 点了启动却不动（实测 bug）。
+                    //   快系统保守判「用户暂停」不越权恢复 → 点了启动却不动。
                     "stop" => run_oni(&["hold", "web 停止AI"]),
                     "start" => {
                         let r = run_oni(&["release"]);
@@ -1656,7 +1625,7 @@ mod tests {
     use super::*;
 
     /// hold = 用户关闭 AI 总开关（唯一用户停止信号，AGENTS.md §7）：大脑不得发总开关类命令。
-    ///   旧白名单含 hold/release/pause/resume/window 且不看 hold 状态 → 大脑能掀自己的总开关。
+    /// hold 期间大脑不得发总开关类命令（hold/release/pause/resume/window）。
     #[test]
     fn llm_cannot_flip_master_switch_during_hold() {
         crate::agent::isolate_state_dir();
@@ -1670,9 +1639,13 @@ mod tests {
             let e = validate_llm_command(c).unwrap_err();
             assert!(e.contains("总开关"), "{c}: {e}");
         }
+        assert!(validate_llm_command("research ImprovedOxygen").is_ok(), "研究方向不是总开关，hold 期间仍可下");
         assert!(validate_llm_command("policy set co2_max_kg=3").is_ok(), "非总开关元命令不受影响");
         assert!(validate_llm_command("resolve 1").is_ok());
         assert!(validate_llm_command("preflight dig 124,192").is_ok(), "精确工单不受影响");
+        // 研究方向/打印舱是战略决定（归大脑）：元命令不需要坐标，hold 期间也不该被误拦
+        assert!(validate_llm_command("research ImprovedOxygen").is_ok(), "研究元命令");
+        assert!(validate_llm_command("pod claim 1").is_ok(), "打印舱元命令");
         crate::agent::clear_hold();
         assert!(!crate::agent::hold_active());
     }
@@ -1695,7 +1668,6 @@ mod tests {
     }
 
     /// 终局判定必须门控"确知名单"：快照 Null / dupes 缺失 / 空数组都不算全灭。
-    ///   实测慢系统首拍读到上一局的 Null 快照 → 三人活着却判死 + 发 7200s Critical。
     #[test]
     fn colony_lost_requires_known_dupe_list() {
         assert_eq!(colony_lost(&Value::Null), None, "快照 Null ≠ 全灭");
@@ -1736,10 +1708,7 @@ mod tests {
     }
 
     #[test]
-    /// ★ 回归：detail 说"零进展"时，即使 ok=true 也必须按失败计。
-    ///   旧 bug：execute() 末尾硬编码 ok:true → 零进展被记成功 →
-    ///   熔断计数永不增长 → 慢系统无限重复入队推不动的目标 →
-    ///   快系统恢复→失败→冻回 无限乒乓（实测 material 前沿全是梯子需求）。
+    /// 回归：detail 说"零进展"时，即使 ok=true 也必须按失败计（否则熔断计数不增长，快系统恢复→失败→冻回无限乒乓）。
     #[test]
     fn zero_progress_counts_as_failure_even_when_ok_flagged_true() {
         let lines = [

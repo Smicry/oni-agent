@@ -1,12 +1,10 @@
 //! 语义化动作：**把意图编译成具体的执行动作**，交给统一执行管线。
 //!
-//! 架构要点：
-//!   旧版语义动作**自己拼 raw 工单**，绕过了统一执行管线里的全部规则：
+//! 架构要点：**语义动作只负责"圈定目标区"，挖掘由统一管线做。**
+//!   自己拼 raw 工单会绕过统一执行管线里的全部规则：
 //!     - 预检（官方可达域 / 唯一支撑 / 正下方悬空）
 //!     - 自动梯子列
 //!     - "已有标记就跳过"
-//!   结果：既能下"没人能挖的死工单"，又会重复对同一格，把好节点拖进熔断。
-//!   **现在语义动作只负责"圈定目标区"，挖掘由统一管线做。**
 //!
 //! 坐标仍然不写死：目标区由运行时从**官方可达区 + 地图字形 + 官方 cell** 算出来，
 //!   所以同一份 plan.json 能跨存档复用。
@@ -25,9 +23,7 @@ pub const BUILDABLE_RAW: &[&str] = &["SandStone", "Dirt", "Algae", "Clay"];
 
 /// **目标锁**：把语义目标钉在一个具体格子上，跨轮不变。
 ///
-/// 为什么需要：
-///   旧版每轮都重选"最近的氧石格"，挖掉一格后最近格变了
-///   代理在 123/126/127 三列之间来回铺梯子 → 梯子材料成倍浪费、节点迟迟不推进。
+/// 约束：每轮重选"最近的格"会让最近格随挖掘变化 → 在多列之间来回铺梯子，材料成倍浪费。
 ///   锁定后：选定一格就一直挖它，直到它被挖开或换存档。
 #[derive(Clone, Serialize, Deserialize)]
 struct GoalLock {
@@ -35,8 +31,7 @@ struct GoalLock {
     y: i32,
     element: String,
     cycle: i64,
-    /// surface 专用：锁定的整条挖掘路径。沿一条路挖到地表，不每轮重算
-    /// 。
+    /// surface 专用：锁定的整条挖掘路径。沿一条路挖到地表，不每轮重算。
     #[serde(default)]
     path: Vec<(i32, i32)>,
 }
@@ -86,8 +81,7 @@ fn locked_target(
         // surface 目标的失效条件：
         //   surface 锁的是"路径上第一个要挖的实心格" —— 一旦它被挖开（不再是实心）
         //   或已经可达（路通了），就必须失效 → 重新算下一个首挖格。
-        //   两个条件取"或"：单用 climbable 会在"挖成气体但下方非梯子"时失效不了
-        //   。
+        //   两个条件取"或"：单用 climbable 会在"挖成气体但下方非梯子"时失效不了；
         //   单用 solid 会在"路已通但该格恰好是实心"时误判 —— 取或最稳。
         let still = if element.is_empty() {
             let cells = oni_world::cell::fetch_many(session, &[(l.x, l.y)]);
@@ -126,9 +120,8 @@ fn locked_target(
 
 /// 从基地锚点正上方找一条**没有污染**的垂直竖井列（一直往上到地表）。
 ///
-/// 为什么需要：几何路径 `route_to_surface()` 可能整条都脏
-///   （选了往西的污染层）→ 过滤后为空 → 代理回退到别的方向继续挖污染。
-///   正解：自己从基地**正上方**找一条干净列（列内无污染、无建筑）。
+/// 约束：几何路径 `route_to_surface()` 可能整条都脏（过滤后为空）→
+///   必须能从基地**正上方**另找一条干净列（列内无污染、无建筑）。
 fn clean_vertical_path(
     session: &McpSession,
     reach: &oni_world::preflight::Reach,
@@ -137,13 +130,9 @@ fn clean_vertical_path(
     let mut fallback: Option<Vec<(i32, i32)>> = None;
 
     // **优先沿"梯子链已经爬到最高的那一列"继续往上挖**。
-    //   这是 ONI 挖竖井的唯一正确姿势：梯子链在哪，就在那一列接着往上。
-    //   代理之前在 118/120 列把梯子铺到了 Y=208~210，
-    //   但目标锁选了几何干净却**没有梯子起步点**的 116/117 列 → 每轮"走不通"
-    //   彻底空转，梯子白铺，竖井永远没通地表。
+    //   ONI 挖竖井：梯子链在哪，就在那一列接着往上；没有梯子起步点的干净列是走不通的。
     // 只在**基地锚点附近**、且高度在基地上方 40 格内，找 climbable 最高的格。
-    //   不能用全局 max_by_key：climbable 含官方可达集（可能有远处的高格），
-    //   取到 (116,248) 这种根本不属于本基地竖井的坐标。
+    //   不能用全局 max_by_key：climbable 含官方可达集（可能有远处的高格），会取到不属于本基地竖井的坐标。
     let mut highest: Option<(i32, i32)> = None;
     for c in &reach.climbable {
         let (x, y) = (c.0, c.1);
@@ -192,8 +181,7 @@ fn clean_vertical_path(
             let path: Vec<(i32, i32)> = (anchor.1 + 1..anchor.1 + 40).map(|y| (x, y)).collect();
             // ★ 这一列还必须**真的挖得动**：第一块实心格的落脚点
             //   要么现在就走得到，要么能铺出梯子链。
-            //   只查「干净」会选到被建筑压住的列（实测：锁定列压着代理自己建的旱厕）
-            //   → 梯子起点不可达 → 永远「锁定列走不通」→ 竖井零进展。
+            //   只查「干净」会选到被建筑压住的列 → 梯子起点不可达 → 永远「锁定列走不通」。
             let first_solid = path
                 .iter()
                 .copied()
@@ -202,9 +190,7 @@ fn clean_vertical_path(
             if !column_viable(reach, first_solid) {
                 continue;
             }
-            // 优先选**梯子链可爬**的列。
-            //   旧逻辑只查"干净"，选了几何干净但梯子链断裂的列
-            //   代理每轮报"锁定列走不通"→ 整轮空转 → 竖井永远不动。
+            // 优先选**梯子链可爬**的列（几何干净但梯子链断裂的列每轮都会"走不通"）。
             let climbable = (anchor.1 + 1..anchor.1 + 40)
                 .any(|y| reach.climbable.contains(&(x, y)));
             if climbable {
@@ -222,10 +208,7 @@ fn clean_vertical_path(
 /// 这一列**现在还能不能挖**：目标格的落脚点要么复制人现在就走得到，
 /// 要么能沿梯子链爬上去。
 ///
-/// 为什么必须有这个判据（实测）：目标锁选中的列可能**被建筑占着**
-///   —— 本存档锁定列 120 正好压着代理自己建的旱厕（119..120 × 194..196）
-///   → 梯子起点 (120,197) 复制人走不到 → 梯子链永远起不来
-///   → 每轮报「锁定列走不通」→ 整轮空转 → 竖井零进展。
+/// 约束：目标锁选中的列可能**被建筑占着** → 梯子起点走不到 → 梯子链起不来。
 /// 判不到就当不可行 → 让上层重选列（重选时会跳过本列）。
 fn column_viable(reach: &oni_world::preflight::Reach, target: (i32, i32)) -> bool {
     let below = (target.0, target.1 - 1);
@@ -248,8 +231,7 @@ fn column_viable(reach: &oni_world::preflight::Reach, target: (i32, i32)) -> boo
 
 /// 找一个**干净可呼吸**的格子。
 ///
-/// 为什么必须：代理把氧气扩散器建在了污染水层
-///   → 设备泡在污染水里 → 产不了氧 → 白建 4 个。
+/// 约束：建筑落点必须干净可呼吸（AGENTS.md §9）—— 设备泡在污染水里产不了氧。
 fn clean_oxygen_spot(
     session: &McpSession,
     reach: &oni_world::preflight::Reach,
@@ -345,8 +327,7 @@ fn forage_candidates(text: &str) -> Vec<((i32, i32), u8)> {
             ("BasicSingleHarvestPlant", 2u8),
         ] {
             // 扫遍整行的**所有**出现：
-            //   地图渲染一行 = 5 格，同一行常有好几株植物。
-            //   旧代码每个 tag 只取第一个就 break → 一行里的其它植物全被漏掉。
+            //   地图渲染一行 = 5 格，同一行常有好几株植物，每个 tag 只取第一个会漏掉。
             let mut start = 0usize;
             while let Some(idx) = line[start..].find(tag) {
                 let abs = start + idx;
@@ -374,26 +355,19 @@ fn forage_candidates(text: &str) -> Vec<((i32, i32), u8)> {
 
 /// mod 的 harvest 工单**必须带"植物"类型前缀**。
 ///
-/// 缺前缀时 mod 会**静默返回 ok:true** 但工单根本没建 ——
-///   `pendingOrders` 里也看不到 harvest → 代理每轮重复下"成功"的死工单，
-///   食物一直不涨。
-/// ⇒ 「工单返回 ok」≠「工单生效」，必须用**效果判据**（食物增量）验证。
+/// 缺前缀时 mod 会**静默返回 ok:true** 但工单根本没建（`pendingOrders` 里也看不到 harvest）。
+/// ⇒ 「工单返回 ok」≠「工单生效」，必须用**效果判据**（食物增量）验证（AGENTS.md §6）。
 pub fn harvest_cmd(x: i32, y: i32) -> String {
     format!("收 植物@({},{}):9", x, y)
 }
 
 /// 从路径里剔除**死亡格**。
 ///
-/// 为什么必须做：
-///   `route_to_surface()` 是纯几何最短路，**不知道哪条路下面有污染层**。
-///   它选了往西的路径
-///   代理挖穿污染层 → 污染水涌入基地 → 三人。
-///   正解：逐格检查下方 1~2 格；是污染/真空就整段跳过（换一条路）。
+/// 约束：`route_to_surface()` 是纯几何最短路，**不知道哪条路下面有污染层**
+///   → 逐格检查下方；是污染/真空就整段跳过（换一条路）。
 fn filter_deadly_path(session: &McpSession, path: &[(i32, i32)]) -> Vec<(i32, i32)> {
     // 收集所有要检查的下方格
-    // 检查范围是**整列到底部**，不只是 1~2 格：
-    //   污染水在竖井**底部**，而路径目标是 Y=194+
-    //   只查下方 1~2 格查不到 → 代理照挖不误 → 挖穿污染层
+    // 检查范围是**整列到底部**，不只是 1~2 格：污染水可能在竖井**底部**，只查 1~2 格查不到。
     let min_y = path.iter().map(|c| c.1).min().unwrap_or(0) - 30;
     let mut below: Vec<(i32, i32)> = Vec::new();
     for c in path {
@@ -444,14 +418,6 @@ fn filter_deadly_path(session: &McpSession, path: &[(i32, i32)]) -> Vec<(i32, i3
     }
 }
 
-/// **surface 专用目标锁定**：锁定整条路径，沿它一格格挖到地表。
-///
-/// 为什么必须锁整条路径：
-///   旧版每轮都重算 route_to_surface() 并取"第一个要挖格"，
-///   但复制人位置/气室在变 → 每轮算出的 first 落到不同的列
-///   → 梯子铺了三列、哪列都没通、氧气反而在降。
-///   现在：首次算好路径存进锁，之后每轮沿同一路径推进到"第一个还没挖开的实心格"，
-///   除非整条路径挖通或换存档，否则绝不重算。
 /// 找**最近的开阔气室**，
 /// 返回它离基地最近的那一格（作为挖掘走廊的目标）。
 ///
@@ -513,6 +479,10 @@ fn best_open_chamber(
     best.map(|(_, _, c)| c)
 }
 
+/// **surface 专用目标锁定**：锁定整条路径，沿它一格格挖到地表。
+///
+/// 约束：首次算好路径存进锁（GoalLock.path），之后每轮沿同一路径推进到"第一个还没挖开的实心格"，
+///   除非整条路径挖通或换存档，否则绝不重算（每轮重算会让首挖格落到不同的列）。
 fn surface_target_locked(
     session: &McpSession,
     catalog: Option<&Catalog>,
@@ -554,27 +524,19 @@ fn surface_target_locked(
     }
 
     // ---- 无有效锁 → 首次建图算路径并存入锁 ----
-    // 修正（新存档surface 目标「在当前地图上找不到」）：
-    //   旧代码用 MapGraph::build
-    //   相机一移开基地，基地就不在图里 → 复制人不在任何气室 → route_to_surface 返回 None
-    //   → **换个存档/移动相机就彻底失效**（这正是「通用助手面对不同情况」的第一道墙）。
-    //   正解：用 **build_full**（全图层，不受相机影响）算路径；只有它失败才退回视野图。
-    //   代价：首次建锁慢，之后走锁，不再重算 ✓。
+    //   用 **build_full**（全图层，不受相机影响）算路径：视野图 `MapGraph::build` 在相机移开基地时
+    //   不含基地 → 复制人不在任何气室 → route_to_surface 返回 None。只有 build_full 失败才退回视野图。
+    //   代价：首次建锁慢，之后走锁，不再重算。
     let g = oni_world::graph::MapGraph::build_full(session, catalog, None, None)
         .or_else(|_| oni_world::graph::MapGraph::build(session, catalog))
         .ok()?;
     let route = g.route_to_surface()?;
     let path: Vec<(i32, i32)> = route.cells.clone();
 
-    // 污染列过滤：
-    //   route_to_surface() 是**纯几何**最短路，它不知道哪条路下面有污染层。
-    //   它选了往西的路径（竖井底整排污染水）→ 代理挖穿污染层
-    //   污染水涌入基地 → 三人。
-    //   正解：把路径里"整列有污染"的段剔掉，**保留剩余段**；
-    //   若整条路径都被污染 → 改用"从基地锚点正上方垂直向上"的干净列。
+    // 污染列过滤：route_to_surface() 是**纯几何**最短路，不知道哪条路下面有污染层
+    //   → 把路径里"整列有污染"的段剔掉，**保留剩余段**（见 filter_deadly_path）。
     let filtered = filter_deadly_path(session, &path);
     // 优先用「基地正上方的干净竖井列」，而不是几何路径：
-    //   几何路径是纯几何最短路，它不知道哪条路下面有污染层（选了往西的污染层）。
     //   只有当干净列找不到时才退回过滤后的几何路径。
     let path = match clean_vertical_path(session, &reach) {
         Some(clean) => clean,
@@ -585,9 +547,8 @@ fn surface_target_locked(
             filtered
         }
     };
-    // 必须带兜底：严格"可爬"过滤可能全落空（路径起点列恰好不可爬），
-    //   旧版直接 ? 返回 None → "语义目标找不到" → 动作失败 → 代理冻回暂停（）。
-    //   回退链：可爬实心格 → 任意实心格 → 路径终点。
+    // 必须带兜底：严格"可爬"过滤可能全落空（路径起点列恰好不可爬）→
+    //   直接返回 None 会报"语义目标找不到" → 动作失败。回退链：可爬实心格 → 任意实心格 → 路径终点。
     let first = path
         .iter()
         .copied()
@@ -602,8 +563,7 @@ fn surface_target_locked(
                 .find(|c| reach.grid.kind(*c) == GridKind::Solid)
         })
         .or_else(|| path.last().copied())?;
-    // 路径起点若**被建筑占着**（研究站在 (135,189)/(135,190)，
-    //   竖井起点正好是它 → 梯子铺不下去 → "无可下单曲"空转），
+    // 路径起点若**被建筑占着**（梯子铺不下去 → "无可下单曲"空转），
     //   就沿路径**往后找一格**能站的起点（横向挪一列继续往上）。
     let first = if let Some(stuck) = path.iter().position(|c| *c == first) {
         let alt = path[stuck..]
@@ -617,9 +577,8 @@ fn surface_target_locked(
     } else {
         first
     };
-    // 竖井的**梯子起点**也不能是建筑格：梯子要铺在"人站得到的那一格"。
-    //   路径首格 (135,190) 是研究站 → 梯子铺不下去。
-    //   正解：沿路径往后找**第一个不是建筑**的格子作为首挖格。
+    // 竖井的**梯子起点**也不能是建筑格：梯子要铺在"人站得到的那一格"
+    //   → 沿路径往后找**第一个不是建筑**的格子作为首挖格。
     let first = {
         let idx = path.iter().position(|c| *c == first).unwrap_or(0);
         path[idx..]
@@ -649,10 +608,8 @@ pub enum Goal {
     Surface,
     /// **挖通最近的开阔气室**（一次解决空气 + 空间 + 建材）
     ///
-    /// 为什么需要：
-    ///   开局基地是 14 格的封闭小房间 —— 空气不够、2×2/2×3 建筑放不下、
-    ///   竖井到地表要 19 格梯子。
-    ///   而东边只隔 3 格砂岩就是一个 **37 格 / 62kg 氧气** 的开阔气室。
+    /// 为什么需要：开局基地常是封闭小房间 —— 空气不够、2×2/2×3 建筑放不下；
+    ///   邻近的开阔气室往往只隔几格砂岩，横向挖通比硬啃竖井划算。
     ///   ⇒ 横向挖通开阔气室 = 一次解决三件事，比硬啃竖井划算一个数量级。
     OpenChamber,
     /// 挖到含指定元素的格（产氧/采矿）
@@ -670,8 +627,7 @@ pub enum Goal {
     ///
     /// 为什么需要：ONI 的 `OnFloor` 建筑（人力发电机/旱厕）
     ///   要求下方是**地板砖**，天然岩石不算 → mod 报 `missing_support`。
-    ///   发电机在基地各处试了 10+ 次全失败（不是位置问题，是**没有砖**）。
-    ///   正解：先在目标位置下方铺砖，再建建筑 —— 两步要**同一轮内**完成。
+    ///   先在目标位置下方铺砖，再建建筑。
     Power,
     /// **扩建基地**：在可达区挖出"够放 2×2 建筑"的空间
     ///
@@ -684,7 +640,6 @@ pub enum Goal {
     /// 为什么需要：
     ///   开局的野采集植物（BasicForagePlant / BasicSingleHarvestPlant）**每株 800kcal**
     ///   且**会重新长** → 这是可持续食物源，比"挖藻类"（不可直接吃）可靠得多。
-    ///   食物只剩 4088kcal 时收割 6 株 → 立刻补充了 1400kcal。
     Forage,
     /// **选研究**：按"解锁食物/产氧"的优先级自动选一项研究
     ///
@@ -750,10 +705,8 @@ pub fn parse_goal(s: &str) -> Option<Goal> {
         return Some(Goal::Forage);
     }
     let e = s.strip_prefix("element:").unwrap_or(s);
-    // ★ 契约层：element:X 不再手写白名单。
-    //   旧白名单 16 个元素，LLM 写 element:Gold 就解析失败（实测）→ "无法解析的 goal" → 节点卡死。
-    //   每加一个元素就改代码 = §0.4 第一条反模式（判据字段只认一种写法）。
-    //   正解：只要 X 是合法元素 ID 形态（字母/数字/下划线，首字母大写）就接受；
+    // ★ 契约层：element:X 不手写白名单（AGENTS.md §0.4 反模式「判据字段只认一种写法」）：
+    //   只要 X 是合法元素 ID 形态（字母/数字/下划线，首字母大写）就接受；
     //   元素是否真的存在于地图，由执行器编译时查（它本来就要查）——那是执行器的事。
     if !e.is_empty()
         && e.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
@@ -767,10 +720,7 @@ pub fn parse_goal(s: &str) -> Option<Goal> {
 
 /// **开局资源侦察**：探测关键资源的位置与距离，报告落盘。
 ///
-/// 为什么必须有这一步：
-///   不知道铁矿在 20 格外，就让代理深挖竖井 → 挖开地下 CO₂ 层
-///   CO₂ 涌入低层走廊 → 三个在作业的复制人全部倒地、一人死亡 → 殖民地死锁。
-///   **先侦察再决定挖哪里**，是唯一能避免这种灾难的顺序。
+/// 约束：**先侦察再决定挖哪里** —— 不知道资源在哪就深挖竖井，可能挖开地下 CO₂ 层。
 ///
 /// 返回人类可读的报告；同时落盘到 ~/.oni-agent/scout.json 供主 agent 读取。
 pub fn scout_resources(session: &McpSession, catalog: Option<&Catalog>) -> String {
@@ -866,8 +816,7 @@ pub fn compile(
             //   缺了第①步，第②步必报 missing_support。
             let reach = oni_world::preflight::load_reach(session, catalog)?;
             let anchor = base_anchor(&reach);
-            // 目标落点：基地西侧空腔（打印舱占满了东侧）
-            //   —— 运行时找"空且下方是实心"的位置，不写死坐标。
+            // 目标落点：运行时找"空且下方是实心"的位置，不写死坐标。
             // 三步流程（用 goal_lock 记住进度，跨轮推进）：
             //   ① 挖出 2×2 的空间（若还没挖开）
             //   ② 在底边两格铺地板砖（OnFloor 建筑只认砖）
@@ -877,8 +826,7 @@ pub fn compile(
             let mut locks = read_goal_locks();
             let spot = match locks.get(key) {
                 Some(l) => {
-                    // ：锁定的位置**也要复检**气体 —— 旧锁可能是 CO₂ 区，
-                    //   直接用锁会绕过新加的选址规则 → 发电机又建回杀人区。
+                    // 锁定的位置**也要复检**气体 —— 锁可能是 CO₂ 区，直接用锁会绕过选址的可呼吸规则。
                     let s = (l.x, l.y);
                     if first_breathable(session, &[s]).is_some() {
                         Some(s)
@@ -938,8 +886,7 @@ pub fn compile(
             }
 
             // ② 底边没有地板砖 → 先铺砖（两格都要）
-            //   关键：一轮要铺**所有**缺失的砖。
-            //   旧逻辑一轮只铺一格 → 另一格永远缺 → 发电机永远建不成（死循环）。
+            //   关键：一轮要铺**所有**缺失的砖（一轮只铺一格 → 另一格永远缺）。
             let supports = [(x, y - 1), (x + 1, y - 1)];
             let missing: Vec<(i32, i32)> = supports
                 .iter()
@@ -961,18 +908,15 @@ pub fn compile(
                 });
             }
 
-            // 产氧件必须建在**干净可呼吸**的格子上：
-            //   代理把氧气扩散器建在了污染水层
-            //   → 设备泡在污染水里 → 产不了氧 → 白建 4 个。
-            //   正解：选点时排除所在格是污染水/污染氧/真空的候选。
+            // 产氧件必须建在**干净可呼吸**的格子上：设备泡在污染水里产不了氧
+            //   → 选点时排除所在格是污染水/污染氧/真空的候选。
             let clean = clean_oxygen_spot(session, &reach, anchor)?;
             let (ox, oy) = clean;
 
             // ③ 两格砖都齐了 → 建发电机（精确锚点，不用 auto 选点）
             let has_gen = crate::exec::find_building_pos(session, "人力发电机").is_some();
             if !has_gen {
-                // **按真实可用量选材料**，没有就**自举去挖**。
-                //   旧代码硬编码 "Cuprite" → 没铜就必然失败 → 节点每轮失败 → 空转。
+                // **按真实可用量选材料**，没有就**自举去挖**（不硬编码某种材料）。
                 let mats = crate::exec::mod_materials_with_kg(session, "ManualGenerator");
                 let usable = mats.iter().find(|(_, kg)| *kg > 0.0).map(|(t, _)| t.clone());
                 let Some(mat) = usable else {
@@ -1015,8 +959,8 @@ pub fn compile(
                 });
             }
 
-            // ④ 发电机已建 → 接线到耗电建筑（造出发电机 ≠ 有电！）
-            //   发电机运转但 consumerUsedWatts=0 → 研究站不工作 → 食物链断。
+            // ④ 发电机已建 → 接线到耗电建筑（造出发电机 ≠ 有电！）：
+            //   没接线的耗电建筑 consumerUsedWatts=0，不会耗电。
             //   要接**每一个**耗电建筑：mod 的诊断会逐个报 "hasWire: false"。
             let consumers = ["研究站", "氧气扩散器", "电解器", "藻类箱"];
             for c in consumers {
@@ -1076,10 +1020,8 @@ pub fn compile(
         }
         Goal::Expand => {
             // 在可达区上方挖出"2 格高"的空间，让 2×2 建筑能建。
-            //   关键：不能固定挖 anchor+1 那一行 —— 那一行可能已经是气体
-            //     （打印舱内部挖空了 → 预检报"不是实心"→ 预检不通过
-            //      节点永远推不动）。
-            //   正解：往上找**第一行有实心格**的行，挖那一行。
+            //   关键：不能固定挖 anchor+1 那一行 —— 那一行可能已经是气体（预检报"不是实心"→ 预检不通过）。
+            //   往上找**第一行有实心格**的行，挖那一行。
             let reach = oni_world::preflight::load_reach(session, catalog)?;
             let anchor = base_anchor(&reach);
             let (x1, x2) = (anchor.0 - 5, anchor.0 + 5);
@@ -1109,34 +1051,40 @@ pub fn compile(
             })
         }
         Goal::Research => {
-            // 自动选研究：读可用研究列表，按优先级挑一项。
-            //   优先级：解锁食物的 > 解锁产氧的 > 其它（基础点够的）。
-            let pick = crate::exec::pick_research(session)?;
-            Some(Action::Call {
-                tool: "world_editor".into(),
-                args: serde_json::json!({
-                    "command": "edit",
-                    "path": "/active/management/research.md",
-                    "content": format!(
-                        "<<<<<<< SEARCH\n# research id=\"ImprovedOxygen\" confirm=true\n=======\nresearch id=\"{}\" confirm=true\n>>>>>>> REPLACE",
-                        pick
-                    ),
-                    "confirm": true,
-                    "task": format!("代理: 选择研究 {}", pick)
-                }).to_string(),
-                why: format!("{why}：选择研究 {pick}"),
-            })
+            // 职责：没研究站就建站。研究方向是大脑的决定（`oni research <TechId>`），执行器不替它选。
+            if crate::exec::find_building_pos(session, "研究站").is_some() {
+                return None;
+            }
+            for (prefab, cn) in &[("ResearchStation", "研究站")] {
+                if !matches!(crate::exec::buildability(session, prefab), crate::exec::Buildability::Ready(_)) {
+                    continue;
+                }
+                let mats = crate::exec::mod_materials_with_kg(session, prefab);
+                if let Some(mat) = mats.iter().find(|(_, kg)| *kg > 0.0).map(|(t, _)| t.clone()) {
+                    return Some(Action::AutoBuild {
+                        prefab: prefab.to_string(),
+                        region: "auto".into(),
+                        material: mat.clone(),
+                        why: format!("{why}（建{cn}，材料 {mat}）"),
+                    });
+                }
+            }
+            let near = oni_world::preflight::dupe_positions(session).first().copied();
+            if let Some(tag) = crate::exec::bootstrap_material(session, "ResearchStation", "研究站", near) {
+                return Some(Action::Auto {
+                    goal: format!("element:{tag}"),
+                    why: format!("{why}：研究站造不了 → 先把 {tag} 挖回来"),
+                });
+            }
+            None
         }
         Goal::Oxygen => {
             // 运行时探测：逐个候选问 mod "你现在能不能造、材料是什么"。
             //   被研究锁 → autoMaterialReason = "building_locked_by_research" → 跳过；
             //   缺材料 → reason 含 "no currently available material" → 跳过；
             //   第一个通过的 → 造它。
-            // （
-            //   旧逻辑按候选顺序挑——第一个 MineralDeoxidizer 要 IronOre，
-            //   造出来**要电**；但开局根本没发电机→ 白建。
-            //   正解：**没有电就只挑不吃电的**（藻类箱 AlgaeHabitat 吃 Dirt+水，零耗电）。
-            //   「能不能造」不只是材料问题，还有"造出来能不能运转"（电/水/光照）。
+            // 约束：**没有电就只挑不吃电的**（藻类箱 AlgaeHabitat 吃 Dirt+水，零耗电）——
+            //   「能不能造」不只是材料问题，还有"造出来能不能运转"（电/水/光照）（AGENTS.md §8）。
             let has_power = session
                 .read_json("oni://power/summary")
                 .ok()
@@ -1147,10 +1095,7 @@ pub fn compile(
                     eprintln!("[产氧探测] 跳过 {cn}：需要电力但当前无发电机");
                     continue;
                 }
-                // （
-                //   mod 的 materials[] 只报"材料可用"，不报 unlocked ——
-                //   藻类箱材料 Dirt 493kg 显示可用，但 mod 落地报 "locked by research"
-                //   。
+                // mod 的 materials[] 只报"材料可用"，不报 unlocked ——
                 //   buildability() 是检查研究锁的权威，必须先过它。
                 let buildable = crate::exec::buildability(session, prefab);
                 if !matches!(buildable, crate::exec::Buildability::Ready(_)) {
@@ -1162,7 +1107,7 @@ pub fn compile(
                     eprintln!("[产氧探测] 跳过 {cn}：{why}");
                     continue;
                 }
-                // 修正：mod 的 materials[] 是**目录顺序**，第一个可能地上 0kg
+                // mod 的 materials[] 是**目录顺序**，第一个可能地上 0kg
                 //   → 必须按真实可用量挑（与 buildability 同一把尺子）。
                 let mats = crate::exec::mod_materials_with_kg(session, prefab);
                 let usable = mats.iter().find(|(_, kg)| *kg > 0.0).map(|(t, _)| t.clone());
@@ -1184,7 +1129,6 @@ pub fn compile(
             }
             // **自举**：全部候选都造不了 → **去挖缺的材料**，
             //   而不是每轮重复失败。
-            //   「缺什么就去挖什么」是通用助手的核心能力：产氧缺氧石/铜就去挖。
             // 自举的基准点：复制人所在（没有就用官方可达集中心）
             let near = oni_world::preflight::dupe_positions(session)
                 .first()
@@ -1248,8 +1192,7 @@ pub fn compile(
             }
             if !reachable.is_empty() {
                 // 在**可达**候选里轮换：
-                //   不轮换 → 每轮都挑同一株 → 收完之后工单变成空转
-                //   代理每 10 秒重复下同一张"成功"的死工单（ 的模式）。
+                //   不轮换 → 每轮都挑同一株 → 收完之后工单变成空转（重复下同一张"成功"的死工单）。
                 let key = "forage_idx";
                 let mut locks = read_goal_locks();
                 let idx = locks
@@ -1360,9 +1303,7 @@ pub fn compile(
 
 /// 找"能放 2×2 建筑"的位置：底边下方是实心、占格全空、且附近有复制人落脚点。
 ///
-/// 为什么要专门找：基地东侧被打印舱/研究站/厕所占满，
-///   西侧是刚挖出的空腔（下方是天然岩石）→ OnFloor 建筑需要**地板砖**。
-///   这里找"下方是实心岩"的位置 → 代理在那一格**铺砖**，下一轮就能建。
+/// OnFloor 建筑需要**地板砖**：这里找"下方是实心岩"的位置 → 在那一格**铺砖**，下一轮就能建。
 fn find_power_spot(
     session: &McpSession,
     reach: &oni_world::preflight::Reach,
@@ -1397,10 +1338,8 @@ fn find_power_spot(
                     continue;
                 }
                 // 底边下方必须是实心（可以在那里铺砖）
-                // 放宽到"至少一格实心"：
-                //   要求两格都实心时，基地周边一个位置都找不到（诊断"找不到位置"）
-                //   → 节点永远推不动。1×2 的产氧件只需 1 格砖，2×2 只需 2 格，
-                //   所以"至少一格"够铺砖、下一轮就能建。
+                // 放宽到"至少一格实心"：要求两格都实心时基地周边可能一个位置都找不到；
+                //   1×2 的产氧件只需 1 格砖，2×2 只需 2 格，"至少一格"够铺砖、下一轮就能建。
                 // 且**底边不能有梯子/建筑**：
                 //   底边若是梯子 → 铺砖失败（梯子占格）→ 预检报
                 //   "占格不是空的（Ladder）" → 发电机永远建不成。
@@ -1416,10 +1355,8 @@ fn find_power_spot(
                 }
             }
         }
-        // （吉恩之死）：占格必须是**可呼吸**气体。
-        //   人力发电机建在基地低洼的 CO₂ 聚集区 → 发电的复制人必须待在机器里
-        //   长期泡在 CO₂ → 呼吸 100→93→88→77→0 → 死亡。
-        //   只看 Kind::Gas 会把 CO₂ 区当合格落点 → 必须查 cell 的元素。
+        // 占格必须是**可呼吸**气体（AGENTS.md §9：人要待在设备里的必须过可呼吸检查）：
+        //   发电的复制人必须待在机器里，只看 Kind::Gas 会把 CO₂ 区当合格落点 → 必须查 cell 的元素。
         if let Some(pick) = first_breathable(session, &cands) {
             return Some(pick);
         }
@@ -1429,7 +1366,7 @@ fn find_power_spot(
 
 /// 从候选锚点里挑第一个**占格可呼吸**的（CO₂ / 污染氧 / 氯气 / 真空 / 污水一律排除）。
 ///
-/// ：任何需要复制人**待在机器里**的设备都必须过这一关。
+/// 约束：任何需要复制人**待在机器里**的设备都必须过这一关。
 pub fn first_breathable(session: &McpSession, cands: &[(i32, i32)]) -> Option<(i32, i32)> {
     if cands.is_empty() {
         return None;
@@ -1442,9 +1379,8 @@ pub fn first_breathable(session: &McpSession, cands: &[(i32, i32)]) -> Option<(i
         })
         .collect();
     let cells = oni_world::cell::fetch_many(session, &probes);
-    // 低浓度 CO₂ 不是危险区，
-    //   按元素名一刀切会把发电选址全否掉 → 永远造不出发电机 → 基地永远没氧气。
-    // 人要在机器里待着 -> 用**严格**判据
+    // 低浓度 CO₂ 不是危险区，按元素名一刀切会把发电选址全否掉；
+    // 人要在机器里待着 → 用**严格**判据。
     let bad = |c: (i32, i32)| -> bool {
         cells
             .get(&c)
@@ -1497,7 +1433,7 @@ fn find_power_spot_any(
                 }
             }
         }
-        // ：兜底也必须是可呼吸的落点（宁可找不到，也不要建在 CO₂ 区）
+        // 兜底也必须是可呼吸的落点（宁可找不到，也不要建在 CO₂ 区）
         if let Some(pick) = first_breathable(session, &cands) {
             return Some(pick);
         }
@@ -1540,7 +1476,7 @@ fn find_floor_ready_spot(
                 }
             }
         }
-        // ：同样必须是可呼吸的落点
+        // 同样必须是可呼吸的落点
         if let Some(pick) = first_breathable(session, &cands) {
             return Some(pick);
         }
@@ -1550,22 +1486,13 @@ fn find_floor_ready_spot(
 
 /// **基地锚点**：目标搜索的距离基准。
 ///
-/// 为什么不用复制人当前位置：
-///   目标搜索按"离复制人最近"排序时，代理往西挖 → 复制人跟着往西走
-///   "最近的目标"变成西边的 → 目标持续漂移 → 代理一路往西追了 15 格，
-///   而目标其实在东侧 2~4 格（还挖出了污染水）。
-///   固定基准在基地 → 复制人怎么走都不影响目标选择。
+/// 约束：基准必须固定，不随单个复制人走动而漂移 —— 按"离复制人最近"排序时，
+///   复制人会跟着挖掘方向走，"最近的目标"持续漂移。
 ///
-/// 实现：**官方可达集的中心**。
-///
-/// 为什么用官方可达集而不是复制人位置：官方可达集是**基地**的范围
-///   ，不随复制人走动而变；复制人位置会变，用它做基准
-///   必然导致目标漂移。官方集为空时退回复制人质心，再退回包围盒中心。
+/// 实现：复制人位置的中位数；没有复制人时用官方可达集质心，再退回包围盒中心。
 pub fn base_anchor(reach: &oni_world::preflight::Reach) -> (i32, i32) {
-    // ★ 锚点 = **复制人自己站的地方**（中位数），不是官方可达集的质心。
-    //   官方可达集是「窗口内所有有地板的格」，质心会被基地边缘的远端格子拉走：
-    //   本存档实测锚点落在 (107,193)，而三人实际站在 (119..121,194)
-    //   → 竖井候选列全在基地西侧的空气里 → 梯子永远铺不到人头上 → 空转。
+    // ★ 锚点 = **复制人自己站的地方**（中位数），不是官方可达集的质心：
+    //   官方可达集是「窗口内所有有地板的格」，质心会被基地边缘的远端格子拉走。
     if !reach.dupes.is_empty() {
         let mut xs: Vec<i32> = reach.dupes.iter().map(|d| d.0).collect();
         let mut ys: Vec<i32> = reach.dupes.iter().map(|d| d.1).collect();
@@ -1638,11 +1565,8 @@ fn rect_around(
 
 /// **渐进走廊矩形**：目标离可达区很远时，挖"目标周围"是没用的（全是实心、无落脚点）。
 ///
-/// 为什么需要：铁矿在 Y=171~176，走廊在 Y=193 —— 相距 17~22 格。
-///   旧逻辑把矩形画在铁矿周围→ 那些格正下方都不可达 → "全部需梯子"
-///   **无可下单曲** → 节点永远不推进。
-///
-///   正确做法：矩形应该是**从可达区朝目标方向推进的一段窄带**，
+/// 约束：矩形必须是**从可达区朝目标方向推进的一段窄带**——
+///   画在目标周围的格正下方不可达（"全部需梯子" → 无可下单曲）。
 ///   每挖通一段，可达区扩大 → 下一轮窗口再往前推 → 渐进逼近目标。
 ///
 /// 返回 (x1,y1,x2,y2)：窄带覆盖"主轴方向上前进 N 格 + 另一轴全覆盖"。
@@ -1657,15 +1581,13 @@ fn rect_toward(
     let dy = center.1 - bb.3;   // >0: 目标在上边
     let adx = dx.abs();
     let ady = dy.abs();
-    // 目标在包围盒内 → 直接用中心矩形（原来的行为）
+    // 目标在包围盒内 → 直接用中心矩形
     if dx <= 0 && dy <= 0 && center.0 >= bb.0 && center.0 <= bb.2 && center.1 >= bb.1 && center.1 <= bb.3
     {
         return rect_around(center, reach, 4);
     }
     // 窄带必须**固定一列**，不能另一轴全覆盖 ——
-    //   全宽窄带让代理在 121/122/123/124/125 五列之间横跳，
-    //   8500kg 砂岩挖掉却没往下推进一格。
-    //   集中一列才能形成真正的竖井（一格格往下）。
+    //   全宽窄带会让代理在多列之间横跳，集中一列才能形成真正的竖井（一格格往下）。
     if adx >= ady {
         // 水平为主：y 固定在目标附近，x 从可达区边缘朝目标推进
         let (x1, x2) = if dx > 0 {
@@ -1694,8 +1616,7 @@ fn rect_toward(
 
 /// 最近的、含指定元素且**实心**的格（用官方 cell 数据判定元素）。
 ///
-/// 为什么不用地图字形猜：渲染网格的列对齐会因标注而漂移（ (136,192)
-///   渲染成砂岩、实际是藻类）—— 字形只能当线索，元素必须问官方 cell。
+/// 约束：不用地图字形猜元素 —— 渲染网格的列对齐会因标注而漂移，字形只能当线索（AGENTS.md §3）。
 fn nearest_solid_with(
     session: &McpSession,
     reach: &oni_world::preflight::Reach,
@@ -1723,10 +1644,7 @@ fn nearest_solid_with(
             continue;
         }
         // 距离基准用**基地锚点**，不用复制人当前位置：
-        //   旧代码按"离复制人最近"排序 → 代理往西挖 → 复制人跟着往西走
-        //   "最近的藻类"变成西边的 → 目标漂移 → 代理一路往西追（追了 15 格，
-        //   而目标其实在东侧 2~4 格），还挖出了污染水。
-        //   正确做法：距离基准固定在**基地锚点**，复制人移动不影响它。
+        //   按"离复制人最近"排序时复制人会跟着挖掘方向走 → 目标持续漂移。
         let anchor = base_anchor(reach);
         let climbable = |c: (i32, i32)| -> bool {
             if reach.official.contains(&(c.0, c.1 - 1)) {
@@ -1737,8 +1655,7 @@ fn nearest_solid_with(
         ring.sort_by_key(|c| {
             let dist = (anchor.0 - c.0).abs() + (anchor.1 - c.1).abs();
             // 深挖惩罚：
-            //   可达区**下方**的资源要降级 —— 挖它要开 20 格竖井，
-            //   会把地下 CO₂ 释放到低层走廊 → 复制人。
+            //   可达区**下方**的资源要降级 —— 挖它要开长竖井，会把地下 CO₂ 释放到低层走廊。
             //   同层/上方的资源永远优先。距离只在同"深度档"里比较。
             let below = if c.1 < bb.1 { 1i32 } else { 0i32 };
             (if climbable(*c) { 0i32 } else { 1i32 }, below, dist)
@@ -1851,7 +1768,7 @@ mod tests {
     }
 
     /// 回归：harvest 工单**必须带"植物"类型前缀**。
-    ///     缺前缀时 mod 静默返回 ok:true 但工单没建 → 断粮 8 个周期。
+    ///     缺前缀时 mod 静默返回 ok:true 但工单没建。
     #[test]
     fn harvest_command_has_plant_type_prefix() {
         let cmd = harvest_cmd(117, 202);
@@ -1884,8 +1801,7 @@ BasicForagePlantPlanted@(131,199) PrickleGrass@(132,199) BasicSingleHarvestPlant
     }
 
     /// 产氧语义目标能被解析（"oxygen" / "产氧" 两种写法）。
-    /// ★ 回归：element:X 不再手写白名单——LLM 写 element:Gold 必须能解析。
-    ///   旧白名单 16 个元素，第 17 个就卡死（实测 W2「采掘金矿」连续 no_target）。
+    /// ★ 回归：element:X 不手写白名单——LLM 写 element:Gold 必须能解析。
     #[test]
     fn any_valid_element_id_parses() {
         for el in ["Gold", "GoldAmalgam", "IronOre", "Tungsten", "Niobium", "Isoresin", "Phosphorite", "some_New_Ore2"] {
@@ -1927,7 +1843,7 @@ BasicForagePlantPlanted@(131,199) PrickleGrass@(132,199) BasicSingleHarvestPlant
     }
 
     /// 换存档的判据：cycle 回退 → 旧锁必须作废。
-    ///   这条守不住的话，新存档开局会拿旧存档的坐标当目标 → 永远挖不到（真事故）。
+    ///   这条守不住的话，新存档开局会拿旧存档的坐标当目标 → 永远挖不到。
     #[test]
     fn stale_lock_cleared_on_save_switch() {
         let mut locks: HashMap<String, GoalLock> = HashMap::new();

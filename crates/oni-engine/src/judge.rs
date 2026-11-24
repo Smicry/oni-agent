@@ -10,11 +10,7 @@ pub const OXYGEN_FLOOR: f64 = 120.0;
 pub const REACH_FLOOR: i64 = 5;   // 开局只有十几格可达，别误报
 /// **每人每周期消耗的热量（kcal）**。
 ///
-/// 修正：旧值 2000 错了 5 倍。
-///   ONI 官方：复制人**每周期吃 400 kcal**。
-///   旧值把开局 16000kcal 算成「只够 2.7 周期」→ 账本把「断粮」排成第一死因
-///   → 代理去抢收割节点 → surface/供电/研究全部饿死（）。
-///   修正后同一局是 13.3 周期 → 断粮不是红线，产氧/厕所才是。
+/// ONI 机制：复制人**每周期吃 400 kcal**。
 pub const KCAL_PER_DUPE_CYCLE: f64 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +38,7 @@ pub struct Judgment {
     pub dangers: Vec<String>,
     /// 危险**类别**（不含会变的数值）——用来判断"是不是同一个危险"。
     ///
-    /// 为什么必须分���：早期把数值也拼进键里，结果呼吸值每轮都变
-    ///   键每轮都变 → 紧急暂停的冷却永远不生效 → 每 10 秒重新暂停一次，
-    ///   复制人反复被冻在坑里窒息。
+    /// 约束：键里不能拼会变的数值（如呼吸值），否则键每轮都变，紧急暂停的冷却永远不生效。
     pub danger_keys: Vec<String>,
     pub actions: Vec<String>,
     pub notes: Vec<String>,
@@ -86,11 +80,7 @@ pub fn judge(s: &Snapshot, trend: Option<&Trend>) -> Judgment {
     //   → 施工节奏被腰斩，还反复重下工单。
     //   真正该判危险的是：**有人呼吸值真的偏低**。
     let worst_breath = s.min_breath();
-    // 保守性修正：
-    //   旧代码 `unwrap_or(false)` = **拿不到呼吸值就不判危险**。
-    //   复制人泡在 CO₂ 里呼吸 0、已失去行动能力时，dupes 数据一度读失败
-    //   判定变成 OK → 代理继续挖矿 → 三个复制人在 CO₂ 里全部死亡。
-    //   读不到呼吸值 ≠ 安全。拿不到就当**可能有危险**（至少不判 OK）。
+    // 约束：读不到呼吸值 ≠ 安全。拿不到就当**可能有危险**（至少不判 OK）。
     let someone_struggling = match worst_breath {
         Some(b) => b < BREATH_FLOOR,
         None => !s.dupes.is_empty(),   // 有复制人但读不到呼吸值 → 保守判危险
@@ -241,7 +231,7 @@ pub fn judge(s: &Snapshot, trend: Option<&Trend>) -> Judgment {
 ///
 /// 为什么单独抽成函数：人口为 0 时**紧急态占空比帮不上忙**——
 /// 没人能靠"跑 120s"自救（mod 无拖人/治疗工单，倒地/死亡不可自愈），
-/// 占空比只会白烧游戏周期并持续唤醒代理。判定必须放在紧急态分支**之前**。
+/// 占空比只会空耗游戏周期并持续唤醒代理。判定必须放在紧急态分支**之前**。
 pub fn is_no_population(danger_keys: &[String]) -> bool {
     danger_keys.iter().any(|k| k == "no_population")
 }

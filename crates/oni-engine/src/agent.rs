@@ -6,7 +6,7 @@
 //!
 //! 暂停策略（与主 agent 的判断配对）：
 //! * 紧急态 → 立刻暂停，直到条件解除才恢复（避免复制人在我思考期间憋死）
-//! * 检测到**手动暂停**且无紧急态 → 自动恢复（手动暂停最容易白烧周期）
+//! * 检测到**手动暂停**且无紧急态 → 自动恢复（手动暂停最容易空耗周期）
 //! * 写操作**不暂停**（通配符补丁与复制人位置无关，不需要稳定快照）
 //! * 紧急暂停有冷却，避免"暂停↔恢复"来回打架把计划饿死
 
@@ -53,8 +53,8 @@ pub fn window_request_path() -> std::path::PathBuf {
 /// 守护进程看到它就**只观察不自动恢复**，等主 agent 写 `open_window` 或删掉它才动。
 ///
 /// 为什么需要：
-///   主 agent 修 bug 时游戏若继续跑，局势会在看不见的地方变化 ——
-///   修完代码一看，殖民地已经死了（a past failure）。hold 让"修复期"也保持观察权。
+///   主 agent 修 bug 时游戏若继续跑，局势会在看不见的地方变化（修完代码殖民地可能已经出事）。
+///   hold 让"修复期"也保持观察权。
 pub fn hold_path() -> std::path::PathBuf {
     oni_mcp::state_dir().join("hold")
 }
@@ -72,8 +72,7 @@ pub fn write_hold(reason: &str, cycle: i64) -> std::io::Result<()> {
 
 /// 测试用：把代理状态目录指到临时目录（绝不碰真实 ~/.oni-agent）。
 ///
-/// 为什么需要：`hold_roundtrip` 曾对**真实** `~/.oni-agent/hold` 做 clear_hold → 主 agent /
-///   用户的 hold 被测试解掉 → 世界在不知情下恢复运行（两次实测，都在 cargo test 之后）。
+/// 约束：写状态的测试一律先调用它，否则测试会解掉主 agent/用户的真实 hold，世界在不知情下恢复运行。
 #[cfg(test)]
 pub fn isolate_state_dir() {
     let d = std::env::temp_dir().join(format!("oni-test-state-{}", std::process::id()));
@@ -100,8 +99,8 @@ pub fn hold_active() -> bool {
 /// ★ 动作指纹：从 exec 结果里提取"这次到底对哪个目标动了手"。
 ///
 /// 为什么需要指纹而不是只按节点计：节点级计数看得见"这个节点失败"，
-///   看不见"代理在同一格上反复下同样的工单"（实测：厕所每轮挖同一格，
-///   那格早已挖开 → 无限循环）。指纹让循环可被识别、被上报、被换方案。
+///   看不见"代理在同一格上反复下同样的工单"（如对早已挖开的格子重复下挖单 → 无限循环）。
+///   指纹让循环可被识别、被上报、被换方案。
 ///
 /// 覆盖的 detail 形态（exec.rs 的稳定文案）：
 ///   "已下挖掘工单 @(x,y)" / "已放置 Prefab @(x,y)" / "落点 (x,y)" / "先挖 (x,y)"
@@ -136,8 +135,7 @@ pub fn action_fingerprint(r: &crate::exec::ActionResult) -> Option<String> {
 }
 
 /// ★ 结构化失败原因分类：把 exec 的自由文本 detail 归为稳定的类别。
-/// 慢系统据此诊断「为什么失败」，而不是盲目换目标名字
-/// （实测 oxygen 连续 8 次失败 = "语义目标找不到"，却一直被重试）。
+/// 慢系统据此诊断「为什么失败」，而不是盲目重试同一个目标。
 pub fn classify_fail(detail: &str) -> String {
     let d = detail;
     if d.contains("找不到") && (d.contains("语义目标") || d.contains("地图")) { "no_target".into() }
@@ -148,8 +146,8 @@ pub fn classify_fail(detail: &str) -> String {
     else if d.contains("落点") || d.contains("建造区域") { "no_placement".into() }
     else if d.contains("无法解析") { "bad_goal".into() }
     // ★ 零进展（挖不动/无可下单曲）——单独归类：它既不是"找不到目标"也不是预检失败，
-    //   而是"目标存在但当前物理条件推不动"（前沿全需梯子、已有标记等）。
-    //   旧版把它归进 unknown → 慢系统看不出"该换方向"，只会重试同一个目标。
+    //   而是"目标存在但当前物理条件推不动"（前沿全需梯子、已有标记等）；
+    //   归进 unknown 会让慢系统看不出"该换方向"。
     else if d.contains("无可下单曲") || d.contains("零进展") || d.contains("推不动") { "no_progress".into() }
     else { "unknown".into() }
 }
@@ -189,11 +187,9 @@ pub struct Agent {
     frozen: bool,
     /// **工作节律自持**：代理自己冻回后，按「冻 20s → 跑 120s」自动续窗。
     ///
-    /// 为什么需要：窗口到期后代理按纪律冻回暂停、等待**新的窗口请求**，
-    ///   而请求通常来自主 agent —— 于是无人值守时殖民地**全程冻着**（白烧一小时，
-    ///   氧气 213kg、砂岩 5080kg 都在，人却闲着）。
+    /// 为什么需要：窗口到期后若只等**新的窗口请求**（通常来自主 agent），无人值守时殖民地会全程冻着。
     ///   只有"窗口正常到期"才置位；"动作失败且无待办"（真没活干）**不**置位，
-    ///   否则会变成"停→恢复→再停"的空转烧周期。
+    ///   否则会变成"停→恢复→再停"的空转。
     auto_rhythm: bool,
     /// 下次自动开窗的时刻（自持节律用）
     resume_at: Option<Instant>,
@@ -206,8 +202,7 @@ pub struct Agent {
     /// ★ 动作级循环账本：动作指纹 → 连续出现次数。
     ///
     /// 为什么需要：节点级计数（action_failures / stuck_streak）只看得见"这个节点失败了"，
-    ///   看不见"代理在同一格上反复下同样的工单"（实测厕所：每轮挖 (115,194)，
-    ///   而那格早已挖开 → 无限循环，厕所永远建不成）。
+    ///   看不见"代理在同一格上反复下同样的工单"（如对早已挖开的格子重复下挖单 → 无限循环）。
     /// 命中阈值 → 不再重复该动作，改为上报慢系统换方案（契约：慢系统处理策略性死循环）。
     action_loops: std::collections::HashMap<String, usize>,
     /// **卡住去抖计数**：同一 kind 连续命中几轮（瞬时状态不升级）。
@@ -227,7 +222,7 @@ pub struct Agent {
     /// 上一轮的进展指纹（用来识别"卡住"）
     last_fingerprint: String,
     /// 上一轮结束时世界是否在跑（用来判断"这一轮世界有没有真的动过"）。
-    /// 世界没跑 → 指纹必然不变 → 那不是"卡住"，不能计入零进展熔断（）。
+    /// 世界没跑 → 指纹必然不变 → 那不是"卡住"，不能计入零进展熔断。
     left_running: bool,
     /// 连续无进展的轮数
     no_progress: usize,
@@ -243,6 +238,18 @@ pub struct Agent {
     pub cycles: u64,
     /// 上一轮的周期号（回滚检测：周期回退 = 读档/重开同一局 → 清局内状态）
     last_cycle: i64,
+}
+
+/// 世界不连续：|Δcycle| ≥ 2 视为读档/手动快进（正常跨周期是 +1）。返回 (上一周期, 类型)。
+pub fn cycle_discontinuity(last_cycle: i64, cycle: i64) -> Option<(i64, &'static str)> {
+    if last_cycle <= 0 {
+        return None;
+    }
+    let d = cycle - last_cycle;
+    if d.abs() < 2 {
+        return None;
+    }
+    Some((last_cycle, if d < 0 { "回退/读档" } else { "跳跃/手动快进" }))
 }
 
 /// B: 从目标锁表里剔除最容易卡死的两类（surface / open_chamber）。
@@ -300,7 +307,7 @@ impl Agent {
     /// 同一动作指纹连续出现多少次 → 判定执行层循环（升级慢系统 + 暂缓节点）。
     ///
     /// 为什么是 3：挖掘/建造要复制人真的走过去动手，2 轮可能是正常的慢；
-    ///   3 轮还在同一格 → 几乎必然是"选点/判据不成立"或"那格早已挖开"（实测厕所）。
+    ///   3 轮还在同一格 → 几乎必然是"选点/判据不成立"或"那格早已挖开"。
     const ACTION_LOOP_MAX: usize = 3;
 
     /// 暂缓节点的冷却期（轮）：暂缓后至少隔这么多轮才允许自动恢复。
@@ -311,11 +318,9 @@ impl Agent {
 
     /// 传感器 session 的最长寿命：到期重新握手（见 `McpSession::refresh`）。
     ///
-    /// 为什么需要：mod 端对**长连接 session** 的"可见世界扫描"类字段（cycle / buildings /
-    ///   体征 / paused）会在游戏长时间暂停后停止更新，而同一响应里的实时字段还在变 →
-    ///   半冻结快照（实测 14 小时 hold 后 serve 持续 25 分钟看 cycle 1 / 厕所 0 / 膀胱 86，
-    ///   新进程直读同一 URI 是 cycle 2 / 厕所 1）。传感器不能无限信任一条 channel：
-    ///   周期重连兜底 + 世界运行态变化（代理恢复游戏）后立即重连。
+    /// mod 行为：对**长连接 session**，"可见世界扫描"类字段（cycle / buildings / 体征 / paused）
+    ///   会在游戏长时间暂停后停止更新，而同一响应里的实时字段还在变 → 半冻结快照。
+    ///   传感器不能无限信任一条 channel：周期重连兜底 + 世界运行态变化（代理恢复游戏）后立即重连。
     const SESSION_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
     /// 实时查游戏是否暂停（读 oni://colony/status，该 URI 走 1s TTL 的秒级新鲜度）。
@@ -330,7 +335,7 @@ impl Agent {
 
     /// A: 工单积压 + 全员闲看门 —— 在**执行闸门之前**运行。
     ///
-    /// 为什么要提前：hook 在每次用户消息时暂冻世界，旧代码在闸门之后才观测，
+    /// 约束：必须在执行闸门之前观测 —— hook 在每次用户消息时暂冻世界，放在闸门之后的话，
     /// AI 思考期间世界被冻、账本被清 → 永远看不到"有活没人干"。
     /// 账本只在世界真跑时累加，暂冻期保留；达阈值先做确定性自救（B），
     /// 仍无解才冻结 + 上报 AI 慢系统。
@@ -475,7 +480,7 @@ impl Agent {
     /// 恢复游戏 + **立即重连传感器 session**。
     ///
     /// 为什么重连：世界运行态变了，mod 对旧 session 的缓存视图可能还停在"暂停时的世界"
-    ///   （实测 14 小时 hold 后：快照 paused=true / 厕所 0 / 膀胱 86，真值是运行中 / 1 / 0）。
+    ///   （快照可能仍是 paused=true、建筑/体征停滞，而真值已在推进）。
     ///   属传感器层：channel 在世界状态跳变后重新建立，不解释、不猜。
     fn resume_world(&mut self, task: String) {
         let _ = self.session.call_text(
@@ -510,12 +515,9 @@ impl Agent {
     ///   4. 决策（实时优先级调度可抢占静态计划）→ 执行
     ///   5. 执行**之后**再判空闲 → 没活才冻回暂停
     ///
-    ///  的完整链条（旧逻辑为什么会自毁）：
-    ///   旧逻辑在"执行**之前**"用**上一轮**的 pending_orders 判空闲
-    ///   → 这一轮刚下的第一张工单还没进队列 → 被当成空闲 → 立刻冻回暂停
-    ///   → 那张工单永远不会被执行（游戏是暂停的）
-    ///   → 指纹永远不变 → 连续 3 轮"零进展" → **误熔断好节点**
-    ///   → 依赖图死锁 → 殖民地彻底停摆。
+    /// 约束：空闲必须在执行**之后**判 —— 执行前判会把"这一轮刚下的第一张工单"（还没进队列）
+    ///   当成空闲 → 立刻冻回暂停 → 那张工单永远不会被执行 → 指纹永远不变
+    ///   → 连续 3 轮"零进展" → **误熔断好节点** → 依赖图死锁。
     /// v3：统一在出口派生运行状态——无论 cycle_inner 从哪个分支 return，
 /// report.run_state 都反映**本轮结束时**的真实状态（供日志/测试断言）。
 pub fn cycle(&mut self) -> CycleReport {
@@ -556,7 +558,7 @@ pub fn cycle(&mut self) -> CycleReport {
         }
         let snap = sense(&self.session);
         // 落盘共享快照：守护进程当**唯一采集者**，主 agent 读它
-        //   MCP 只有一条通道（不再两边各采一遍），两边看到的也是同一份真值。
+        //   MCP 只有一条通道（两边不各采一遍），两边看到的也是同一份真值。
         let _ = crate::live::publish(&snap);
         let _ = record(&snap);
         let samples = load_samples(200);
@@ -590,10 +592,6 @@ pub fn cycle(&mut self) -> CycleReport {
             report.notes.push(msg);
         }
 
-        // ---- S5：事件驱动重规划 ------------------------------------
-        //   计划不该一成不变：人口下降 / 氧气告急 / 节点连续失败时，
-        //   要**按新的世界事实重新生成依赖图**（换策略族），而不是继续走老路。
-        //   冷却 60s，避免每轮都重算（采集事实要打多次 MCP）。
         // =====================================================================
         // 2) 运行状态机：这一轮世界在不在跑
         //    铁律：**世界不跑 ⇒ 不下工单、不累计进展、不熔断。**
@@ -601,12 +599,12 @@ pub fn cycle(&mut self) -> CycleReport {
         // ★ 世界在不在跑：**实时真值**，不是过期快照。
         //   判据三重信号（同一份 oni://colony/status，1s TTL 秒级新鲜度）：
         //     ① isPaused = true → 停（暂停按钮被按下）
-        //     ② gameSpeed <= 0 → 停（速度 0 等于没跑；mod 出现过
+        //     ② gameSpeed <= 0 → 停（速度 0 等于没跑；mod 会出现
         //        isPaused=false 但 gameSpeed=0.0 的组合，只看 ① 会漏判）
         //     ③ 任一说停 → 判停（保守：宁可少下一轮工单，也不可在世界停着时下单）
         //   为什么不能只信快照里的 paused：拿过期值判定 → 代理以为世界在跑 →
         //   继续下工单 → 游戏实际停着、工单永不执行 → 指纹不变 → 判零进展 →
-        //   误熔断好节点（契约 §9 铁律：世界不跑 ⇒ 不下工单、不计进展、不熔断）。
+        //   误熔断好节点（契约 §2 不变量 1：世界不跑 ⇒ 不下工单、不计进展、不熔断）。
         let speed_stopped = snap.game_speed >= 0.0 && snap.game_speed <= 0.0;
         let mut observed_running = !snap.paused && !speed_stopped;
         // ★ 实时复核：快照说"在跑"时，再查一次实时状态兜底。
@@ -623,7 +621,6 @@ pub fn cycle(&mut self) -> CycleReport {
         }
         // 暂停所有权：唯一的用户停止信号是 hold（AI 总开关关），
         //   在下方 hold_active() 早退处理。其它 owner 一律由代理自主恢复。
-        //   （旧逻辑把 owner=User 判成"用户暂停→绝不恢复"，与 AI 总开关重复且致死锁。）
         let ctl = crate::control::read();
         // 上一轮结束时世界在跑吗？→ 这一轮世界有没有真的动过（决定能不能比指纹）
         let world_advanced = self.left_running;
@@ -631,29 +628,22 @@ pub fn cycle(&mut self) -> CycleReport {
         let danger_key = judgment.danger_keys.join(";");
         let mut can_execute = false;
 
+        // ---- 回滚检测（每轮执行，与 hold 无关）：|Δcycle| ≥ 2 = 读档/手动快进 → 清局内决策上下文 ----
+        //   旧记录会污染 LLM 决策窗口，旧的熔断记录会封锁新局的保命目标。
+        if let Some((prev, kind)) = cycle_discontinuity(self.last_cycle, snap.cycle as i64) {
+            crate::saveswitch::clear_save_state();
+            report.notes.push(format!(
+                "🔁 检测到世界不连续（周期 {prev} → {}，{kind}）→ 已清局内决策上下文（LLM 从零重排）",
+                snap.cycle));
+        }
+        self.last_cycle = snap.cycle as i64;
+
         if hold_active() {
-            // hold：主 agent 正在改代码 → 冻世界，只观察
+            // hold：用户关闭了 AI 总开关 → 冻世界，只观察，不自动恢复
             if observed_running {
                 self.pause("hold：主 agent 正在处理，冻结世界");
             }
-
-        // ---- 回滚检测：周期回退 = 读档/重开同一局 → 清局内决策上下文 ----
-        //   不清的话：上一轮（往往以全灭告终）的 decisions/goal_outcomes/ai_goals/
-        //   circuit_breaks 全部残留 → LLM 决策窗口被污染、产氧目标开局即熔断
-        //   （实测缺口：回滚后 oxygen fail=4 的熔断记录直接封锁新局的产氧目标）。
-        //   阈值 2：读档通常回退多个周期；正常跨周期是 +1，不会误触。
-        // ★ 世界不连续 = 回退 **或** 跳跃（|Δcycle| ≥ 2）。
-        //   跳跃的实测场景：hold 期间世界被手动快进了 13 个周期（2→15），release 后代理
-        //   看到的是一个人口 0 的死局，但 decisions/goal_outcomes 里还是周期 2 的旧记录，
-        //   窗口也还是旧世界的。回退清、跳跃不清 → 代理用旧世界的记忆面对新世界。
-        //   传感器只负责说"世界变了"，怎么回应用清上下文表达（LLM 从零重排）。
-        let dcycle = snap.cycle as i64 - self.last_cycle;
-        if self.last_cycle > 0 && dcycle.abs() >= 2 {
-            crate::saveswitch::clear_save_state();
-            report.notes.push(format!("🔁 检测到世界不连续（周期 {} → {}，{}）→ 已清局内决策上下文（LLM 从零重排）",
-                self.last_cycle, snap.cycle, if dcycle < 0 { "回退/读档" } else { "跳跃/手动快进" }));
-        }
-        self.last_cycle = snap.cycle as i64;            self.window_until = None;
+            self.window_until = None;
             self.window_owned_by_us = false;
             report.notes.push(
                 "⏸ hold 模式：主 agent 正在处理 → 代理只观察，不自动恢复（等 oni release）".into(),
@@ -665,12 +655,11 @@ pub fn cycle(&mut self) -> CycleReport {
             // 紧急态用**占空比**，不是"一暂停到底"：
             //   暂停只是冻结倒计时；人闷在 CO₂ 坑里，暂停并不能救他们。
             //   正确节奏：冻 20s（给主 agent 一个世界静止的快照）→ 跑 120s（让人能行动）→ 再冻。
-            //   历史上"一暂停到底"的结果：三个人全部失去行动能力、一人死亡。
             self.danger_cycle = true;
 
             // 人口为 0 = 殖民地已死，**紧急态占空比在这里帮不上忙**。
             //   没有活人能靠"跑 120s"自救，
-            //   占空比只会白烧游戏周期 + 持续唤醒代理。
+            //   占空比只会空耗游戏周期 + 持续唤醒代理。
             //   正确处置：保持暂停、只观察，等人工回滚存档。
             if crate::judge::is_no_population(&judgment.danger_keys) {
                 if observed_running {
@@ -713,10 +702,8 @@ pub fn cycle(&mut self) -> CycleReport {
                 report.notes.push(format!("▶ 紧急态运行中（剩 {}s）", (deadline - now).as_secs()));
             } else {
                 // 紧急态 + 游戏暂停：开一个**最短窗口**让人有机会恢复，然后立刻冻回。
-                //   旧逻辑是"完全不跑，只报警" —— 但这在真紧急态下会**阻止救援**：
-                //   downed 的复制人只能靠环境改善（CO₂ 稀释 / 污染水清理）恢复，
-                //   而环境改善需要**游戏在跑**（工单要能被执行、人要能行动）。
-                //   三人全倒时若游戏一直冻着 → 永远恢复不了 = 死局。
+                //   约束："完全不跑，只报警"会**阻止救援**：downed 的复制人只能靠环境改善
+                //   （CO₂ 稀释 / 污染水清理）恢复，而环境改善需要**游戏在跑**（工单要能被执行、人要能行动）。
                 //   边界：用户手动暂停依然被尊重 —— 只开最短窗口，到点立刻冻回。
                 const RESCUE_TICK: u64 = 30;
                 self.window_until = Some(Instant::now() + Duration::from_secs(RESCUE_TICK));
@@ -756,7 +743,7 @@ pub fn cycle(&mut self) -> CycleReport {
                             self.window_owned_by_us = false;
                             can_execute = false;
                             // 工作节律自持：窗口正常到期 → 冻 20s 后自动续窗。
-                            //   无人值守时不再需要外部窗口请求（此前会白烧一小时）。
+                            //   无人值守时不需要外部窗口请求（否则殖民地会一直冻着）。
                             self.auto_rhythm = true;
                             self.resume_at = Some(Instant::now() + Duration::from_secs(20));
                             report.notes.push(
@@ -792,7 +779,7 @@ pub fn cycle(&mut self) -> CycleReport {
             //   - 连续自持上限 RHYTHM_MAX：即使误判也不会长期越权暂停用户的游戏
             const RHYTHM_MAX: usize = 4;
             // ★ 有未完成的长线目标/在建工单 → 视为"有活"，续窗不消耗自持额度，
-            //   让竖井/研究这类跨多窗口任务能持续到完成（原来4次后必停 = 长线任务夭折）。
+            //   让竖井/研究这类跨多窗口任务能持续到完成。
             let has_pending_goal = !crate::commands::ai_goals_pending().is_empty()
                 || crate::escalate::has_pending();
             let work_pending = has_pending_goal
@@ -824,9 +811,8 @@ pub fn cycle(&mut self) -> CycleReport {
                 ));
             } else if (self.frozen || self.idle_stopped) && work_pending {
                 // ★ 冻结中慢系统送来了新目标（ai_goal / 升级请求 / 在建工单）→ 有活就该干，
-                //   立即续窗（契约 §7：有活续窗 / 空闲冻回）。否则慢系统在冻结期间入队的
-                //   目标会因「冻结只观察」永远不被消费 → 快慢互等死锁（2026-11-24 实测：
-                //   目标消费完才冻结，LLM 80s 后入队新目标，冻结态无人开窗，第二层死锁）。
+                //   立即续窗（契约 §2 不变量 1：有活续窗 / 空闲冻回）。否则慢系统在冻结期间入队的
+                //   目标会因「冻结只观察」永远不被消费 → 快慢互等死锁。
                 self.rhythm_streak = 0;
                 self.window_until =
                     Some(Instant::now() + Duration::from_secs(self.cfg.work_window_secs));
@@ -915,7 +901,7 @@ pub fn cycle(&mut self) -> CycleReport {
 
         // =====================================================================
         // 3) 执行闸门：世界不跑 ⇒ 只观察
-        //    （不下工单、不计进展、不熔断 ——  的直接止血点）
+        //    （不下工单、不计进展、不熔断）
         // =====================================================================
         // ★ 传感器数据可能过期（mod 心跳未推进）→ 和"世界不跑"同一条纪律：不下工单、不计进展。
         //   sense() 已在检测到 stale 时重连 session，下一拍应为新鲜数据。
@@ -945,30 +931,23 @@ pub fn cycle(&mut self) -> CycleReport {
             return report;
         }
 
-        // ---- 殖民地杂务：每轮都把打印舱的奖励领出来 ----
-        // 为什么独立于依赖图：玩家绝不会让打印舱的产出烂在舱里，
-        // 而它可能产出**唯一的新人**（三人只剩两个）。
-        if let Ok(out) = self.session.call_text(
-            "building_control",
-            serde_json::json!({
-                "domain": "side_surface", "surface": "facility", "kind": "printing_pod",
-                "action": "claim", "rewardIndex": 0, "confirm": true,
-                "task": "代理: 领取打印舱奖励"
-            }),
-        ) {
-            let first = out.lines().find(|l| l.contains("claimable") || l.contains("selectedReward"));
-            if let Some(l) = first {
-                report.notes.push(format!("🎁 打印舱奖励: {}", l.trim().chars().take(60).collect::<String>()));
-            }
+        // ---- 打印舱：只上报，不替大脑决定领什么 ----
+        // 可领取的物品包是战略资源，领哪个由大脑决定（pod claim <index>）；新人只能在游戏 UI 里选。
+        if let Some(p) = snap.printing_rewards.as_ref().filter(|p| p.available && p.reward_count > 0) {
+            report.notes.push(format!("🎁 打印舱：{} 个可领取奖励（{}）→ 已上报大脑", p.reward_count, p.rewards.join(" / ")));
+            crate::escalate::raise_categorized(
+                crate::escalate::Kind::StrategyMismatch, "pod",
+                format!("打印舱有 {} 个可领取的奖励：{}", p.reward_count, p.rewards.join(" / ")),
+                "大脑：用 pod claim <index> 领最有用的一项；新人需用户在游戏里选择".into(),
+                crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(), oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
+                "printing_pod", Default::default());
         }
 
-        // ---- 救援：有人倒地 → 立刻把他挪到安全的建筑旁（ 的正解）
-        //   旧结论"downed 不可救"是错的：mod 有 dupes_control move_to。
-        //   倒地的复制人待在污染区**必定死亡**；挪到干净的建筑旁边就能活。
+        // ---- 救援：有人倒地 → 立刻把他挪到安全的建筑旁 ----
+        //   mod 有 dupes_control move_to：倒地的复制人待在污染区**必定死亡**，挪到干净的建筑旁边就能活。
         //   本步骤每轮都做（不依赖依赖图），优先级高于任何施工。
-        // 门槛必须是"有人需要救援"，不能只是"有人倒地"。
-        //   旧门槛 downed_count()>0 让"呼吸在掉但还站着"的人永远进不了救援逻辑
-        //   （ 的修复只做了一半 —— 执行方改了、调用方没改）。
+        // 门槛必须是"有人需要救援"，不能只是"有人倒地"：
+        //   "呼吸在掉但还站着"的人也要进救援逻辑。
         // S3 执行后复核：回读上一轮移动是否**真的生效**。
         //   「已下令」≠「已生效」：倒地的复制人无法自行寻路 → 移动工单永远不执行。
         //   复核不通过时要**显式报告**，否则会误以为救到了而不去建床/清毒气。
@@ -1001,7 +980,7 @@ pub fn cycle(&mut self) -> CycleReport {
             matches!(g, "expand" | "scout" | "surface" | "open_chamber")
         };
         {
-            // ★ 从独立 ai_goals.jsonl 读（不再从 commands.jsonl 过滤 source）
+            // ★ 从独立 ai_goals.jsonl 读
             let mut ai_goals: Vec<_> = crate::commands::ai_goals_pending();
             if urgent_guard {
                 let before = ai_goals.len();
@@ -1059,7 +1038,6 @@ pub fn cycle(&mut self) -> CycleReport {
         // ★ "等慢系统"不再是暂停/停手理由：escalation 只是上报给慢系统做战略参考，
         //   快系统的保命与执行**永不因此阻塞**。慢系统照常 resolve（清 pending/写静默），
         //   但快系统每轮照常干活——这是"慢系统不审批急症"的核心。
-        //   旧的 60 行 waiting_slow 停手逻辑已删除（它曾导致膀胱爆表却没人建厕所）。
         let pending_esc = crate::escalate::has_pending();
         let pending_cmd = !crate::commands::pending().is_empty();
         if pending_esc || pending_cmd {
@@ -1077,9 +1055,7 @@ pub fn cycle(&mut self) -> CycleReport {
         };
         // ★ **复核 done 节点**：done 必须有证据。
         //   计划里的 status=done 可能来自 AI 直接写的计划（未经判据校验）。
-        //   实测本局：E1「地表换气」done 但可达上界只有 194（判据要 216）、
-        //   B1「床位」done 但 beds=0 → 依赖图以为"换气与床位都完成了"
-        //   → 再没有任何节点要求产氧 → 基地慢慢耗尽。
+        //   节点被误标 done 后，依赖图会以为该目标已完成 → 不再有节点去补这个缺口。
         //   每轮用同一套判据复核，不成立就打回 todo。
         {
             let bad = recheck_done_nodes(&self.cfg.plan_path, &snap);
@@ -1094,8 +1070,7 @@ pub fn cycle(&mut self) -> CycleReport {
         // ★ **开局规划素材**（快慢契约 §4：快系统采事实，慢系统做战略）：
         //   计划不是 AI 生的（模板/机械兜底）→ 采集本局世界事实
         //   （侦察 + 结构化 facts）写盘，供慢系统 LLM 生成开局战略。
-        //   旧实现：每局计划来自 plan.template.json（硬编码 playbook）
-        //   → 换一张地图（水世界/金属星）节点图就不适用（用户指出的设计缺陷）。
+        //   硬编码 playbook 换一张地图（水世界/金属星）节点图就不适用，所以节点结构必须由慢系统按本局事实生成。
         //   只采**事实**，节点结构由慢系统决定 —— 分工不变。
         if plan.author.as_deref() != Some("ai") {
             let brief_path = oni_mcp::save::save_file("opening_brief.json");
@@ -1128,7 +1103,7 @@ pub fn cycle(&mut self) -> CycleReport {
             ));
         }
         // 保命优先：空气告急 / 有人倒下 → 强制执行 survival_node（产氧/换气），
-        //   其它目标一律让位。这条是上一局"三个人"的直接教训。
+        //   其它目标一律让位。
         // 救援模式：有人倒地时，**普通施工必须让位**。
         let rescue_mode = judgment.danger_keys.iter().any(|k| k == "downed");
         let survival_mode = judgment.danger_keys.iter().any(|k| {
@@ -1138,8 +1113,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 || k.starts_with("population_dropped")
         });
         // ---- 实时优先级调度----
-        // 三次的共同根因：代理看不见"人"。调度器每轮按**当前真实状态**
-        // 算"最该做什么"，能**抢占**当前节点。
+        // 调度器看得见"人"（复制人实时状态）：每轮按**当前真实状态**算"最该做什么"，能**抢占**当前节点。
         let trend_now = compute(&load_samples(200), &snap);
         let directive = crate::priority::direct(
             &snap,
@@ -1181,11 +1155,10 @@ pub fn cycle(&mut self) -> CycleReport {
 
         // 救援模式优先于保命模式：有人倒地时，先救倒下的，再谈产氧/换气。
         // 实时调度优先：Level>=2（紧急/救命）时，**抢占**静态计划。
-        // ★ v3 阶段 1：**Urgent 不再在 plan 里做字符串匹配**（删除 19 处 tag.contains）。
-        //   为什么：意图到节点的翻译靠 `tag.contains("厕所")`，LLM 换个说法就断
-        //   （实测 T1 的 why 含"厕所"→ Urgent 建厕所误匹配到采建材节点 → 真正的
-        //   卫生节点永远轮不上）。v3 的分工：**安全壳反射弧**负责保命，
-        //   plan 只负责非紧急的战略推进，两者不再靠自然语言耦合。
+        // ★ v3：**Urgent 不在 plan 里做字符串匹配**。
+        //   为什么：意图到节点的翻译靠 `tag.contains("厕所")`，LLM 换个说法就断，或因 why 文案偶然含"厕所"
+        //   而误匹配到别的节点。v3 的分工：**安全壳反射弧**负责保命，
+        //   plan 只负责非紧急的战略推进，两者不靠自然语言耦合。
         //   唯一保留的 plan 抢占：LLM 显式标记的 `rescue` 节点（结构化字段，不是字符串）。
         let picked_by_scheduler = if directive.level >= crate::priority::Level::Urgent {
             if directive.forbid_expansion {
@@ -1243,7 +1216,7 @@ pub fn cycle(&mut self) -> CycleReport {
             }
             cur
         });
-        // Urgent 抢占到的是 done 节点（如 T1 建了 1 座厕所后 done，
+        // Urgent 抢占到的是 done 节点（如建了 1 座厕所后 done，
         //   但膀胱告急需要第 2/3 座）→ 必须把它写回 todo，否则 decide() 永远不会选它。
         if let Some(n) = &picked_by_scheduler {
             if n.is_done() {
@@ -1276,7 +1249,7 @@ pub fn cycle(&mut self) -> CycleReport {
             if !vital.is_empty() {
                 let out = execute(&self.session, &self.catalog, &vital);
                 // ★ 打印完整 detail：只打 "build:ok" 会掩盖"工单被接受但没落地"
-                //   （实测：旱厕 2×3 没空位，mod 接受工单却建不成 → 看着成功实际没进展）。
+                //   （mod 可能接受工单却建不成，如目标建筑没有空位 → 看着成功实际没进展）。
                 let detail = out.results.iter()
                     .map(|x| format!("{} → {}", x.kind, x.detail))
                     .collect::<Vec<_>>().join(" | ");
@@ -1289,7 +1262,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 ));
                 // ★ 反射弧**失败**时不独占本轮 → 让 plan 继续执行。
                 //   反射弧只会"下工单"，而工单能不能被复制人执行是另一回事
-                //   （实测：旱厕 2×3 要先腾空间，反射弧挖的那格复制人够不到 → 死单）。
+                //   （如目标建筑要先腾空间，而反射弧挖的那格复制人够不到 → 死单）。
                 //   真正的解法往往在 plan 里（挖空间/换方向）——
                 //   若这里 return，plan 节点每轮都被抢占 → 永远轮不上 → 死锁。
                 if out.ok {
@@ -1371,13 +1344,10 @@ pub fn cycle(&mut self) -> CycleReport {
         report.node = Some(node.id.clone());
 
         // 判据**先于动作**：目标已经达成就别再动手。
-        //   旧顺序（先执行、后判达标）有两个真实代价：
-        //   1) 判据在开局就已满足的节点会白执行一次动作；
-        //   2) 那个动作往往"没有对象可做" → 被判为失败 → 触发「动作失败→冻回暂停」
-        //      → 殖民地刚开局就停摆。
-        // 救援节点是**常驻能力**，不是可完成的里程碑 → 不能因判据达成就标 done。
-        //   R2 的判据 breath_min 98 在人健康时达成 → R2 被标 done
-        //   → 之后 Urgent 报「找不到匹配节点（动作 Rescue）」→ 紧急态被静默降级。
+        //   约束：先执行、后判达标的代价 —— 判据在开局就已满足的节点会白执行一次动作，
+        //   而那个动作往往"没有对象可做" → 被判为失败 → 触发「动作失败→冻回暂停」。
+        // 救援节点是**常驻能力**，不是可完成的里程碑 → 不能因判据达成就标 done
+        //   （判据在人健康时就会达成；标 done 后 Urgent 会报「找不到匹配节点（动作 Rescue）」→ 紧急态被静默降级）。
         if !node.rescue {
             if let Some(v) = node.success_obj() {
                 if let Some(true) = check_success(&snap, &v) {
@@ -1396,12 +1366,9 @@ pub fn cycle(&mut self) -> CycleReport {
             report.notes.push(format!("[{}] 没有动作定义（需要先规划该节点）", node.id));
             return report;
         }
-        // （）：**有人倒地时，本轮不许再施工**。
-        //   旧逻辑在救援模式下仍会执行保命节点（常常是「挖地表」）
-        //   施工继续把人送进毒气区，倒地的人没救成还多倒几个。
-        //   正解：救援模式下只做救援动作（mop / 搬人 / 建床），挖掘与建造一律让位。
-        //   但**保命节点必须放行**：2026-11-22 ，
-        //     上面那条「空气/产氧主线」恰恰就是救命的施工（挖上去就有新风），
+        // 约束：**有人倒地时，本轮不许再施工**（挖掘/建造会把人送进毒气区）。
+        //   救援模式下只做救援动作（mop / 搬人 / 建床），挖掘与建造一律让位。
+        //   但**保命节点必须放行**：「空气/产氧主线」恰恰就是救命的施工（挖上去就有新风），
         //     一旦被「有人倒地就停工」拦住，殖民地只能等死。
         let node_is_survival = plan.survival_node.as_deref() == Some(node.id.as_str());
         if rescue_mode
@@ -1426,8 +1393,7 @@ pub fn cycle(&mut self) -> CycleReport {
         report.acted = true;
 
         // ---- 统一卡住检测（单一真相来源）--------------------------
-        //   之前"卡住"的判定散落在七八个 if 里 → 漏一个就是致命缺口。
-        //   现在每轮跑一次 stuck::detect()，产出统一清单 → 全部升级给慢系统。
+        //   每轮跑一次 stuck::detect()，产出统一清单 → 全部升级给慢系统（判定不散落在调用方的分支里）。
         //   死工单计数取自挖掘结果回报的"已在位 N"（mod 的 dig 标记不进 pendingOrders）。
         {
             let dig_markers = out
@@ -1496,7 +1462,7 @@ pub fn cycle(&mut self) -> CycleReport {
                         "请慢系统决策：换目标 / 改计划 / 改代码 / 直接下精确工单".into(),
                         ctx,
                     );
-                    // P0-61 核心修复：策略类卡住的**节点必须暂缓**，
+                    // 约束：策略类卡住的**节点必须暂缓**，
                     //   否则下一轮 decide 又选它 → 又失败 → 又 escalate → 冻结空转（活锁根因）。
                     //   危险类（倒地/不可呼吸/人口下降/死锁）不 defer —— 那是全局态，defer 节点没用。
                     //   保命节点/救援节点永不 defer。
@@ -1522,9 +1488,7 @@ pub fn cycle(&mut self) -> CycleReport {
                         .collect::<Vec<_>>()
                         .join("；");
                     report.notes.push(format!("🆘 卡住检测：{}", confirmed_summary));
-                    // 二次修正：
-                    //   旧逻辑：stuck → 冻结世界 + 等慢系统 → 谁都不恢复 → 无限循环（已废除）。
-                    //   正解：**卡住时世界继续跑**（已有工单做完、膀胱/呼吸照常演化），
+                    // 约束：**卡住时世界继续跑**（已有工单做完、膀胱/呼吸照常演化），
                     //   只在本轮不下新工单 + 升级给慢系统（问题仍在清单里）。
                     //   冻结只留给：真红线紧急态占空比 / 主 agent 的 hold。
                     // ★ 契约：卡住只上报慢系统，不停手——世界继续跑，保命动作照常。
@@ -1551,8 +1515,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 self.space_failures = 0;
             }
             if self.space_failures >= 2 {
-                // 这条路径**不再自己升级/停手** ——
-                //   统一交给 stuck::detect，
+                // 这条路径不自己升级/停手 —— 统一交给 stuck::detect，
                 //   否则"前置未完成"这种正常状态会每轮都升级+冻结 → 噪声不断。
                 //   这里只保留计数，供 stuck::detect 参考。
                 self.space_failures = 0;
@@ -1561,15 +1524,14 @@ pub fn cycle(&mut self) -> CycleReport {
 
         // =====================================================================
         // 5) 执行**之后**再判空闲 → 没活才冻回暂停
-        //    顺序是硬要求：旧逻辑在执行前用"上一轮的 pending_orders"判空闲，
-        //      把"这一轮刚下的第一张工单"当成空闲 → 立刻冻回 → 工单永不执行。
+        //    顺序是硬要求：在执行前用"上一轮的 pending_orders"判空闲，会把"这一轮刚下的第一张工单"
+        //      当成空闲 → 立刻冻回 → 工单永不执行。
         // =====================================================================
         let work_now = issued_work(&out)
             || snap.pending_orders.unwrap_or(0) > 0
             || snap.under_construction > 0;
         // 只有**动作真的失败**才冻回。动作成功但没产生工单（如只读的侦察、
-        //   或节点已达标）不等于"卡住" → 继续下一轮换目标（否则开局第一轮就冻死，
-        // 新档：侦察成功 → 冻回 → 殖民地停摆直到人工再开窗）。
+        //   或节点已达标）不等于"卡住" → 继续下一轮换目标（否则开局第一轮侦察成功就冻回，殖民地停摆直到人工再开窗）。
         // 被研究锁的失败**不算**冻回理由：
         //   烤箱/电解器这类建筑造多少次都不会成功 → 冻回 → 殖民地停摆，
         //   而别的节点（产氧/换气）其实完全能做。
@@ -1582,7 +1544,7 @@ pub fn cycle(&mut self) -> CycleReport {
             //     走自持节律（冻 20s → 续窗重试），失败记 goal_outcomes +
             //     熔断计数驱动慢系统换目标。绝不能进"等人工介入"死锁——
             //     否则慢系统入队的 ai_goal 永远等不到窗口：快系统暂停只观察、
-            //     慢系统空转入队，两边互等（2026-11-24 实测死锁，世界冻死）。
+            //     慢系统空转入队，两边互等。
             //   无 → 真没活干 → 冻回等介入（不空烧周期）。
             let slow_pending = !crate::commands::ai_goals_pending().is_empty()
                 || crate::escalate::has_pending();
@@ -1649,16 +1611,14 @@ pub fn cycle(&mut self) -> CycleReport {
                     } else if !snap.anyone_on_duty() {
                         // ★ 没人在工作日程（全员睡觉/娱乐）→ 判据没达成是正常的，不计 stall。
                         //   和"世界不跑 ⇒ 不计进展"（§7.1）同一条规则：世界在跑但没人上班也一样。
-                        //   旧逻辑每 10s 计一轮，一觉下来在途节点全部"让位"→ 醒来全在冷却 → 窗口枷锁。
                         report.notes.push(format!(
                             "[{}] 判据未达成，但全员不在工作时段 → 不计 stall，等开工",
                             node.id
                         ));
                     } else {
                         // ★ 连续没达成 → 累加 stall：
-                        //   达到 decide::STALL_LIMIT 就把这个节点让给别人。
-                        //   旧逻辑只写 note 就继续选它 → 一个"每轮都能做点什么"
-                        //   的节点会**永久霸占**执行位 → 其它节点（供电）0 次被选中。
+                        //   达到 decide::STALL_LIMIT 就把这个节点让给别人
+                        //   （否则一个"每轮都能做点什么"的节点会**永久霸占**执行位 → 其它节点 0 次被选中）。
                         let stall = node.stall.unwrap_or(0) + 1;
                         mark_node_stall(&self.cfg.plan_path, &node.id, stall);
                         report.notes.push(format!(
@@ -1672,17 +1632,15 @@ pub fn cycle(&mut self) -> CycleReport {
 
         // =====================================================================
         // 6) 进展指纹 / 无进展熔断
-        //    只统计**世界真的跑过**的轮次（）：
+        //    只统计**世界真的跑过**的轮次：
         //      冻结期的指纹必然不变 —— 那不是"卡住"，是"世界没动"。
         //    有活排队时也不算卡住（复制人可能在睡觉，工单是好的）。
         // =====================================================================
         let fp = snap.progress_fingerprint();
         if world_advanced {
             // busy 也要算上「本轮自己刚下的工单」：
-            //   mod 的工单在 step_facts 里看不见
-            //   只看它 → 复制人正在挖的那 3~6 轮里指纹不变 → 连续 3 轮 → **误熔断好节点**
-            //   。
-            //   有活排队 = 不是卡住 = 不计入零进展。
+            //   mod 的工单在 step_facts 里看不见 → 只看它，复制人正在挖的那几轮里指纹不变
+            //   → 连续 3 轮 → **误熔断好节点**。有活排队 = 不是卡住 = 不计入零进展。
             let busy = snap.pending_orders.unwrap_or(0) > 0
                 || snap.under_construction > 0
                 || issued_work(&out);
@@ -1708,7 +1666,7 @@ pub fn cycle(&mut self) -> CycleReport {
             // 冷却：从暂缓那一刻起，至少隔 N **代理轮次**才允许恢复。
             // 必须用代理自己的轮次（self.cycles），不能用游戏 cycle：
             //   游戏周期很长，用 cycle 会让冷却永远不结束
-            //   → 所有节点都被暂缓 → "依赖图里没有可执行目标"（）。
+            //   → 所有节点都被暂缓 → "依赖图里没有可执行目标"。
             if let Some(at) = n.deferred_at {
                 if self.cycles.saturating_sub(at) < Self::DEFER_COOLDOWN {
                     continue;
@@ -1737,8 +1695,8 @@ pub fn cycle(&mut self) -> CycleReport {
         }
 
         // 动作**明确失败**的计数：
-        //   建造类失败（找不到落点 / 材料不足 / 被研究锁）会让代理**无限重试**同一个节点：
-        //   第二个厕所连撞 8 次 → 每轮冻回 → 殖民地反复停摆，而别的节点其实能做。
+        //   建造类失败（找不到落点 / 材料不足 / 被研究锁）会让代理**无限重试**同一个节点
+        //   → 每轮冻回 → 殖民地反复停摆，而别的节点其实能做。
         //   为什么不能靠 no_progress 熔断兜底：失败后代理会冻回暂停
         //     世界没跑 → 指纹没变 → 但"没跑"被排除在熔断计数外 → 永不熔断。
         //   正解：动作**明确失败**单独计数，连续 N 次 → 暂缓该节点（deferred），
@@ -1753,8 +1711,7 @@ pub fn cycle(&mut self) -> CycleReport {
         //   这是"策略在代码里可调"的最小闭环：慢系统不必每次都出手，
         //   快系统先按策略自己放宽一档；仍不行再上报慢系统。
         //   ★ 绝不自动放宽 **CO₂ 阈值**：那是保命判据（人要待在那儿）。
-        //     实测自动把 CO₂ 上限从 2.5 放宽到 8kg/格 → 厕所建在 CO₂ 里 →
-        //     复制人如厕时呼吸掉到 66 → 触发一串假紧急态 → 慢系统反复暂停游戏。
+        //     放宽后厕所会建在 CO₂ 里 → 复制人如厕时呼吸下降 → 触发一串假紧急态 → 慢系统反复暂停游戏。
         //     "放宽"应该是扩大候选集，不是放松安全线；安全线只能由慢系统显式调。
         {
             let mut pol = oni_world::preflight::site_policy();
@@ -1773,8 +1730,7 @@ pub fn cycle(&mut self) -> CycleReport {
         }
 
         // ---- ★ 动作级循环检测（"循环即升级"）----
-        //   节点级计数看不见"代理在同一格上反复下同样的工单"（实测厕所：每轮挖
-        //   (115,194)，而那格早已挖开 → 无限循环，厕所永远建不成）。
+        //   节点级计数看不见"代理在同一格上反复下同样的工单"（如对早已挖开的格子重复下挖单 → 无限循环）。
         //   这里按**动作指纹**（kind@坐标）计账：同一指纹连续出现 N 次 →
         //   判定执行层循环 → ① 上报慢系统（带指纹/次数/失败类别/现场事实）
         //   ② 暂缓该节点（下一轮不再选它）→ 慢系统换方案，而不是继续硬试。
@@ -1827,11 +1783,9 @@ pub fn cycle(&mut self) -> CycleReport {
         if self.action_failures >= Self::ACTION_FAIL_MAX && !research_locked {
             let is_survival = plan.survival_node.as_deref() == Some(node.id.as_str());
             if is_survival {
-                // 快慢分工修正：保命节点失败**不再无限重试**。
-                //   旧行为：重置失败计数 → 下一轮再试 → 无限循环、白烧周期。
-                //   新行为：**喊慢系统**（escalation）+ 停手等它改计划。
+                // 快慢分工：保命节点失败**不无限重试** —— **喊慢系统**（escalation）+ 暂缓等它改计划。
                 //   慢系统拿到信息后要么改目标、要么改代码、要么换策略族 ——
-                //   这才是「AI 参与规划」的落点，而不是让快系统自己猜。
+                //   这是「AI 参与规划」的落点，而不是让快系统自己猜。
                 self.survival_failures += 1;
                 let ctx = crate::escalate::Ctx {
                     cycle: snap.cycle,
@@ -1858,12 +1812,11 @@ pub fn cycle(&mut self) -> CycleReport {
                 );
                 self.action_failures = 0;
                 // ★ 保命节点连续失败 → **暂缓**（deferred），不只"本轮停手"。
-                //   旧行为：只 return 本轮 → 下一轮 decide() 又选中同一个保命节点
-                //   → 又失败 → 又冻回 → **无限乒乓**（实测 T5/oxygen 物理上不可成功：
-                //     零氧石、零电、零藻类 → 每轮必然失败 → 游戏永远停着）。
-                //   正解：**暂缓**让快系统去执行别的目标、给慢系统换方向的空间；
-                //   deferred 有冷却期，条件变化后可自动恢复（ unlike 熔断=永久自杀）。
-                //   ★ 保命节点**禁熔断**的规则不变（不写 circuit_breaks 永久记录）。
+                //   只 return 本轮 → 下一轮 decide() 又选中同一个保命节点 → 又失败 → 又冻回 → **无限乒乓**
+                //   （目标物理上不可成功时每轮必然失败）。
+                //   **暂缓**让快系统去执行别的目标、给慢系统换方向的空间；
+                //   deferred 有冷却期，条件变化后可自动恢复（熔断则是永久的）。
+                //   ★ 保命节点**禁熔断**：不写 circuit_breaks 永久记录。
                 mark_node_deferred(
                     &self.cfg.plan_path,
                     &node.id,
@@ -1893,7 +1846,7 @@ pub fn cycle(&mut self) -> CycleReport {
 
         if self.no_progress >= 3 {
             // 保命节点（产氧/换气）**永不熔断**：它没有替代方案，
-            //   熔断它 = 整张依赖图停摆 + colony 窒息（真事故）。
+            //   熔断它 = 整张依赖图停摆 + colony 窒息。
             let is_survival = plan.survival_node.as_deref() == Some(node.id.as_str());
             if is_survival {
                 mark_node_todo(&self.cfg.plan_path, &node.id);
@@ -1976,7 +1929,7 @@ pub fn cycle(&mut self) -> CycleReport {
         // ---- 空跑即停：没有人干活就立刻冻回，不烧周期 ----
         // 空跑 = 没人干活 **且** 没有待办工单。
         // 用 truly_idle_count（排除休息/睡觉的人）：
-        //   全员睡觉 ≠ 无人干活（醒来就会做）→ 用旧判据会在他们睡觉时误停机。
+        //   全员睡觉 ≠ 无人干活（醒来就会做），否则会在他们睡觉时误停机。
         let all_idle = !snap.dupes.is_empty()
             && snap.truly_idle_count() == snap.dupes.len()
             && snap.pending_orders.unwrap_or(0) == 0
@@ -1984,7 +1937,7 @@ pub fn cycle(&mut self) -> CycleReport {
             && snap.under_construction == 0
             // 本轮**自己**是否刚制造了活（工单/蓝图/梯子）。
             //   mod 的工单在 step_facts 里看不见 → 只看 pending_orders 会误判空跑
-            //   → 代理冻回暂停 → 那些工单永远不会被执行（ 的第五个坑）。
+            //   → 代理冻回暂停 → 那些工单永远不会被执行。
             && !issued_work(&out);
         // 只有**游戏在跑**的时候才累计空跑轮数。
         if all_idle && !snap.paused {
@@ -1993,8 +1946,8 @@ pub fn cycle(&mut self) -> CycleReport {
             // A: 暂停期保留账本（hook 暂冻世界不清零，避免观测窗口错配）
             self.idle_streak = 0;
         }
-        // ★ 去掉 window_owned_by_us 门槛：用户恢复的世界里全员空跑同样要上报，
-        //   否则"用户按空格开局后代理一直闲置"永远不触发 AI 规划（实测卡住感）。
+        // ★ 不设 window_owned_by_us 门槛：用户恢复的世界里全员空跑同样要上报，
+        //   否则"用户按空格开局后代理一直闲置"不会触发 AI 规划。
         if self.idle_streak >= 2 && !snap.paused {
             // Idle may mean "plan done" or "goals exist but nobody executes".
             // The fast system cannot judge which - freeze and escalate to AI.
@@ -2013,9 +1966,7 @@ pub fn cycle(&mut self) -> CycleReport {
                 crate::escalate::Ctx { cycle: snap.cycle, dupes: snap.dupes.len(),
                     oxygen_kg: snap.oxygen_kg(), food_kcal: snap.food_kcal(), ..Default::default() },
             );
-            // 文案纠正：这里**没有冻结世界**（只是上报慢系统）——
-            //   旧文案写"冻结并上报 AI"，与实际行为不符，
-            //   读日志的人会以为世界被冻住（本次排查就被它误导过）。
+            // 这里**没有冻结世界**（只是上报慢系统）。
             report.notes.push(format!("⏸ 全员空闲 → 上报 AI（世界继续跑）：{detail}"));
 
         }
@@ -2027,10 +1978,9 @@ pub fn cycle(&mut self) -> CycleReport {
 /// 这次执行有没有**真的制造出活**（工单 / 蓝图 / 梯子 / 擦除单）。
 ///
 /// 为什么需要：
-///   mod 下发的挖掘工单**不出现在 step_facts 的 remainingTrackedOrders 里**
-///   。
+///   mod 下发的挖掘工单**不出现在 step_facts 的 remainingTrackedOrders 里**。
 ///   只看 pending_orders → 把"有活排队"误判成"全员空跑"→ 代理冻回暂停
-///   → 那 5 张工单永远不会被执行 → 殖民地看起来"在跑"其实零进展。
+///   → 那些工单永远不会被执行 → 殖民地看起来"在跑"其实零进展。
 pub fn issued_work(out: &crate::exec::ExecOutcome) -> bool {
     out.results.iter().any(|r| {
         r.ok && (r.detail.contains("新标记")
@@ -2102,7 +2052,7 @@ pub struct CycleReport {
 /// 食物还能撑几个周期。
 ///
 /// 为什么要有这个：绝对 kcal 判据在**开局就满足**
-///   → 节点在 t=0 直接 done → 代理永远不会去采食物（）。
+///   → 节点在 t=0 直接 done → 代理永远不会去采食物。
 ///   续航判据反映的是"还能撑多久"，开局必然不达标。
 pub fn food_runway_cycles(food_kcal: f64, dupes: usize) -> f64 {
     food_kcal / (dupes.max(1) as f64 * crate::judge::KCAL_PER_DUPE_CYCLE)
@@ -2111,18 +2061,14 @@ pub fn food_runway_cycles(food_kcal: f64, dupes: usize) -> f64 {
 /// ★ 从判据 JSON 里取阈值，**兼容 LLM 常用的多种字段名**。
 ///
 /// 为什么需要：开局规划由 LLM 生成判据，而 prompt 不可能穷举每种 kind 的字段格式，
-///   LLM 只能"照相邻例子猜"——实测它把 `loose_min` 写成 `{key:"SandStone", n:50}`，
-///   而代码只认 `{element, kg}` → `v.get("element")?` 返回 None → 判据**永远无法判定**
-///   → 节点永远不算 done → 反复执行 → 零进展 → 被熔断 → 下游节点前置断链
-///   （实测 T1「采建材」砂岩 7507kg 已满足 n=50，却被熔断，连带锁死 T2「建厕所」）。
+///   LLM 只能"照相邻例子猜"（如把 `loose_min` 写成 `{key:"SandStone", n:50}` 而非规范的 `{element, kg}`）；
+///   不做别名容错的话判据**永远无法判定** → 节点永远不算 done → 反复执行 → 零进展 → 被熔断 → 下游节点前置断链。
 ///   这里做**别名容错**：猜错也能工作，把 LLM 的自由发挥变成可容忍的噪声。
 /// 动作的**语义身份**（用于节点匹配）：只含目标词，不含解释文案。
 ///
 /// ★ 为什么不能直接用 `{:?}`（Action 的 Debug）：Debug 会把 `why` 一起打出来，
-///   而 `why` 是给人和 LLM 看的**解释文本**，里面的词是偶然的 ——
-///   实测节点 T1「浅层建材自举」的 why 写了"厕所、梯子、砖块都需要建材"，
-///   于是 Urgent「建厕所」把 T1（采建材）当成了卫生节点 → 真正该跑的
-///   T2「卫生前置：三人厕所」永远轮不上。
+///   而 `why` 是给人和 LLM 看的**解释文本**，里面的词是偶然的（如采建材节点的 why 提到"厕所"）
+///   → Urgent「建厕所」会把它误当成卫生节点，真正该跑的卫生节点永远轮不上。
 pub fn action_identity(a: &crate::exec::Action) -> String {
     use crate::exec::Action;
     match a {
@@ -2171,8 +2117,8 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
     match kind {
         "building_min" => {
             let key = crit_str(v, &["key", "building", "name"])?;
-            // ★ 键名归一化：LLM 写 "toilet"，传感器报 "toilets"（实测差一个 s → 判据永不满足
-            //   → W2 反复建第二座厕所）。只在传感器**实际报出**的键集合里做大小写/单复数对齐。
+            // ★ 键名归一化：LLM 写 "toilet"，传感器报 "toilets"（差一个 s 会让判据永不满足 → 反复建厕所）。
+            //   只在传感器**实际报出**的键集合里做大小写/单复数对齐。
             let key = resolve_building_key(snap, key);
             Some(snap.building(&key) as i64 >= crit_num(v, &["n", "count", "min", "target"], 1.0) as i64)
         }
@@ -2190,15 +2136,13 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
             Some(total >= kg)
         }
         // 必须读 **summary 子对象**：电力字段全在 summary 里，
-        //   读顶层永远拿不到 → 这个判据一直是假的。
+        //   读顶层永远拿不到 → 判据永远为假。
         "power_operational" => Some(snap.power_int("generatorOperational") > 0),
         "oxygen_min" => Some(snap.oxygen_kg() >= crit_num(v, &["kg", "n", "min", "target"], 0.0)),
         // ★ **产氧设备在运转**（不是"造出来了"）。
-        //   实测本局铁证：氧气扩散器建成了（制氧1），但
-        //   power/summary 显示 generatorCount=0、consumerOperational=0、
-        //   netActiveWatts=-120 → **设备通电量为 0、根本没在产氧**，
+        //   判据只看建筑数量（prefab_min）会把"造出来但不运转"当成完成：
+        //   有产氧建筑但 generatorOperational=0 / consumerOperational=0 → **设备没通电、根本没在产氧**，
         //   而基地氧气照常被消耗 → 慢慢耗尽。
-        //   判据只看建筑数量（prefab_min）会把"造出来但不运转"当成完成。
         "oxygen_producing" => {
             let producers = snap.building("oxygenProducers");
             let powered = snap.power_int("consumerOperational") > 0;
@@ -2255,7 +2199,7 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
         // 多材料同时达标（资源循环必须成套）：
         //   `elements` 是 [[元素ID, 最小kg], ...] —— 全部满足才算达成。
         //   为什么不分开判：只判"煤"会让"发电机"节点提前放行，
-        //   但铜矿还没挖到 → 建造必失败 → 循环卡死（）。
+        //   但铜矿还没挖到 → 建造必失败 → 循环卡死。
         "loose_multi_min" => {
             let pairs = v.get("elements").or_else(|| v.get("pairs"))?.as_array();
             let Some(pairs) = pairs else { return None; };
@@ -2312,8 +2256,7 @@ pub fn check_success(snap: &Snapshot, v: &Value) -> Option<bool> {
 /// ★ 这是"保命被改成执行注定失败的前置"的判据。
 ///   紧急抢占会沿 requires 回溯到未完成的前置；但若该前置已被熔断或暂缓，
 ///   依赖链走不通 —— 此时保命**不能等它**，必须改走内置反射弧。
-///   实测：T2「卫生前置：三人厕所」requires T1「采建材」；T1 熔断后，
-///   Urgent 建厕所变成"执行 T1" → 厕所永远建不成 → 膀胱爆表。
+///   （否则 Urgent 建厕所会变成"执行已被熔断的采建材前置" → 厕所永远建不成）。
 pub fn has_unexecutable_predecessor(node: &crate::decide::Node, plan: &[crate::decide::Node]) -> bool {
     node.requires.iter().any(|r| {
         plan.iter()
@@ -2414,14 +2357,10 @@ pub fn mark_node_deferred(plan_path: &str, id: &str, reason: &str, cycle: u64) {
 
 /// 记录节点「连续未达成判据」的轮数（stall 计数）。
 ///
-/// ★ 为什么需要（实测事故）：
-///   依赖图按 (priority, unlocks 数, 文件顺序) 选节点，
-///   一个"解锁下游多"的节点（AIR unlocks=5）只要每轮都能"做点什么"
-///   （下了一格挖掘工单）就**永远压住**解锁数少的节点（P1 供电 unlocks=3）。
-///   实测本局 P1 被选中 **0 次**（AIR 166 次 / T1 139 次）→
-///   供电节点从没跑 → 氧气扩散器建成了但**没有电**（净 -120W、consumerOperational=0）
-///   → 造出来 ≠ 在产氧 → 基地耗尽。
-///   正解：连续没达成的节点计数累加，超限就让位（见 decide::STALL_LIMIT）。
+/// ★ 为什么需要：依赖图按 (priority, unlocks 数, 文件顺序) 选节点，
+///   一个"解锁下游多"的节点只要每轮都能"做点什么"（下了一格挖掘工单）就**永远压住**解锁数少的节点
+///   （如供电节点从没被选中 → 产氧设备建成了但**没有电** → 造出来 ≠ 在产氧）。
+///   连续没达成的节点计数累加，超限就让位（见 decide::STALL_LIMIT）。
 pub fn mark_node_stall(plan_path: &str, id: &str, stall: u64) {
     let Ok(text) = std::fs::read_to_string(plan_path) else { return; };
     let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return; };
@@ -2444,15 +2383,9 @@ pub fn clear_node_stall(plan_path: &str, id: &str) {
 
 /// **复核已 done 的节点**：判据现在不成立 → 打回 todo。
 ///
-/// ★ 为什么必须有（实测本局两个铁证）：
-///   1) E1「地表换气（无限空气，替代被锁的电解器）」status=done，
-///      判据 surface_open(minY=216)，而实际可达上界只有 194 → **从来没通过过**；
-///   2) B1「床位」status=done，判据 building_min(beds>=2)，
-///      而 diagnostics.buildings.beds = 0 → **也是假的**。
-///   也就是说：plan 里的 status=done 可以**未经任何校验**就存在（AI 写的计划自带）。
-///   快系统信任它 → 依赖图认为"换气已完成、氧气有着落"
-///   → **再没有任何节点要求产氧** → 基地慢慢耗尽。
-///   正解：done 必须有**证据**。每轮用同一套判据复核，不成立就打回。
+/// ★ 为什么必须有：plan 里的 status=done 可以**未经任何校验**就存在（AI 写的计划自带）。
+///   快系统信任它 → 依赖图认为目标已完成 → **再没有任何节点去补这个缺口**。
+///   约束：done 必须有**证据**。每轮用同一套判据复核，不成立就打回。
 pub fn recheck_done_nodes(plan_path: &str, snap: &crate::sense::Snapshot) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(plan_path) else { return Vec::new(); };
     let Ok(v) = serde_json::from_str::<Value>(&text) else { return Vec::new(); };
@@ -2499,10 +2432,9 @@ pub fn mark_node_done(plan_path: &str, id: &str) {
     if let Some(nodes) = v.get_mut("nodes").and_then(|n| n.as_array_mut()) {
         for n in nodes.iter_mut() {
             if n.get("id").and_then(|i| i.as_str()) == Some(id) {
-                // 救援节点是**常驻能力**，不是可完成的里程碑 → 永不标 done。
-                //   R2 的判据 breath_min 98 在人健康时达成
-                //   被标 done → 之后 Urgent 报「找不到匹配节点（动作 Rescue）」
-                //   → 紧急态被静默降级。在这一处拦截即可覆盖所有调用点。
+                // 救援节点是**常驻能力**，不是可完成的里程碑 → 永不标 done
+                //   （判据在人健康时就会达成；标 done 后 Urgent 会报「找不到匹配节点（动作 Rescue）」
+                //   → 紧急态被静默降级）。在这一处拦截即可覆盖所有调用点。
                 if n.get("rescue").and_then(|r| r.as_bool()) == Some(true) {
                     continue;
                 }
@@ -2515,11 +2447,9 @@ pub fn mark_node_done(plan_path: &str, id: &str) {
 
 #[cfg(test)]
 mod tests {
-/// ★ **done 必须有证据**：判据现在不成立的 done 节点要被打回 todo。
+    /// ★ **done 必须有证据**：判据现在不成立的 done 节点要被打回 todo。
     ///
-    /// 实测本局铁证：E1「地表换气」done 但可达上界只有 194（判据要 216）、
-    /// B1「床位」done 但 beds=0 → 依赖图以为"换气与床位都完成"
-    /// → 再没有节点要求产氧 → 基地慢慢耗尽。
+    /// plan 里的 status=done 可能未经判据校验（AI 写的计划自带）；信任它会让依赖图以为目标已完成。
     #[test]
     fn done_node_with_failing_criterion_is_reopened() {
         let tmp = std::env::temp_dir().join(format!("oni_recheck_{}.json", std::process::id()));
@@ -2543,9 +2473,9 @@ mod tests {
     }
 
     /// ★ 回归：保命动作**不能被改成执行注定失败的前置**。
-    ///   场景：T2「卫生前置：三人厕所」requires T1「采建材」，T1 被熔断（blocked）。
-    ///   旧行为：紧急抢占沿 requires 回溯 → 执行 T1 → 零进展 → 厕所永远建不成 → 膀胱爆表。
-    ///   正解：识别出前置不可执行 → 改走内置保命反射弧（不依赖 plan 依赖图）。
+    ///   场景：「建厕所」requires「采建材」，而「采建材」被熔断（blocked）。
+    ///   约束：识别出前置不可执行 → 改走内置保命反射弧（不依赖 plan 依赖图），
+    ///   否则紧急抢占沿 requires 回溯去执行已熔断的前置 → 零进展 → 厕所永远建不成。
     #[test]
     fn unexecutable_predecessor_blocks_urgent_from_waiting_on_it() {
         use crate::decide::Node;
@@ -2610,9 +2540,9 @@ mod tests {
     }
 
     /// ★ 回归：判据字段别名容错 —— LLM 猜错字段名也不能让判据失效。
-    ///   实测事故：LLM 把 `loose_min` 写成 `{key:"SandStone", n:50}`（照 building_min 的例子猜），
-    ///   而代码只认 `{element, kg}` → 判据永远返回 None → 节点永远不算 done →
-    ///   零进展 → 被熔断 → 下游「建厕所」节点前置断链 → 膀胱爆表。
+    ///   LLM 会把 `loose_min` 写成 `{key:"SandStone", n:50}`（照 building_min 的例子猜）；
+    ///   若代码只认 `{element, kg}` → 判据永远返回 None → 节点永远不算 done →
+    ///   零进展 → 被熔断 → 下游节点前置断链。
     #[test]
     fn success_check_accepts_alias_field_names() {
         use crate::sense::Snapshot;
@@ -2653,9 +2583,8 @@ mod tests {
     }
 
     /// ★ 回归：节点匹配的 tag **不能包含动作的 why 文案**。
-    ///   实测事故：T1「浅层建材自举」的 why 写了"厕所、梯子、砖块都需要建材"，
-    ///   Urgent「建厕所」因此把 T1（采建材）当成卫生节点 → 每轮复活它、
-    ///   真正该跑的 T2「卫生前置：三人厕所」永远轮不上。
+    ///   采建材节点的 why 可能写了"厕所、梯子、砖块都需要建材"：Urgent「建厕所」会因此把采建材节点
+    ///   当成卫生节点 → 真正该跑的卫生节点永远轮不上。
     #[test]
     fn action_identity_excludes_why_text() {
         use crate::exec::Action;
@@ -2757,8 +2686,8 @@ mod tests {
                 success_check: None, success: String::new(), rescue: false, note: String::new(),
                 priority: None, deferred: None, deferred_at: None, stall: None,
         };
-        // ★ 关键：W1 的 goal 是 expand（LLM 把厕所写成"腾空间"），旧的字符串匹配会漏判；
-        //   新判据只看"能推进"——照样让规划器走。
+        // ★ 关键：W1 的 goal 是 expand（LLM 把厕所写成"腾空间"），字符串匹配会漏判；
+        //   判据只看"能推进"——照样让规划器走。
         let w1_expand = mk("W1", "todo", vec![], "expand");
         assert!(super::planner_takes_urgent(&[w1_expand.clone()], Level::Urgent),
             "Urgent（分钟级）且规划器可推进 → 让规划器走，不管它 goal 写的是什么");
@@ -2792,6 +2721,17 @@ mod tests {
     }
 
     /// hold 标记：存在时守护进程只观察，不自动恢复。
+    /// 回滚检测必须每轮生效且只在真的不连续时触发：
+    ///   正常 +1 / 首轮不算；读档（回退 ≥2）和手动快进（跳跃 ≥2）才算。
+    #[test]
+    fn cycle_discontinuity_only_on_jump_or_rollback() {
+        assert_eq!(cycle_discontinuity(0, 5), None, "首轮没有基线");
+        assert_eq!(cycle_discontinuity(3, 4), None, "正常跨周期 +1");
+        assert_eq!(cycle_discontinuity(4, 3), None, "退 1 不算");
+        assert_eq!(cycle_discontinuity(5, 2), Some((5, "回退/读档")));
+        assert_eq!(cycle_discontinuity(2, 15), Some((2, "跳跃/手动快进")));
+    }
+
     #[test]
     fn hold_roundtrip() {
         isolate_state_dir();
@@ -2806,7 +2746,7 @@ mod tests {
     }
 
     /// LLM 写 "toilet"、传感器报 "toilets" → 判据必须按真实键求值，而不是永远 false。
-    ///   实测：差一个 s → W2 建厕所永不 done → 反复建第二座。
+    ///   差一个 s → 判据永不满足 → 反复建厕所。
     #[test]
     fn building_min_key_normalizes_singular_plural() {
         let mut snap = Snapshot::default();
@@ -2819,14 +2759,13 @@ mod tests {
     }
 
     /// 食物判据必须是"续航"而不是绝对值。
-    /// 绝对 kcal 在新档开局就满足 → 节点秒 done → 代理永远不采食物（）。
+    /// 绝对 kcal 在新档开局就满足 → 节点秒 done → 代理永远不采食物。
     #[test]
     fn food_runway_not_satisfied_at_start() {
         let food = 16000.0;
         let dupes = 3;
         let cycles = food_runway_cycles(food, dupes);
-        // 修正：ONI 官方 400 kcal/人/周期。
-        //   16000 ÷ 3 ÷ 400 ≈ 13.3 周期 —— 开局粮食充裕，断粮不是红线。
+        // ONI 机制：400 kcal/人/周期 → 16000 ÷ 3 ÷ 400 ≈ 13.3 周期。
         assert!((cycles - 13.33).abs() < 0.1, "开局续航应约 13.3 周期，实际 {cycles}");
         assert!(food_runway_cycles(30000.0, dupes) > cycles);
         assert!(food_runway_cycles(16000.0, 6) < cycles);

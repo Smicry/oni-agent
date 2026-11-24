@@ -13,7 +13,7 @@ pub struct McpSession {
     ///
     /// 写入类调用（call_tool）会自动清空缓存 —— 状态变了，旧快照就是错的。
     cache: SnapshotCache,
-    /// ★ singleflight：同 URI 的并发读合并成一次（MCP 请求按 uri 合并，见 transport 说明）。
+    /// singleflight：同 URI 的并发读合并成一次（MCP 请求按 uri 合并，见 transport 说明）。
     ///
     /// 为什么需要：cell 事实被快系统多个阶段反复读、且快慢两线程会同时读同一格
     ///   → 几百个重复 HTTP 请求 → mod 端点排队 → 60s 超时 → 周期空窗。
@@ -36,7 +36,7 @@ impl McpSession {
         )?;
         t.notify("notifications/initialized", None);
         let cache = SnapshotCache::default();
-        // ★ 关键状态走**秒级新鲜度**（事件驱动查询融进 singleflight）：
+        // 关键状态走秒级新鲜度（事件驱动查询融进 singleflight）：
         //   世界运行/暂停是"判定世界在不在跑"的唯一依据，拿过期值会让代理
         //   在游戏已停时继续下工单 → 工单永不执行 → 判零进展 → 误熔断好节点。
         //   不绕过缓存（那会打爆 mod 端点），而是把这条 URI 的 TTL 调到 1s：
@@ -53,18 +53,18 @@ impl McpSession {
 
     pub fn read_resource(&self, uri: &str) -> Result<Value, McpError> {
         // 快照复用：同一 URI 在 TTL 内只打一次 MCP。
-        //   守护进程每轮读 11 个观察源，主 agent 的查询也在读同样的源 ——
+        //   守护进程每轮读全部观察源，主 agent 的查询也在读同样的源 ——
         //   没有缓存时同一份数据在几秒内被反复拉取，既浪费又给 mod 端点加压。
         if let Some(v) = self.cache.get(uri) {
             if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
                 return Ok(parsed);
             }
         }
-        // ★ singleflight：同 URI 的**并发**读合并成一次请求，其余线程等共享结果。
+        // singleflight：同 URI 的并发读合并成一次请求，其余线程等共享结果。
         //   为什么需要：cell 事实（元素/质量/建筑/标记）被快系统多个阶段反复读
         //   （danger_cells / deadly_below_cells / 建筑安全复核 / 实时复核），
         //   快慢两线程还会同时读同一格 → 几百个重复 HTTP 请求 → mod 端点排队
-        //   → 60s 超时 → 周期空窗 89 秒（实测多次）。
+        //   → 60s 超时 → 周期空窗。
         //   合并后同一时刻每个 URI 只打一次，其余线程直接拿结果。
         {
             let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
@@ -91,10 +91,7 @@ impl McpSession {
                     *guard = Some(result.as_ref().map_err(|e| e.to_string()).cloned());
                     cv.notify_all();
                     drop(guard);
-                    // ★ 槽位**必须移除**：singleflight 只合并"并发"读。
-                    //   旧实现留着不删 → 下一次缓存过期的读者 map.get(uri)=Some → 走 waiter
-                    //   分支 → 拿到槽里**第一次**的结果 → 该 URI 永远不会再有新 leader
-                    //   （旧注释说"缓存过期后自然会有新的 leader"，但代码做不到）。
+                    // 槽位必须移除：singleflight 只合并并发读，留着的已完成槽位会让后续读返回第一次的结果。
                     //   等待者持有的是 Arc 克隆：先写结果+唤醒、再移除 map 条目，它们照常拿到结果。
                     self.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(uri);
                     let v = result?;
@@ -114,9 +111,8 @@ impl McpSession {
                 let (g, _t) = cv.wait_timeout(guard, remain).unwrap_or_else(|e| e.into_inner());
                 guard = g;
             }
-            // ★ 用 as_ref().clone() 而**不是 take()**：结果要被所有等待者共享读取，
-            //   take() 只能取一次 → 第二个等待者永远等不到（死锁：快系统线程卡死，
-            //   实测表现为"游戏十分钟没进展"）。
+            // 用 as_ref().clone() 而不是 take()：结果要被所有等待者共享读取，
+            //   take() 只能取一次 → 第二个等待者永远等不到（快系统线程死锁）。
             match guard.as_ref().cloned() {
                 Some(Ok(v)) => Ok(v),
                 Some(Err(e)) => Err(McpError::Http(e)),
@@ -220,9 +216,8 @@ mod tests {
         (format!("http://{addr}/mcp/"), h)
     }
 
-    /// singleflight 只合并**并发**读：缓存过期后的第二次读必须真的再打到端点。
-    ///   旧实现 leader 完成后槽位不删 → 第二次读走 waiter 分支拿到第一次的结果
-    ///   → 该 URI 在这个 session 里永久冻结（serve 实测：diagnostics 25 分钟不更新）。
+    /// singleflight 只合并并发读：缓存过期后的第二次读必须真的再打到端点。
+    ///   已完成的槽位若不移除，第二次读会走 waiter 分支拿到第一次的结果，该 URI 永久冻结。
     #[test]
     fn second_read_after_cache_expiry_hits_the_endpoint() {
         std::env::set_var("ONI_MAX_CONCURRENT", "16");

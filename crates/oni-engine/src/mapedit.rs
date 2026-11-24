@@ -14,10 +14,9 @@ pub const WILDCARD: &str = ".*";
 
 /// 生成建造 token。
 ///
-/// 关键：material 为空时**绝不能**留下 `Prefab:7#` 的悬空 `#`。
-/// `Ladder` 的 `availableMaterials` 是空数组 → 旧代码拼出 `Ladder:7#SandStone`，
-/// mod 报 `Unsupported map cell transitions ... x->Ladder:7#`（材料不在白名单 +
-/// 悬空 `#`）→ 梯子永远铺不下去 → 竖井挖不动。**空材料必须省略整个 `#` 段**。
+/// 约束：material 为空时省略整个 `#` 段，不能留下 `Prefab:7#` 的悬空 `#`。
+/// `Ladder` 的 `availableMaterials` 是空数组；材料不在白名单或 `#` 悬空时
+/// mod 报 `Unsupported map cell transitions`。
 pub fn build_token(prefab: &str, material: &str) -> String {
     if material.is_empty() {
         format!("{prefab}:7")
@@ -160,8 +159,7 @@ pub fn apply_build(
         )
         .map_err(|e| e.to_string())?;
     // 判定成功的依据：mod 成功时返回 `ok: true`（首行），失败时首行是 `ok: false`。
-    //   旧写法 `!out.contains("ok: false")` 会把**正文里任何**提到 ok:false 的
-    //   字样误判成失败（例如 details 里嵌套的子结果）。改成看首行 + applied。
+    //   首行非空时只看首行：正文（如 details 里嵌套的子结果）出现 ok:false 不算整体失败。
     let first = out.lines().next().unwrap_or("").trim();
     let ok = first.starts_with("ok: true")
         || (first.is_empty() && !out.contains("failed: 1") && !out.contains("ok: false"));

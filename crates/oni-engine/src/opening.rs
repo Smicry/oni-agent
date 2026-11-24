@@ -1,19 +1,11 @@
 //! OPENING —— 开局规划器：每局的战略由 LLM 依据**本局世界事实**生成。
 //!
-//! 设计初衷（慢系统契约 §4：慢系统 = 战略层，决定"往哪走"）：
-//!   旧实现：plan.json 来自 plan.template.json（硬编码 playbook），
-//!   且模板自带 author=ai / locked=true 的**假身份** →
-//!   机械 planner（按世界事实分类的策略族）被永久锁死（saveswitch 拒写）→
-//!   换一张地图（水世界/金属星/沼泽）节点图就不适用 → 代理带着错误的计划全灭
-//!   （实测：拉德多局模板没有产氧节点，"挖通地表换气"又被假 done 提前宣告完成）。
-//!
-//! 新契约（无本地兜底，战略层全面 LLM 化）：
+//! 契约（慢系统契约 §4：慢系统 = 战略层，决定"往哪走"）：
 //!   快系统采世界事实（opening_brief.json），
-//!   慢系统 LLM 生成节点图（author=ai，名副其实）→ 强校验 → 落盘。
-//!   **没有本地兜底**（用户决策：硬编码 playbook 换地图就不适用，已删除）：
+//!   慢系统 LLM 生成节点图（author=ai / locked=true）→ 强校验 → 落盘。
+//!   **没有本地兜底**（硬编码 playbook 换地图就不适用）：
 //!   LLM 失败/校验不过 → 本轮无战略计划（快系统保命层照常跑），
 //!   冷却 10 分钟后重试 LLM；失败原因记入 decisions.jsonl 可见。
-//!   原 planner.rs 的机械策略族（playbook）已随本契约删除。
 //! 通用性关键：prompt 里**只放跨局通用原则**（厕所前置/材料先行/换气判据用真实
 //! 可达上界/缺料自举/造出来≠在运转/产氧需电）+ **本局事实**；节点结构由 LLM
 //! 依据事实决定（水世界→藻类箱/电解器，陆地→氧石扩散器/挖掘换气）。
@@ -35,7 +27,7 @@ pub const CHECK_KINDS: &[&str] = &[
 ];
 
 /// 计划节点允许使用的动作 kind（**禁止带坐标的 build/dig/order/auto_connect**——
-/// 写死坐标换个存档就废，这是"playbook 不可通用"的老坑）。
+/// 约束：写死坐标换个存档就废）。
 pub const ACTION_KINDS: &[&str] = &["auto", "auto_build", "scout", "call"];
 
 /// 开局世界事实（由 CLI 从游戏采集后传入）。
@@ -88,8 +80,7 @@ fn count_matches(session: &McpSession, q: &str) -> i64 {
         .unwrap_or(0)
 }
 /// **采集本局世界事实**（开局规划 brief 的主体）。
-/// 只采**事实**：可达区/行跨度/资源距离/基底下水与CO₂/食物/建材。
-///   否则"CLI 看到的"和"代理看到的"会不一致。
+/// 只采**事实**：可达区/行跨度/资源距离/基底下水与CO₂/食物/建材，保证 CLI 与代理看到的一致。
 pub fn collect_facts(session: &McpSession, snap: &crate::sense::Snapshot) -> WorldFacts {
     // ---- 官方可达集（去重！）----
     let mut reach_set: std::collections::BTreeSet<(i32, i32)> = std::collections::BTreeSet::new();
@@ -180,12 +171,12 @@ pub fn collect_facts(session: &McpSession, snap: &crate::sense::Snapshot) -> Wor
             .sum(),
     }
 }
-/// **跨局通用原则**（每局都成立的经验教训，与地图无关 → 属于系统知识）。
+/// **跨局通用原则**（与地图无关的系统知识）。
 ///
-/// 注意区分：这些是"怎么活下来"的**规则**，不是"这一局先做什么"的**套路**。
+/// 约束：这些是"怎么活下来"的**规则**，不是"这一局先做什么"的**套路**；
 /// 套路（先挖地表还是先产氧、走藻类箱还是电解器）必须由 LLM 依据本局事实决定。
 pub const UNIVERSAL_PRINCIPLES: &[&str] = &[
-    "厕所必须前置：厕所排在后面 → 膀胱 100% → 随地排泄 → 污染水 → 复制人泡在里面呼吸归零 → 全灭（两次事故）。",
+    "厕所必须前置：厕所排在后面 → 膀胱 100% → 随地排泄 → 污染水 → 复制人泡在里面呼吸归零 → 全灭。",
     "全局气体比例会骗人：全局 O₂/(O₂+CO₂)=99% 也可能是封闭气室在闷死；换气是否达成只看「复制人真能走到的最高可达格」，且必须复核，不许声明。",
     "厕所 2×3、床 2×2 需要连续空间：找不到落点时自动腾空间（挖开占格），不是放弃。",
     "梯子/砖块只认建材（砂岩/泥土/藻类/黏土/沙）；发电机/电线/高级产氧要金属。开局地上零建材 → 第一步永远是采建材。",
@@ -198,7 +189,7 @@ pub const UNIVERSAL_PRINCIPLES: &[&str] = &[
     "换气判据用「复制人真能走到的最高可达格」且必须复核——不许声明完成。",
 ];
 
-/// 计划不是 AI 生的（模板/机械兜底）→ 需要 LLM 开局规划。
+/// 计划不是 AI 生的（author != "ai"）→ 需要 LLM 开局规划。
 pub fn opening_needed(plan_path: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(plan_path) else { return true; };
     let Ok(v) = serde_json::from_str::<Value>(&text) else { return true; };
@@ -213,20 +204,12 @@ pub fn extract_json(text: &str) -> Option<&str> {
     Some(&text[start..=end])
 }
 
-/// **计划完整性校验**（防 LLM 幻觉）。返回错误清单；空 = 通过。
-///
-/// 校验的不是风格，是**会致命的结构问题**：
-///   - 判据 kind 不在白名单 → 该节点永远无法判完成（永动或永挂）；
-///   - 判据重复 → 一个 done 会连带"证明"另一个（实测 E1/AIR 同判据）；
-///   - 产氧节点无供电前置 → 造出来不产氧（实测：制氧1 但净 -120W）；
-///   - 缺生命线 → 代理不会去建厕所/床/产氧（实测：床位 0/3 无人建）。
 /// goal → 机器可判的**默认判据**（契约层归一化：只用结构化的 goal 字段，不解析文案）。
 ///
-/// 为什么需要：LLM 给节点写了 goal 却没给可解析的 `success_check`（或写了白名单外的 kind）
-///   → 旧逻辑一律降级 manual → judge 里 manual 永远不 done → 3 节点窗口很快"枷锁" → 整窗重算，
-///   W1→W2→W3 的推进根本观察不到（实测 23:53 的窗口三节点全 manual）。
-///   节点已经带了**结构化**的 goal，而每个 auto-goal 在执行器里有确定的"效果"：
-///   建厕所 = 厕所数 ≥ 1、采建材 = 地上有建材……判据直接由 goal 推出，这是契约层做自己的事。
+/// 约束：节点带了结构化 goal 却没有可解析的 `success_check`（或写了白名单外的 kind）时，
+///   不能一律降级 manual——judge 里 manual 永远不 done → 3 节点窗口很快"枷锁" → 整窗重算，
+///   W1→W2→W3 的推进观察不到。每个 auto-goal 在执行器里有确定的"效果"
+///   （建厕所 = 厕所数 ≥ 1、采建材 = 地上有建材……），判据直接由 goal 推出，这是契约层做自己的事。
 ///   forage / open_chamber / mop_dirty 没有诚实的状态判据（"食物 ≥ 1 kcal"在新档开局恒真）
 ///   → 不兜底，保持 manual（LLM 想要更强/更弱的判据时显式写即可，不会被这里覆盖）。
 pub fn default_check_for_goal(goal: &str) -> Option<serde_json::Value> {
@@ -253,10 +236,8 @@ pub fn default_check_for_goal(goal: &str) -> Option<serde_json::Value> {
 /// **判据自愈**：LLM 发明/缺失的判据 → 先按节点的 goal 兜底成机器可判的默认判据
 ///   （见 [`default_check_for_goal`]）；goal 没有默认判据时才降级为 manual（可执行但永不自动完成）。
 ///
-/// 为什么不直接拒绝整份计划：一个未知判据只影响**一个节点**的验收，
-///   拒绝整份计划会让其它 10 个正确节点陪葬（实测首跑：T1 被发明 material_min，
-///   整份计划被拒 → 代理继续跑旧 playbook）。兜底/降级 + 告警 = 可用且可见。
-/// 返回告警清单。
+/// 约束：不直接拒绝整份计划——一个未知判据只影响**一个节点**的验收，拒绝会让其它正确节点一起作废。
+///   兜底/降级 + 告警 = 可用且可见。返回告警清单。
 pub fn repair_plan_checks(plan: &mut Plan) -> Vec<String> {
     let mut warns = Vec::new();
     for node in &mut plan.nodes {
@@ -284,6 +265,13 @@ pub fn repair_plan_checks(plan: &mut Plan) -> Vec<String> {
     warns
 }
 
+/// **计划完整性校验**（防 LLM 幻觉）。返回错误清单；空 = 通过。
+///
+/// 校验的不是风格，是**会让计划失效的结构问题**：
+///   - 判据 kind 不在白名单 → 该节点永远无法判完成（永动或永挂）；
+///   - 判据重复 → 一个 done 会连带"证明"另一个；
+///   - 产氧节点无供电前置 → 造出来不产氧；
+///   - 缺生命线 → 代理不会去建厕所/床/产氧。
 pub fn validate_plan(plan: &Plan) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
     let n = plan.nodes.len();
@@ -437,7 +425,7 @@ pub fn validate_plan(plan: &Plan) -> Vec<String> {
         .collect();
     if !producers.is_empty() {
         if powers.is_empty() {
-            errs.push("产氧节点存在但没有供电节点（耗电产氧件没电 = 废铁，实测制氧1 净-120W）".into());
+            errs.push("产氧节点存在但没有供电节点（耗电产氧件没电 = 不产氧）".into());
         } else {
             for p in &producers {
                 let node = plan.nodes.iter().find(|nd| nd.id == *p);
@@ -463,10 +451,8 @@ fn build_prompts(brief_text: &str) -> (String, String) {
 只输出 JSON，不要任何其它文字、不要 markdown 栅栏。".to_string();
 
     // ★ 判据 kind 全集 + **每种的字段格式**（必须照抄，不要自己发明字段名）。
-    //   为什么必须写清字段：LLM 看不到 check_success 的实现，只能照例子猜
-    //   （实测它把 loose_min 写成 {key,n}，而代码只认 {element,kg} → 判据永远无法判定
-    //     → 节点永远不算 done → 零进展 → 被熔断 → 下游节点前置断链 → 保命目标做不成）。
-    //   代码侧已加别名容错兜底，但 prompt 写清楚才能让 LLM 一次就写对。
+    //   LLM 看不到 check_success 的实现，只能照例子猜：字段名写错 → 判据无法判定 → 节点永不 done → 零进展 → 熔断。
+    //   代码侧有别名容错兜底，但 prompt 写清楚才能让 LLM 一次就写对。
     let kinds_line = format!(
         "判据 kind 全集与**字段格式**（kind 只能从中选，字段名必须照抄）:\n\
    - building_min: {{kind, key:\"toilets|beds|...\", n:<数>}}\n\
@@ -536,7 +522,7 @@ pub fn author_opening_plan(
             if repairs.is_empty() { String::new() } else { format!("（已自愈 {} 条未知判据）", repairs.len()) }
         ));
     }
-    // 名副其实：这份计划才是 AI 生的 → author=ai / locked=true
+    // 这份计划是 AI 生成的 → author=ai / locked=true
     if let Some(obj) = raw_v.as_object_mut() {
         obj.insert("author".into(), Value::from("ai"));
         obj.insert("locked".into(), Value::from(true));
@@ -567,7 +553,6 @@ mod tests {
 
     /// LLM 写了 goal 却没给可解析判据 → 按 goal 兜底成机器可判的判据，而不是永不完成的 manual。
     ///   锁住的不变量：窗口节点有结构化 goal 时，判据一定可机器判定（除非该 goal 没有诚实判据）。
-    ///   实测 23:53 窗口三节点全 manual → 窗口"枷锁"整窗重算，W1→W2 推进观察不到。
     #[test]
     fn repair_checks_falls_back_to_goal_default() {
         let mut plan: Plan = serde_json::from_value(serde_json::json!({
@@ -661,7 +646,7 @@ mod tests {
         assert!(errs.is_empty(), "合法计划不应报错: {errs:?}");
     }
 
-    /// 产氧节点缺供电前置 → 必须报错（实测：制氧1 净 -120W 不产氧）。
+    /// 产氧节点缺供电前置 → 必须报错（没电的产氧设备不产氧）。
     #[test]
     fn oxygen_without_power_dependency_rejected() {
         let mut oxygen = node("O1", Some(oxygen_producing_check()));
@@ -692,7 +677,7 @@ mod tests {
             "产氧节点缺供电前置必须报错: {errs:?}");
     }
 
-    /// 判据重复 → 必须报错（实测 E1/AIR 同判据，一个假 done 连坐）。
+    /// 判据重复 → 必须报错（一个 done 会连带"证明"另一个）。
     #[test]
     fn duplicate_criteria_rejected() {
         let mut a = node("AIR", Some(serde_json::json!({"kind": "surface_open", "minY": 216})));
@@ -736,7 +721,7 @@ mod tests {
             "判据重复必须报错: {errs:?}");
     }
 
-    /// 写死坐标的动作 → 必须报错（playbook 不可通用的老坑）。
+    /// 写死坐标的动作 → 必须报错（换个存档就废）。
     #[test]
     fn hardcoded_region_rejected() {
         let mut bad = node("X1", Some(toilet_check()));

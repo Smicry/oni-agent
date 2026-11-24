@@ -68,10 +68,9 @@ cargo build --release
 
 从 [`docs/README.md`](docs/README.md)（索引）开始。
 
-- [`docs/architecture-v3.md`](docs/architecture-v3.md) — **架构总纲**：LLM 驾驶 / 滚动窗口 / 安全壳；为什么 v2 规则引擎不行
+- [`docs/architecture-v3.md`](docs/architecture-v3.md) — **架构总纲**：LLM 驾驶 / 滚动窗口 / 安全壳
 - [`docs/FAST_SLOW_CONTRACT.md`](docs/FAST_SLOW_CONTRACT.md) — 快慢契约（唯一权威，代码与之不符时改代码）
 - [`docs/dual-system.md`](docs/dual-system.md) / [`docs/coordination.md`](docs/coordination.md) — 交接协议、总线设计、暂停语义
 - [`AGENTS.md`](AGENTS.md) — agent 工程规则
 - [`docs/knowledge-base.md`](docs/knowledge-base.md) — 带出处的游戏机制
 - [`design/graph-model.md`](design/graph-model.md) — 气室图设计
-- `docs/archive/` — 已被推翻的历史设计（v2 规则规划器），仅供追溯

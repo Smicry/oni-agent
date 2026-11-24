@@ -1,4 +1,4 @@
-//! EXEC —— 执行动作。**预检不过 = 绝不执行**（这是三次“指令 ok 但没人干活”事故的拦截器）。
+//! EXEC —— 执行动作。**预检不过 = 绝不执行**（工单返回 ok ≠ 生效，见 AGENTS.md §6）。
 
 use std::collections::BTreeMap;
 
@@ -53,12 +53,8 @@ pub enum Action {
     },
     /// **接线**：把两个电力端点连起来。
     ///
-    /// 为什么需要：
-    ///   造出发电机**不等于**有电：电网需要导线连接两端。
-    ///   发电机建成并运转，但
-    ///   `consumerUsedWatts=0` —— 耗电建筑**没接上** → 研究站不工作
-    ///   烤箱永远不解锁 → 食物耗尽
-    ///   接线用 mod 的 `building_control domain=planning action=auto_connect`。
+    /// 约束：造出发电机**不等于**有电 —— 耗电建筑没接上时 `consumerUsedWatts=0`，电网需要导线连接两端。
+    /// 接线用 mod 的 `building_control domain=planning action=auto_connect`。
     AutoConnect {
         /// 电源端点名（如 "人力发电机"）
         from: String,
@@ -81,9 +77,7 @@ pub enum Action {
     },
     /// **开局资源侦察**：探测关键资源分布并落盘（不改世界）。
     ///
-    /// 为什么需要：
-    ///   不知道铁矿在 20 格外就深挖 → 挖开地下 CO₂ → 三人。
-    ///   先侦察再决定挖哪里，是唯一能避免这种灾难的顺序。
+    /// 约束：先侦察再决定挖哪里 —— 盲目深挖可能挖开地下 CO₂ / 水袋。
     Scout {
         #[serde(default)]
         why: String,
@@ -122,18 +116,9 @@ impl ExecOutcome {
     }
 }
 
-/// **正在不可呼吸环境里的复制人所在格**。
+/// 该目标格的**落脚点**（work_position）是否是人能待的（可呼吸）环境。
 ///
-/// 供挖掘管线的**所有**分支共用：
-///   避人规则原先只写在"非梯子"分支里，而代理实际走的是梯子分支（挖竖井）
-///   → 规则形同虚设 → 三人泡在污染水里，代理还在他们脚下开井。
-/// 该目标格的**落脚点**是否是人能待的（可呼吸）环境。
-///
-/// （根因）：旧逻辑只检查"复制人当前所在格危不危险"，
-///   **不检查落脚点本身** → 代理把人派进 CO₂ 主导的格子（只有 0.25~1.4 kg/格，
-///   按旧的"CO₂ > 5kg 才致命"判据看着"不致命"）→ 人在那里呼吸一路掉到 0
-///   → 倒地 → move_to 需要寻路、倒地的走不动 → 无人能救 → 三人。
-///
+/// 约束：判据看**落脚点本身**，不是"复制人当前所在格危不危险"。
 /// 判据与"人要待在里面"的建筑落点一致（cell::is_safer_for_occupied）：
 ///   **主导元素必须是氧气**。mod 不提供 O₂ 分量（multicomponent 不可用），
 ///   所以只能用主导元素 —— 这是可得的最严判据。
@@ -163,6 +148,7 @@ fn work_position_breathable(
     }
 }
 
+/// **正在不可呼吸环境里的复制人所在格**。
 pub fn danger_cells(session: &McpSession) -> Vec<(i32, i32)> {
     let dupes = oni_world::preflight::dupe_positions(session);
     if dupes.is_empty() {
@@ -203,22 +189,10 @@ pub fn near_danger_cell(danger: &[(i32, i32)], c: (i32, i32)) -> bool {
         .any(|d| (d.0 - c.0).abs() <= 2 && (d.1 - c.1).abs() <= 2)
 }
 
-/// **死亡格**：挖开它会释放致命液体/气体（污染水/污染氧/真空）的格。
-///
-/// 为什么需要：
-///   代理沿 Y=191 往西挖竖井，穿过污染层 → 竖井底整排变成污染水
-///   基地生活区被 CO₂ 淹没 → 三人走进污染区 → 呼吸 0 → 倒地
-///   根因：**挖开一格会释放那格的液体/气体**，而代理只检查"目标格本身"。
-///   正解：挖之前先看**目标格正下方 1~2 格**是什么；
-///   若是污染水/污染氧/真空 → 这格是死亡格 → 排除（换方向或先清理）。
 /// **复制人脚下格**：目标格正下方 1~2 格是复制人当前所在格。
 ///
-/// ：
-///   旧规则只保护"正在不可呼吸环境里"的复制人（danger_cells），
-///   注释还写着"复制人处在**正常**空气里时，在附近挖是安全的，不避" —— **这是错的**：
-///   挖开复制人**脚下**的格子 → 人掉下去 → 掉进坑 / 水 / CO₂ 区 → 死亡。
-///   代理挖地表竖井时把泡泡脚下掏空，泡泡随即消失。
-///   规则：目标格正下方 1~2 格若是**任意**复制人所在格 → 排除该格。
+/// 约束：对**任意**复制人生效，不限于"正在不可呼吸环境里"的人（danger_cells）——
+///   挖开复制人**脚下**的格子 → 人掉下去 → 掉进坑 / 水 / CO₂ 区。
 pub fn dupe_below_cells(
     session: &McpSession,
     targets: &[oni_world::preflight::TargetCheck],
@@ -248,7 +222,7 @@ pub fn dupe_below_of(dupes: &[(i32, i32)], targets: &[(i32, i32)]) -> Vec<(i32, 
 
 /// 危险格判据（实现在 oni-world，便于 preflight 的建筑选点共用）。
 ///
-/// ：代理把床/厕所建在 CO2 聚集区 -> 复制人睡在 CO2 里 -> 。
+/// 设备落点要排除危险格：人要待在设备里的必须过可呼吸检查（AGENTS.md §9）。
 pub fn cell_is_hazardous(cd: &oni_world::cell::Cell) -> bool {
     cd.is_hazardous()
 }
@@ -257,10 +231,9 @@ pub fn deadly_below_cells(
     session: &McpSession,
     targets: &[oni_world::preflight::TargetCheck],
 ) -> Vec<(i32, i32)> {
-    // （）：只查**下方**是不够的 ——
-    //   挖穿污染层的**顶部**会把污染水放下来，淹没目标格 → 跟着工单走过去干活的
-    //   复制人直接淹死。
-    //   ⇒ 上下 1~2 格都要查：挖任何一格都可能把相邻的污染层"打开"。
+    // **死亡格**：挖开它会释放有害液体/气体（污染水/污染氧/真空等）的格。
+    //   挖开一格会释放那格的液体/气体，所以要看相邻格而不只是目标格本身：
+    //   上下 1~2 格都要查 —— 挖穿污染层的**顶部**会把污染水放下来，淹没目标格。
     let mut around: Vec<(i32, i32)> = Vec::new();
     for t in targets {
         for dy in -2..=2i32 {
@@ -286,11 +259,8 @@ pub fn deadly_below_cells(
 
 /// 自动腾空间：找一块 W×H 的候选地，返回**该挖的那一格**。
 ///
-/// 为什么需要：
-///   开局的打印舱占了 4×4，房间里只剩十几格 → 2×3 的厕所**根本没有现成落点**。
-///   旧逻辑直接报「找不到落点」→ 节点暂缓 → 厕所永远建不出来，
-///   而上一局正是「没厕所 → 膀胱爆 → 随地排泄 → 污染水 → 复制人溺死」。
-///   ⇒ 找不到落点时应该**先挖出空间**，而不是放弃。
+/// 约束：找不到落点时**先挖出空间**，而不是放弃 —— 找不到落点常常只是空间不够
+///   （占格是实心岩，如开局打印舱旁放不下 2×3 的厕所）。
 ///
 /// 规则：
 ///   - 占格只能是「气体」（可建）或「实心岩」（要先挖）；建筑/梯子/液体一律排除
@@ -362,7 +332,7 @@ fn dig_space_for(
         }
         solids.sort_by_key(|c| (c.1, c.0));
         // ★ 用**实时 cell 数据**复核候选格：reach.grid 是缓存网格，可能认为某格还是 Solid，
-        //   但真实世界已经挖成气体（或已下挖掘工单）→ 旧逻辑反复对同一格下工单 → 厕所永远建不成。
+        //   但真实世界已经挖成气体（或已下挖掘工单）→ 否则会反复对同一格下工单。
         let live = oni_world::cell::fetch_many(session, &solids);
         for cell in solids {
             if live.get(&cell).map(|cd| cd.is_solid()).unwrap_or(true) == false {
@@ -386,21 +356,16 @@ fn dig_space_for(
 
 /// ★ 汇总各动作结果的真实成败：**任一失败 → 整体失败**。
 ///
-/// 为什么必须是这个规则：慢系统的熔断统计读 goal_outcomes.jsonl 的 ok 字段，
-///   ok 恒为 true 时熔断永不触发 → 同一个推不动的目标被无限重复入队
-///   → 快系统恢复→失败→冻回 无限乒乓（实测 material 前沿全是梯子需求）。
+/// 约束：慢系统的熔断统计读 goal_outcomes.jsonl 的 ok 字段，ok 必须真实汇总（AGENTS.md §9）——
+///   恒为 true 会让熔断永不触发，同一个推不动的目标被无限重复入队。
 pub fn aggregate_ok(results: &[ActionResult]) -> bool {
     results.iter().all(|r| r.ok)
 }
 
 pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> ExecOutcome {
     let mut results = Vec::new();
-    // ★ 各分支的**真实**成败由 results 承载，末尾用 aggregate_ok 汇总。
-    //   旧逻辑：函数末尾无条件 `ok: true` → 分支里 push 的 ok:false 被丢掉
-    //   → "无可下单曲"这种零进展被报成成功 → 慢系统以为目标达成 →
-    //   无限重复入队同一个推不动的目标 → 快系统恢复→失败→冻回 无限乒乓
-    //   （实测：material 目标反复"已执行：前沿 N 格无可下单曲…推不动"，
-    //     而 ai_goals.jsonl 里全是 done:true）。
+    // ★ 各分支的**真实**成败由 results 承载，末尾用 aggregate_ok 汇总：
+    //   零进展（如"无可下单曲"）记为成功会让熔断统计失真（AGENTS.md §9）。
     for a in actions {
         match a {
             Action::Dig { rect, why, auto_ladder, focus } => {
@@ -422,14 +387,10 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                     return ExecOutcome { results, ok: false };
                 }
                 // ★ 死工单自愈：撤销**模型判定没人能执行**的旧挖掘工单。
-                //   症状链（实测）：模型比游戏宽松 → 把工单下到悬空岩层
-                //   → 游戏里每个复制人都被 precondition 拒绝
-                //     （oni://dupes/todos 的 counts.blocked = 单数 × 人数，实测 18 = 6×3）
-                //   → 全员闲 + 工单积压 = "看游戏没进展"。
-                //   这些死单会一直占着差事队列、掩盖真实进展 → 必须撤掉，
+                //   死单会一直占着差事队列、掩盖真实进展（全员闲 + 工单积压）→ 必须撤掉，
                 //   否则引擎会继续把复制人往够不到的地方派。
                 //   判据是**确定性的事实**（落脚点走不到 + 这一列也铺不出梯子链），
-                //   所以由快系统直接撤销，不必等慢系统决策。
+                //   所以由快系统直接撤销，不必等慢系统决策（AGENTS.md §3.5）。
                 if let Some(r) = oni_world::preflight::load_reach(session, Some(catalog)) {
                     let dead: Vec<(i32, i32)> = pf
                         .targets
@@ -456,34 +417,24 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 //   复制人爬上去才能继续往上挖。没有这一步就永远挖不到头顶的矿层。
                 // 缺梯子材料时的降级说明（不阻断横向挖掘）
                 let mut ladder_note: Option<String> = None;
-                // 锁定列走不通时**整轮不下单**（绝不横向换列）
+                // 锁定列走不通：梯子分支不换列（本轮不铺梯子），交给下面的横向分支。
                 let mut locked_out = false;
                 if *auto_ladder {
-                    // 必须遍历**所有**需要梯子的前沿格，挑第一个"梯子落点确实可达"的。
-                    //   旧代码用 find() 只取第一个：它的落点若不可达（ladder_step 返回 None），
-                    //   整个 auto_ladder 分支就放弃 —— 哪怕后面还有能铺梯子的目标。
-                    //   症状：日志一直显示"前沿 N 格，本轮挖 1 格"（走了非梯子分支），
-                    //   梯子永远不铺，竖井永远挖不动。
+                    // 必须遍历**所有**需要梯子的前沿格，挑"梯子落点确实可达"的：
+                    //   只看第一个前沿格的话，它落点不可达（ladder_step 返回 None）时整个分支会白白放弃。
                     let reach = oni_world::preflight::load_reach(session, Some(catalog));
                     let mut chosen: Option<((i32, i32), (i32, i32))> = None;
                     if let Some(r) = &reach {
-                        // 收集所有"落点可达"的梯子候选，再按 focus 距离排序：
-                        //   旧代码按 pf.targets 顺序取第一个 → 锁定的目标列被跳过
-                        //   代理在 123/125/132/134 列之间乱挖，surface 锁形同虚设
-                        //   → 换气节点永远打不通。
-                        //   现在：离 focus 越近越优先；focus 列挖不动才降级到别的列。
+                        // 收集所有"落点可达"的梯子候选；不按 pf.targets 顺序取第一个（会跳过锁定的目标列）。
                         let mut candidates: Vec<((i32, i32), (i32, i32))> = Vec::new();
-                        // 避人规则在梯子分支**同样生效**：
-                        //   旧代码只在非梯子分支避人 → 代理在三人泡着的污染水区
-                        //   继续开井 → 呼吸掉到 87.5 → 差点重演/9。
+                        // 避人规则在梯子分支**同样生效**（danger_cells / near_danger_cell 两个分支共用）。
                         let danger = danger_cells(session);
-                        // 死亡格（）：梯子分支同样要排除
+                        // 死亡格：梯子分支同样要排除
                         let mut deadly = deadly_below_cells(session, &pf.targets);
-                        // ：复制人**脚下**也不能挖
+                        // 复制人**脚下**也不能挖
                         deadly.extend(dupe_below_cells(session, &pf.targets));
-                        // P0-69 低氧竖井拦截：批量读梯子候选格 + 其上方格的氧气质量。
-                        //   实事故：梯子一路铺到 (127,215)，该处 Oxygen 仅 0.046kg/格（近真空），
-                        //   复制人爬上去"寻找安全区域"、呼吸掉到 90 → 必须禁止引导人去低氧格。
+                        // 低氧竖井拦截：批量读梯子候选格 + 其上方格的氧气质量。
+                        //   约束：不把人往低氧格引（近真空的竖井顶会让复制人呼吸持续下降）。
                         //   读不到 → 保守跳过。批量 fetch 控制 MCP 压力。
                         let ladder_cells: Vec<(i32, i32)> = pf.targets.iter()
                             .filter(|t| t.needs_ladder && pf.ready.contains(&(t.x, t.y)))
@@ -510,11 +461,8 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                             }
                         }
                         if let Some(f) = focus {
-                            // 同列硬锁：surface 目标锁定的是**列**，
-                            //   不是某一格。旧逻辑按曼哈顿距离排序 → 选到"离焦点近但列不同"的
-                            //   前沿格 → 代理在 115/116/118 列之间来回漂移，梯子成倍浪费，
-                            //   竖井永远挖不到地表。
-                            //   现在：只保留 focus 所在列的候选；该列完全走不通才降级到别的列。
+                            // 同列硬锁：surface 目标锁定的是**列**，不是某一格。
+                            //   只保留 focus 所在列的候选（不按到焦点的距离排序，避免在相邻列间漂移）。
                             let same_col: Vec<((i32, i32), (i32, i32))> = candidates
                                 .iter()
                                 .filter(|(_, t)| t.0 == f.0)
@@ -525,13 +473,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                                 candidates = same_col;
                                 candidates.sort_by_key(|(_, t)| t.1);
                             } else if !candidates.is_empty() {
-                                // 修正（）：**有候选但都不在锁定列**
-                                //   → 不换列（换列=梯子白铺）→ 本轮不下单。
-                                //
-                                // 但如果**本来就没有**需要梯子的候选（candidates 为空），
-                                //   说明这一列的前沿格**不需要梯子**（正下方就是岩肩/实地，
-                                //   例如沿实心岩肩的斜向阶梯）→ 应该交给下面的「横向挖前沿」分支，
-                                //   绝不能整轮不下单（氧石支线因此一格没挖）。
+                                // **有候选但都不在锁定列** → 不换列（换列会浪费已铺的梯子）→ 梯子分支本轮不下单。
                                 candidates.clear();
                                 locked_out = true;
                                 ladder_note = Some(format!(
@@ -539,10 +481,8 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                                     f.0
                                 ));
                             }
-                            // candidates 为空 → 说明这一列的前沿格**不需要梯子**
-                            //   （正下方就是岩肩/实地，例如沿实心岩肩的斜向阶梯）
-                            //   → 交给下面的「横向挖前沿」分支，**绝不能整轮不下单**。
-                            //   
+                            // candidates 为空 → 这一列的前沿格**不需要梯子**（正下方就是岩肩/实地，
+                            //   例如沿实心岩肩的斜向阶梯）→ 交给下面的「横向挖前沿」分支，不能整轮不下单。
                         }
                         if let Some(c) = candidates.first().copied() {
                             chosen = Some(c);
@@ -553,14 +493,12 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         let t = t.unwrap();
                         // 梯子材料：缺材料**不能阻断横向挖一格**。
                         //   梯子是"往上挖"的手段，不是"挖建材"的前提。
-                        //   旧代码在这里直接失败 → 开局永远拿不到第一块砂岩 → 节点被误熔断。
                         let (mats, reason) = mod_available_materials(session, "Ladder");
                         if let Some(mat) = mats.first().cloned() {
                             // 逐级往上试：
                             //   内存网格是**快照**，可能滞后于真实地图 —— 那一格已经
-                            //   有梯子了，落地必然失败。旧逻辑一失败就中止整个动作
-                            //   代理冻回暂停 → 殖民地停摆。
-                            //   正确做法：失败就**往上一级**继续试（梯子链本来就该连续），
+                            //   有梯子了，落地必然失败。
+                            //   约束：失败就**往上一级**继续试（梯子链本来就该连续），
                             //   全失败也**不阻断横向挖**（梯子只是"往上挖"的手段）。
                             let mut attempt = 0usize;
                             let mut rung = lp;
@@ -613,15 +551,10 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         }
                     }
                 }
-                // 锁定列走不通 → **整轮不下任何单**。
-                //   旧逻辑会落到下面的"横向挖前沿"分支 → 换列挖 → 梯子白铺
-                //   。
+                // 锁定列走不通：梯子分支本轮不铺梯子（不换列，免得浪费已铺的梯子）。
                 if locked_out {
-                    // 修正（）：**不要在这里提前返回**。
-                    //   locked_out 的本意是「梯子分支不换列」，不是「整轮不下单」。
-                    //   旧代码直接 return → 连下面的「横向挖前沿」分支也被禁掉
-                    //   代理整轮空转（地表节点每轮都「锁定列走不通」，复制人全空闲）。
-                    //   横向分支本身就有 **focus 优先级**（挖锁定格）→ 不会换列 ✓。
+                    // 约束：**不要在这里提前返回** —— locked_out 只表示「梯子分支不换列」，
+                    //   不是「整轮不下单」；下面的「横向挖前沿」分支有 **focus 优先级**，不会换列。
                     results.push(ActionResult {
                         kind: "dig".into(),
                         why: why.clone(),
@@ -638,9 +571,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 let ready = pf.ready.clone();
                 let mut issued = 0usize;
                 let mut already = 0usize;
-                // 优先挑**还没标记**的前沿格：
-                //   旧逻辑每轮都取第一个前沿格 → 每轮重复对同一格下单，
-                //   既浪费调用，又掩盖真实进展。
+                // 优先挑**还没标记**的前沿格（重复对同一格下单既浪费调用，又掩盖真实进展）。
                 //   全都有标记 = 已经下过单了，本轮就等复制人消化，不再重复下单。
                 let marked: std::collections::HashSet<(i32, i32)> = pf
                     .targets
@@ -655,48 +586,23 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                     // 排除"需要梯子"的格：直上直下的竖井没有梯子爬不上去，
                     //   下去单只会变成死工单（ONI 立刻取消）。
                     .filter(|c| !pf.targets.iter().any(|t| (t.x, t.y) == *c && t.needs_ladder))
-                    // （根因）：**工位的落脚点必须是人能呼吸的格**。
-                    //   旧逻辑只看"复制人当前所在格危不危险"，不看落脚点本身
-                    //   代理把人派进 CO₂ 主导的格子
-                    //   人站在那里呼吸一路掉到 0 → 倒地 → 搬不动
-                    //   判据与"人要待在里面"的建筑落点一致：主导元素必须是氧气。
-                    //   （mod 不给 O₂ 分量：multicomponent 不可用 ⇒ 只能用主导元素。）
+                    // **工位的落脚点必须是人能呼吸的格**：判据与"人要待在里面"的建筑落点一致，
+                    //   主导元素必须是氧气（见 work_position_breathable）。
                     .filter(|c| work_position_breathable(session, &pf, *c))
                     .collect();
-                // 避人规则：
-                //   **不要在"身处不可呼吸环境的人"旁边开井**。
-                //   ：代理沿竖井挖 195~201 层 → 地下 CO₂ 涌入低层走廊
-                //   三个在 (121~132,192~193) 作业的复制人全部倒地、其中一人死亡。
-                //   规则：复制人所在格若不可呼吸（污染水/CO₂/氯气/真空），
+                // 避人规则：**不要在"身处不可呼吸环境的人"旁边开井**。
+                //   复制人所在格若不可呼吸（污染水/CO₂/氯气/真空），
                 //   则排除距他 2 格内的候选格 —— 换一列挖，别在人脚下开井。
-                //   （复制人处在**正常**空气里时，**脚下**依然不能挖 —— 见 dupe_below_cells。
-                // ：旧假设"正常空气里在附近挖是安全的"是错的，
-                //    挖开脚下 → 人掉进坑/水 → 死亡。就是这么少了一个人。）
-                // 避人规则：
-                //   不要在"身处不可呼吸环境的人"旁边开井。
-                //   ：代理沿竖井挖 195~201 层 → 地下 CO2 涌入低层走廊
-                //   三个在 (121~132,192~193) 作业的复制人全部倒地、其中一人死亡。
-                //   规则：复制人所在格若不可呼吸，
-                //   则排除距他 2 格内的候选格 —— 换一列挖，别在人脚下开井。
-                //
-                // 新坑：这条规则原来**只作用于非梯子分支**，
-                //   而代理实际走的正是梯子分支（挖竖井）→ 规则完全没生效：
-                //   三人已泡在污染水里，代理还在他们脚下开井。
-                //   现在抽成共享函数 danger_cells / near_danger_cell，
-                //   **梯子分支与非梯子分支都要用**。
+                //   共享函数 danger_cells / near_danger_cell：**梯子分支与非梯子分支都要用**。
+                //   （复制人处在**正常**空气里时，**脚下**依然不能挖 —— 见 dupe_below_cells。）
                 let danger_cells = danger_cells(session);
                 let near_danger = |c: (i32, i32)| -> bool {
                     near_danger_cell(&danger_cells, c)
                 };
-                // 死亡格规则：
-                //   挖开一格会**释放该格周围的液体/气体**。
-                //   代理沿 Y=191 往西挖竖井 → 挖穿污染层
-                //   竖井底 (108~122,191) 全部变成污染水 → 基地生活区被 CO₂ 淹没
-                //   三人先后走进污染区 → 呼吸 0 → 倒地
-                //   规则：**目标格正下方 1~2 格若是污染/真空 → 排除该格**
-        //   （挖开它就是打开一个死亡空间）。
+                // 死亡格规则：挖开一格会**释放该格周围的液体/气体** →
+                //   目标格上下 1~2 格若是污染/真空 → 排除该格（见 deadly_below_cells）。
                 let mut deadly_below = deadly_below_cells(session, &pf.targets);
-                // ：复制人**脚下**也不能挖
+                // 复制人**脚下**也不能挖
                 deadly_below.extend(dupe_below_cells(session, &pf.targets));
                 let near_deadly = |c: (i32, i32)| -> bool {
                     deadly_below.iter().any(|d| *d == c)
@@ -710,11 +616,11 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 let mut best_refill = false;
                 let mut best_focus = false;
                 for (i, c) in fresh.iter().enumerate() {
-                    // 避人（）：跳过"身处不可呼吸环境的人"附近的格
+                    // 避人：跳过"身处不可呼吸环境的人"附近的格
                     if near_danger(*c) {
                         continue;
                     }
-                    // 死亡格（，）：目标格下方是污染/真空 → 挖开即致命
+                    // 死亡格：目标格上下是污染/真空 → 挖开会释放有害液体/气体
                     if near_deadly(*c) {
                         continue;
                     }
@@ -738,7 +644,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         best_focus = is_focus;
                     }
                 }
-                // ★ 向下梯子预铺（v3 ②）：focus 目标在可达区下方且站立格无梯子 → 先铺梯子。
+                // ★ 向下梯子预铺：focus 目标在可达区下方且站立格无梯子 → 先铺梯子。
                 //   只在 pick 为空（横向无格可挖）时才用；方向由 focus 决定。
                 let down_ladder_pending: Option<(i32, i32)> = match focus {
                     Some((fx, fy)) if best_idx.is_none() => {
@@ -789,20 +695,17 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 }
                 let note_prefix = ladder_note.map(|n| format!("[{}] ", n)).unwrap_or_default();
                 // 把「视野内还有多少格挂着挖掘标记」写进结果：
-                //   mod 下发的挖掘工单**不出现在 step_facts 的 remainingTrackedOrders 里**
-                //
-                //   代理只按 pending_orders 判"有没有活"→ 误判空跑 → 把世界冻回去
-                //   → 那 5 张工单永远不会被执行。必须把"还有活"显式带出来。
+                //   mod 下发的挖掘工单**不出现在 step_facts 的 remainingTrackedOrders 里**，
+                //   只按 pending_orders 判"有没有活"会误判空跑并把世界冻回去 → 必须把"还有活"显式带出来。
                 let outstanding = pf.targets.iter().filter(|t| t.has_marker).count();
                 let out_note = if outstanding > 0 {
                     format!("；视野内还有 {} 格待完成", outstanding)
                 } else {
                     String::new()
                 };
-                // ★ "无可下单曲" = **零进展**（没挖任何东西）→ 必须记为失败。
-                //   旧逻辑两种情况都 ok:true → 循环检测/熔断都抓不到它 →
-                //   慢系统收到"已执行"以为在推进，实际目标永远不动（实测 open_chamber 空转）。
-                //   记为失败后：动作级循环检测能识别"同一目标反复零进展" → 上报慢系统换方案。
+                // ★ "无可下单曲" = **零进展**（没挖任何东西）→ 必须记为失败（AGENTS.md §9）。
+                //   记为成功会让循环检测/熔断都抓不到它；记为失败后动作级循环检测能识别
+                //   "同一目标反复零进展" → 上报慢系统换方案。
                 let (ok, detail) = if pick.is_some() {
                     (true, format!("{}{}前沿 {} 格（新 {} / 已有标记 {}），本轮挖 1 格：新标记 {}，已在位 {}",
                         note_prefix, out_note, ready.len(), fresh.len(), marked.len(), issued, already))
@@ -815,7 +718,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         note_prefix, out_note, ready.len()))
                 };
                 // 零进展（无可下单曲）用 ok=false → 末尾 aggregate_ok 会让整体失败
-                //   → 触发熔断/上报换方案，不再被硬编码的 ok:true 吞掉。
+                //   → 触发熔断/上报换方案。
                 results.push(ActionResult { kind: "dig".into(), why: why.clone(), ok, detail });
             }
             Action::Build { anchor, prefab, size, material, why } => {
@@ -844,11 +747,9 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                     Err(e) => return ExecOutcome::stop("build", why, e),
                 };
                 let a = pts[0];
-                // 材料选择：目录的 availableMaterials（地上已有）→ defaultMaterials（推荐）。
-                //   旧代码只用 available_materials.first()，开局它是**空数组**
-                //   生成无材料 token → mod 报 phase: failed（建造被游戏拒绝）。
-                // 材料来自 mod 权威查询：它按地上实际库存给出可用材料。
-                //   目录的 defaultMaterials 只是首选一种；猜错了游戏会静默拒绝建造。
+                // 材料来自 mod 权威查询（按地上实际库存给出可用材料，见 mod_available_materials）：
+                //   目录的 availableMaterials 在地上没材料时是空数组，defaultMaterials 只是首选一种；
+                //   猜错了游戏会静默拒绝建造（mod 报 phase: failed）。
                 let (mats, mat_reason) = mod_available_materials(session, &def.prefab_id);
                 let mat = if !material.is_empty() {
                     material.clone()
@@ -927,9 +828,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                     }
                 };
                 let (w, h) = (def.width, def.height);
-                // 先判**能不能造**（研究锁 + 材料），再造。
-                //   旧顺序是"先查材料 → 造 → 落点失败" → 被研究锁的建筑
-                //   会反复走到"找不到落点"这一步 → 反复失败 → 反复冻回。
+                // 先判**能不能造**（研究锁 + 材料），再造：被研究锁的建筑必须在这里失败，不能走到"找不到落点"。
                 let mat = match buildability(session, &def.prefab_id) {
                     Buildability::Ready(m) => {
                         if !material.is_empty() {
@@ -984,13 +883,10 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 let Some((anchor, pf)) =
                     oni_world::preflight::find_build_site(session, rect, (w, h), mat_ok, Some(catalog), &prefab)
                 else {
-                    // 自动腾空间：
-                    //   找不到落点**不等于**「没地方」 —— 常常只是**空间不够**（占格是实心岩）。
-                    //   旧逻辑直接失败 → 节点被暂缓 → 厕所/床永远建不成；
-                    //   而上一局就是「没有厕所 → 膀胱爆 → 随地排泄 → 污染水 → 溺死」。
-                    //   新逻辑：找一块 W×H 的候选地（占格只能气体或实心岩、底边要有实心支撑），
+                    // 自动腾空间：找不到落点**不等于**「没地方」—— 常常只是**空间不够**（占格是实心岩）。
+                    //   找一块 W×H 的候选地（占格只能气体或实心岩、底边要有实心支撑），
                     //   把其中**一格实心岩**挖掉（过统一挖掘预检：避人/死亡格/落脚点），
-                    //   下一轮再回来建造 → 空间自己长出来。
+                    //   下一轮再回来建造（见 dig_space_for）。
                     let dupes = oni_world::preflight::dupe_positions(session);
                     if let Some((cell, note)) =
                         dig_space_for(session, Some(catalog), rect, (w, h), &dupes, &def.name)
@@ -1017,11 +913,8 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                     return ExecOutcome { results, ok: false };
                 };
                 // ★ 支撑缺失 → **先铺地板砖**，下一轮再建造。
-                //   为什么必须有这一步：OnFloor 建筑（旱厕/发电机/洗手盆）要求底边是地板砖；
-                //   旧逻辑只在"连落点都找不到"时才去挖空间，挖完依然没有地板砖
-                //   → 厕所永远建不成（实测第 2 座旱厕连续失败 10+ 次，每轮报
-                //   "落地失败"）。铺砖是**确定性的机械子步骤**，不属于慢系统的策略权衡，
-                //   所以放快系统做，慢系统不必为此决策。
+                //   OnFloor 建筑（旱厕/发电机/洗手盆）要求底边是地板砖（AGENTS.md §2：支撑必须在 y-1）。
+                //   铺砖是**确定性的机械子步骤**，不属于慢系统的策略权衡，所以放快系统做。
                 if !pf.supported {
                     let supports: Vec<(i32, i32)> =
                         (0..w.max(1)).map(|dx| (anchor.0 + dx, anchor.1 - 1)).collect();
@@ -1174,10 +1067,8 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                         detail: format!("无法解析的 goal: {goal}") });
                     return ExecOutcome { results, ok: false };
                 };
-                // 语义动作只负责"圈定目标区"，挖掘交给**统一执行管线**
-                //   。
-                //   旧版语义动作自己拼 raw 工单，绕过了全部这些规则
-                //   死工单 + 重复下单 + 把好节点拖进熔断。
+                // 语义动作只负责"圈定目标区"，挖掘交给**统一执行管线**：
+                //   自己拼 raw 工单会绕过预检/避人/死工单规则（死工单 + 重复下单 + 把好节点拖进熔断）。
                 let Some(action) = crate::autoact::compile(session, Some(catalog), g, why) else {
                     results.push(ActionResult { kind: "auto".into(), why: why.clone(), ok: false,
                         detail: format!("语义目标在当前地图上找不到（{}）→ 换方案", goal) });
@@ -1215,7 +1106,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
                 }
             }
             Action::Order { cmd, why } => {
-                // 必须 dry-run → apply 两步都做（历史 bug：只做了 dry-run，指令从没落地）
+                // 必须 dry-run → apply 两步都做（AGENTS.md §6）：只做 dry-run，指令不会落地。
                 if let Err(e) = run_order(session, cmd, true) {
                     results.push(ActionResult { kind: "order".into(), why: why.clone(), ok: false, detail: format!("dry-run 失败: {e}") });
                     return ExecOutcome { results, ok: false };
@@ -1237,9 +1128,7 @@ pub fn execute(session: &McpSession, catalog: &Catalog, actions: &[Action]) -> E
 
 /// **真实可达材料**：读 `oni://resources/inventory`。
 ///
-/// 为什么不能用目录里的 `availableKg`：那是全局/陈旧值。
-/// 开局砂岩目录显示 11782kg，实际地上 **0kg**，
-/// 于是代理反复下"材料不够"的建造单 → 每轮都失败 → 看着像在跑、其实啥也没干。
+/// 约束：不能用目录里的 `availableKg` —— 那是全局/陈旧值，可能与地上真实散装量不符（AGENTS.md §3）。
 pub fn loose_material_kg(session: &McpSession, element: &str) -> f64 {
     let Ok(v) = session.read_json("oni://resources/inventory") else {
         return 0.0;
@@ -1289,95 +1178,36 @@ fn bounds(cells: &[(i32, i32)]) -> (i32, i32, i32, i32) {
 }
 
 
-
-/// **研究 id 的优先级表**（ONI 基础研究树，按对殖民地的重要性排序）。
-///
-/// 为什么用固定表而不是动态查询：
-///   mod **没有**暴露"可用研究列表"接口，
-///   `management/research.md?format=json` 只有 active/target/queue 三项。
-///   → 唯一可行办法是**按 id 逐个尝试**（不存在的 id 会回 "Research tech not found"）。
-///   这张表就是"试哪些、按什么顺序"的知识沉淀。
-///
-/// 顺序含义：**先食物、再产氧、再基建**。
-pub const RESEARCH_PRIORITY: &[&str] = &[
-    // —— 食物链 ——
-    "FarmingTech",      // 基础耕种 -> 藻类箱/种植箱/口粮箱/堆肥堆
-    "FineDining",       // 食物制备 -> 电动烤箱
-    "Agriculture",      // 农业 -> 农业站
-    "RationBox",        // 口粮箱
-    // —— 产氧 ——
-    "ImprovedOxygen",   // 空气系统 -> 电解器
-    "LiquidPiping",     // 水管（电解器的前置）
-    "LiquidConduit",
-    "AtmosphericAnalysis",
-    // —— 基建/电力 ——
-    "BasicPower",
-    "PowerManagement",
-    "AdvancedPower",
-    "Batteries",
-    // —— 居住/健康 ——
-    "BasicFarming",
-    "Hygiene",
-    "BasicConstruction",
-    "FineDining2",
-];
-
-/// 自动选一项研究（返回 research id）。
-///
-/// 为什么需要：研究是**唯一**能解锁关键设备的途径
-///   （电动烤箱/电解器/农业站/藻类箱全部研究锁）。
-///   手工点研究要重读文件 + 试探 id —— 应该由代理自己按优先级选。
-///
-/// 做法：按 `RESEARCH_PRIORITY` 顺序**逐个尝试**，第一个不报
-/// "Research tech not found" 的就是它（失败原因会是"研究点不足"等）。
-pub fn pick_research(session: &McpSession) -> Option<String> {
-    // 已经 active / 已在队列里的 -> 不重复选
-    if let Ok(v) = session.read_json("oni://research/status") {
-        let active = v
-            .get("active")
-            .and_then(|a| a.get("id"))
-            .and_then(|i| i.as_str())
-            .unwrap_or("")
-            .to_string();
-        let queued: Vec<String> = v
-            .get("queue")
-            .and_then(|q| q.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !active.is_empty() || !queued.is_empty() {
-            return None; // 已有研究在跑
-        }
-    }
-    for id in RESEARCH_PRIORITY {
-        if research_id_exists(session, id) {
-            return Some((*id).to_string());
-        }
-    }
-    None
+/// 当前在研（或队列首位）的研究 (id, 名字)；没有则 None。
+pub fn current_research(session: &McpSession) -> Option<(String, String)> {
+    let v = session.read_json("oni://research/status").ok()?;
+    let pick = |x: &serde_json::Value| -> Option<(String, String)> {
+        let id = x.get("id")?.as_str()?.to_string();
+        if id.is_empty() { return None; }
+        let name = x.get("name").and_then(|n| n.as_str()).map(crate::sense::strip_link).unwrap_or_else(|| id.clone());
+        Some((id, name))
+    };
+    pick(v.get("active")?).or_else(|| v.get("queue")?.as_array()?.first().and_then(pick))
 }
 
-/// 某个 research id 在当前存档里是否存在（试写一次，读回是否成功）。
-fn research_id_exists(session: &McpSession, id: &str) -> bool {
-    let line = format!("research id=\"{}\" confirm=true", id);
-    let res = session.call_text(
-        "world_editor",
-        serde_json::json!({
-            "command": "edit", "path": "/active/management/research.md",
-            "content": format!(
-                "<<<<<<< SEARCH\n# research id=\"ImprovedOxygen\" confirm=true\n=======\n{}\n>>>>>>> REPLACE",
-                line
-            ),
-            "confirm": true,
-            "task": format!("代理: 探测研究 {id}")
-        }),
-    );
-    let Ok(text) = res else { return false };
-    // "Research tech not found" -> 这个 id 不存在
-    !text.contains("Research tech not found")
+/// 设定研究方向。研究方向是"往哪走"，由大脑决定（`oni research <TechId>`）；执行器只执行。
+/// 返回 mod 的原始输出（含 "Research tech not found" / "研究点不足" 等失败原因）供回执。
+pub fn set_research(session: &McpSession, id: &str) -> Result<String, String> {
+    let line = format!("research id=\"{id}\" confirm=true");
+    session
+        .call_text(
+            "world_editor",
+            serde_json::json!({
+                "command": "edit", "path": "/active/management/research.md",
+                "content": format!(
+                    "<<<<<<< SEARCH\n# research id=\"ImprovedOxygen\" confirm=true\n=======\n{}\n>>>>>>> REPLACE",
+                    line
+                ),
+                "confirm": true,
+                "task": format!("大脑: 研究方向 {id}")
+            }),
+        )
+        .map_err(|e| e.to_string())
 }
 
 /// 找已建成建筑的位置（按中文名）。走官方建筑索引。
@@ -1443,32 +1273,17 @@ pub fn building_has_wire(session: &McpSession, name: &str) -> bool {
     true
 }
 
-/// 救援：把倒地的复制人移到**有氧气的落脚点**。
-///
-/// 为什么需要：
-///   旧结论"mod 无 dupes_control、downed 不可救"**是错的**—— mod 有
-///   `dupes_control domain=command action=move_to`，只是：
-///     - **只能移到「对象名」**（打印舱/研究站/厕所/床铺…），不能传坐标；
-///     - 用 `人@名字` 语义快捷键（`dupeName=` 传中文名会报 Duplicant not found）。
-///   倒地的复制人若待在污染区会**必定死亡**；把他挪到干净的建筑旁边就能活。
-///
 /// **这个复制人是否需要救援**（倒地 **或** 在不可呼吸环境里呼吸持续下降）。
 ///
-/// 这是 修复的**完整形态**。
-///   之前只在 exec.rs 里扩宽了 rescue_dupes 的内部条件，但 agent.rs 的**调用门槛**
-///   仍然是 `downed_count() > 0` → "呼吸在掉但没倒地"的人**根本进不了救援逻辑**，
-///   扩展形同虚设。
-///   ⇒ 判据必须**只有一份**，调用方与执行方共用。
+/// 约束：判据必须**只有一份**，调用方（agent.rs）与执行方（rescue_dupes）共用 ——
+///   调用门槛若只看倒地人数，"呼吸在掉但没倒地"的人进不了救援逻辑。
 pub fn dupe_needs_rescue(d: &crate::sense::Dupe) -> bool {
     let breath = d.breath.unwrap_or(0.0);
     d.is_downed() || (d.in_unbreathable() && breath < 95.0)
 }
 
-/// 返回 true = 已发出移动指令。
-/// S3 执行后复核：**「已下令」不等于「已生效」**。
-///
-/// 倒地的复制人无法自行寻路 → 移动工单永远不会被执行 → 旧日志写「已挪动」是谎报，
-/// 会让人以为救到了而不去建床 / 清毒气。
+/// 执行后复核：**「已下令」不等于「已生效」**（AGENTS.md §6）。
+/// 倒地的复制人无法自行寻路 → 移动工单可能永远不会被执行，"已挪动"的日志不能当真。
 ///
 /// 做法：下达移动命令时**记下移动前的位置**；下一轮**回读当前位置**对比：
 ///   位置变了 → 真的挪到了；没变 → 如实报告「未生效（目标不可达 / 需要一张床）」。
@@ -1549,15 +1364,18 @@ pub fn verify_moves(session: &McpSession) -> Vec<String> {
     out
 }
 
+/// 救援：把倒地的复制人移到**有氧气的落脚点**。
+///
+/// mod 的移动指令（`dupes_control domain=command action=move_to`）限制：
+///   - **只能移到「对象名」**（打印舱/研究站/厕所/床铺…），不能传坐标；
+///   - 用 `人@名字` 语义快捷键（`dupeName=` 传中文名会报 Duplicant not found）。
+/// 倒地的复制人若待在污染区会**必定死亡**；把他挪到干净的建筑旁边就能活。
 pub fn rescue_dupes(session: &McpSession, dupes: &[crate::sense::Dupe]) -> Vec<String> {
     // 候选落点：**局内所有已建成建筑**，按「它附近有没有富氧格」排序。
     //
-    // 为什么不再用硬编码名单（旧名单：研究站/发电机/电解器/…）：
-    //   1) 开局这些建筑常常一个都不存在 → 救援静默失败，代理看着人死；
-    //   2) 旧判据只看**锚点那一格**是不是富氧 → 基地被 CO₂ 污染后
-    //      每个候选都被否掉 → **一次救援令都发不出去**（实测三人全部倒地）。
-    // 现在：列出全部建筑，用「锚点 + 邻域」里最富氧的那一格打分，
-    //   选最好的几个当落点；一个都没有就**如实报告**（失败要可见）。
+    // 不用硬编码名单：开局名单里的建筑常常一个都不存在。
+    // 打分用「锚点 + 邻域」里最富氧的那一格（只看锚点一格会在基地被 CO₂ 污染后否掉所有候选）；
+    // 选最好的几个当落点，一个都没有就**如实报告**（失败要可见，AGENTS.md §9）。
     let mut cands: Vec<(String, i32, i32)> = Vec::new();
     if let Ok(text) = session.call_text(
         "world_editor",
@@ -1622,7 +1440,7 @@ pub fn rescue_dupes(session: &McpSession, dupes: &[crate::sense::Dupe]) -> Vec<S
         })
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    // 只要富氧落点（>=2）。宁可没有，也不要把人送进毒气（旧事故：救援成了杀手）。
+    // 只要富氧落点（>=2）。宁可没有，也不要把人送进毒气。
     let targets: Vec<String> = scored
         .iter()
         .filter(|(_, s)| *s >= 2.0)
@@ -1637,8 +1455,7 @@ pub fn rescue_dupes(session: &McpSession, dupes: &[crate::sense::Dupe]) -> Vec<S
     }
     let mut moved = Vec::new();
     for d in dupes {
-        // 不能只救"倒地" —— 卡塔莉娜当时状态是**为建造挖掘**（没倒地），
-        //   但人在污染水层里干活，呼吸一路归零 → 死亡。旧规则直接 continue → 代理看着她死。
+        // 不能只救"倒地"：没倒地但人在污染水层里干活的人，呼吸也会一路归零（判据见 dupe_needs_rescue）。
         if !dupe_needs_rescue(d) {
             continue;
         }
@@ -1716,9 +1533,7 @@ pub fn mod_available_materials(
 
 /// mod 报告的候选材料 + **地上真实可用量**。
 ///
-/// 为什么不能只看 `materials[]` 的顺序：
-///   mod 返回的 `materials[]` 是**目录顺序**，第一个往往地上 0kg
-///   。
+/// 约束：不能只看 `materials[]` 的顺序 —— 它是**目录顺序**，第一个往往地上 0kg
 ///   ⇒ 必须按 availableKg 排序，取第一个真有货的。
 pub fn mod_materials_with_kg(
     session: &McpSession,
@@ -1746,9 +1561,7 @@ pub fn mod_materials_with_kg(
 
 /// **自举**：某个建筑造不了（缺材料）时，去挖它缺的那个材料。
 ///
-/// 为什么必须有：
-///   开局零铜零氧石 → 产氧节点每轮都失败 → 保命节点不暂缓 → **整轮空转**。
-///   代理应该做的是"缺什么就去挖什么"，而不是反复尝试注定失败的建造。
+/// 约束："缺什么就去挖什么"，而不是反复尝试注定失败的建造
 ///   ⇒ 返回 `element:<材料>` 语义目标，交给元素搜索去找最近的该元素格。
 ///
 /// 只选**能挖到散装**的元素类材料（岩石/矿），不选需要特殊来源的。
@@ -1773,19 +1586,15 @@ pub fn bootstrap_material(
     if candidates.is_empty() {
         return None;
     }
-    // 修正：**按位置挑材料，不按目录顺序**。
-    //   同一个建筑可能同时缺铜（深埋在下方，挖了会放出 CO₂/水袋）和
-    //   铁矿（在地表附近，挖它顺带就通地表了）。
-    //   正解：逐个搜最近位置，**优先选"在上方/浅"的**，下方重罚。
+    // **按位置挑材料，不按目录顺序**：同一个建筑可能同时缺铜（深埋在下方，挖了会放出 CO₂/水袋）和
+    //   铁矿（在地表附近，挖它顺带就通地表了）。逐个搜最近位置；下方的材料直接排除（见下）。
     let mut best: Option<(i32, String)> = None;
     for tag in &candidates {
         let found = oni_world::search::search_element(session, tag, near, 40);
         let Some(first) = found.first() else { continue };
         let (fx, fy) = *first;
-        // 用户指令「别再往下挖了」→ **下方的材料直接排除**。
-        //   下方 = 地下 CO₂ / 水袋 / 深坑。
-        //   旧逻辑只是"重罚 1000 分"，但当**只有**下方材料时仍会去挖 → 违背指令。
-        //   正解：下方材料不作为候选；若因此找不到材料 → 返回 None → 上层换方案。
+        // 约束：**下方的材料直接排除**（下方 = 地下 CO₂ / 水袋 / 深坑）。
+        //   若因此找不到材料 → 返回 None → 上层换方案。
         if let Some((_, ny)) = near {
             if fy < ny {
                 eprintln!(
@@ -1814,10 +1623,7 @@ mod buildability_tests {
     use super::*;
 
     /// ★ 回归："零进展"绝不能报成功。
-    ///   旧 bug：execute() 末尾无条件 `ok: true`，分支里 push 的 ok:false 被丢掉
-    ///   → 慢系统收到"已执行"以为目标达成 → 无限重复入队推不动的目标
-    ///   → 快系统恢复→失败→冻回 无限乒乓（实测 material 反复"已执行：前沿 N 格无可下单曲"）。
-    ///   熔断机制靠 goal_outcomes.jsonl 里的 ok 字段统计，ok 恒 true → 熔断永不触发。
+    ///   熔断机制靠 goal_outcomes.jsonl 里的 ok 字段统计，ok 必须由各结果真实汇总，否则熔断永不触发。
     #[test]
     fn exec_outcome_aggregates_failure_from_results() {
         let failed = ActionResult {
@@ -1836,17 +1642,6 @@ mod buildability_tests {
         assert!(!aggregate_ok(&[failed.clone()]), "单个失败结果必须让整体失败");
         assert!(!aggregate_ok(&[ok_hit.clone(), failed]), "混合结果里有失败 → 整体必须失败");
         assert!(aggregate_ok(&[ok_hit]), "全成功才允许整体成功");
-    }
-
-    /// 研究优先级表：食物链必须排在产氧前面。
-    #[test]
-    fn research_priority_puts_food_first() {
-        let p = RESEARCH_PRIORITY;
-        let farming = p.iter().position(|x| *x == "FarmingTech").expect("应有 FarmingTech");
-        let dining = p.iter().position(|x| *x == "FineDining").expect("应有 FineDining");
-        let oxy = p.iter().position(|x| *x == "ImprovedOxygen").expect("应有 ImprovedOxygen");
-        assert!(farming < dining, "基础耕种必须排在食物制备之前（否则烤箱解锁不了）");
-        assert!(dining < oxy, "食物链必须排在产氧之前");
     }
 
     /// 被研究锁 vs 缺材料 —— 必须分开。
@@ -1873,10 +1668,8 @@ mod buildability_tests {
 
 /// 建筑当前的**可建造性**判定。
 ///
-/// 为什么需要：被研究锁的建筑（电动烤炉、电解器、
-///   藻类箱…）即使材料齐全也造不出来 → 代理反复尝试 → 每次都失败
-///   触发「动作失败 → 冻回暂停」→ 殖民地反复停摆。
-///   必须在**动手前**分清"缺材料"（可去采）与"被研究锁"（只能等研究）。
+/// 约束：必须在**动手前**分清"缺材料"（可去采）与"被研究锁"（只能等研究）——
+///   被研究锁的建筑即使材料齐全也造不出来（AGENTS.md §8「能不能造」要过三关）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Buildability {
     /// 现在就能造（材料已就位）
@@ -1889,12 +1682,10 @@ pub enum Buildability {
 
 /// 查询建筑当前能不能造（材料 + 研究锁）。
 ///
-/// 为什么锁定状态要单独查：
-///   `oni://buildings/materials?prefabId=X` **不报告研究锁**——它照样返回
-///   铜矿 1452kg（看起来材料齐全），但建筑其实被锁。
-///   真正报锁定的是 `building_control domain=planning action=search_defs`：
+/// 约束：锁定状态要单独查 —— `oni://buildings/materials?prefabId=X` **不报告研究锁**
+///   （材料齐全但建筑被锁时照样返回材料）。
+/// 真正报锁定的是 `building_control domain=planning action=search_defs`：
 ///   它的 `autoMaterialReason` = `building_locked_by_research`、`unlocked: false`。
-///   两个接口口径不一致 → 只看 materials 会误判"能造" → 反复失败。
 pub fn buildability(session: &McpSession, prefab_id: &str) -> Buildability {
     // 1) 先查研究锁（权威口径）
     if let Some(lock) = research_lock_reason(session, prefab_id) {
@@ -1903,10 +1694,8 @@ pub fn buildability(session: &McpSession, prefab_id: &str) -> Buildability {
     // 2) 再查材料
     let (mats, reason) = mod_available_materials(session, prefab_id);
     if let Some(m) = mats.first() {
-        // 修正：mod 返回的「可用材料」是**目录顺序**，
-        //   不是「地上真的有货」的顺序。建旱厕时取了目录第一个「火成岩」
-        //   → 反复失败「材料不可用」→ 节点被暂缓。
-        //   正解：按**地上真实可用量**排序，取第一个真有货的。
+        // mod 返回的「可用材料」是**目录顺序**，不是「地上真的有货」的顺序
+        //   → 按**地上真实可用量**排序，取第一个真有货的。
         let mut best: Option<(f64, String)> = None;
         for tag in &mats {
             let kg = loose_material_kg(session, tag);
@@ -1937,8 +1726,6 @@ pub fn research_lock_reason(session: &McpSession, prefab_id: &str) -> Option<Str
     // 必须**精确匹配 prefabId**，不能取第一个：
     //   search_defs 按 prefabId 查询时会返回**多个相似匹配**（前缀/包含关系），
     //   例如查 "ResearchCenter" 返回 AdvancedResearchCenter（研究锁）在前。
-    //   旧代码取第一段 → 把未锁的研究站误判成"被研究锁" → 研究站永远建不成
-    //   → 烤箱不解锁 → 食物链断裂 → 全局卡死。
     let want = format!("prefabId: {}", prefab_id);
     let mut seg: Option<&str> = None;
     for line in text.lines() {
@@ -2039,10 +1826,8 @@ fn list_dig_orders(session: &McpSession) -> Vec<(i32, i32)> {
 
 /// **死工单清扫**：撤销"复制人根本走不到"的挖掘工单。
 ///
-/// 为什么需要：模型比游戏宽松时（旧的 phantom 建筑 / 宽松的地板判据），
-///   代理会把工单下到没人能站的地方 → 游戏里每个复制人都被拒绝
-///   → 全员闲 + 工单积压 = "看游戏没进展"。
-///   这些单子会一直占着差事队列，掩盖真实进展 → 必须撤。
+/// 模型比游戏宽松时（AGENTS.md §3.5），工单会被下到没人能站的地方 → 游戏里每个复制人都被拒绝
+///   → 全员闲 + 工单积压；这些单子会一直占着差事队列，掩盖真实进展 → 必须撤。
 ///
 /// 判据用**模型 + 官方可达集**（事实），不需要慢系统决策：
 ///   目标格周围没有任何"复制人走得到的落脚点"，且这一列也铺不出梯子链

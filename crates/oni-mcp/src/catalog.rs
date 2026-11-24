@@ -22,11 +22,9 @@ pub struct BuildingDef {
     pub available_materials: Vec<MaterialDef>,
     /// 建造目录给出的**首选材料**（即使当前地上没有该材料也会列出）。
     ///
-    /// 为什么需要：开局地上零建材，`availableMaterials` 是**空数组**。
-    ///   旧代码 `available_materials.first()` 拿到空 → 生成无材料的 `Prefab:7` token
-    ///   mod 报 `phase: failed`。
-    ///   正确做法：拿目录里的 `defaultMaterials`（例：梯子 = Isoresin 异构树液）作为目标材料，
-    ///   再单独检查地上有没有它 —— **有材料才能造，没有就换方案**。
+    /// 开局地上零建材时 `availableMaterials` 是空数组，无材料的 `Prefab:7` token 会被 mod 报 `phase: failed`；
+    /// 所以用 `defaultMaterials`（例：梯子 = Isoresin 异构树液）作为目标材料，
+    /// 再单独检查地上有没有它 —— 有材料才能造，没有就换方案。
     #[serde(default, rename = "defaultMaterials")]
     pub default_materials: Vec<String>,
     /// 该建筑接受的材料**类别**（mod 的 `materialCategories` 解析结果）。
@@ -49,9 +47,8 @@ pub struct MaterialDef {
 
 /// 建造目录缓存。
 ///
-/// **关键教训**：接口默认只返回"当前可用/已解锁"的子集，
-/// 完整集合是 100+ 项（电解器、藻类箱、种植箱都在其中）。
-/// 因此这里**永远**带 `includeUnavailable=true`，并落盘缓存，避免重复踩坑。
+/// 接口默认只返回"当前可用/已解锁"的子集，完整集合是 100+ 项（电解器、藻类箱、种植箱都在其中）；
+/// 因此这里永远带 `includeUnavailable=true`，并落盘缓存。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     pub fetched_at: u64,
@@ -73,20 +70,18 @@ impl Catalog {
                     .map(|d| d.as_secs())
                     .unwrap_or(0)
                     .saturating_sub(cat.fetched_at);
-                // 24h TTL 太长 → 目录缓存跨局复用
-                //   新存档里"煤电/种植箱/打印舱"整批缺失
-                //   preflight 把 Generator 模糊匹配成 DevGenerator(1×1) → 落点判断全错。
-                //   目录会随研究解锁而变，30 分钟足够安全，又不会跨局带脏。
+                // 目录缓存 TTL = 30 分钟：目录会随研究解锁/换存档而变，缓存跨局复用会整批缺建筑
+                //   （preflight 把 Generator 模糊匹配成 DevGenerator(1×1) → 落点判断全错）。
                 if age < 30 * 60 && !cat.buildings.is_empty() {
                     return Ok(cat);
                 }
             }
         }
-        // 两个查询取**并集**：
+        // 两个查询取并集：
         //   1) 默认查询 = 当前可用/已解锁的那批
         //   2) includeUnavailable=true = 另一批，
-        //      但它按字母序截断（只到 G/L），所以单靠它会**丢**基础建筑。
-        //   历史上因为只看了被过滤的子集，直接得出"这游戏没有电解器"的致命误判。
+        //      但它按字母序截断（只到 G/L），所以单靠它会丢基础建筑。
+        // 只看被过滤的子集会把已锁定的建筑（如电解器）误判为不存在。
         let mut merged: Vec<BuildingDef> = Vec::new();
         for uri in [
             "oni://buildings/defs?includeUnavailable=true&limit=1000",

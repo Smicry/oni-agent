@@ -21,10 +21,9 @@ pub struct Cell {
     pub mass_kg: f64,
     #[serde(default)]
     pub buildings: Vec<CellBuilding>,
-    /// 该格上的**标记**（挖掘 DigPlacer / 取消 / 清扫…）。
+    /// 该格上的标记（挖掘 DigPlacer / 取消 / 清扫…）。
     ///
-    /// 为什么需要：代理每轮取第一个前沿格 → 每轮重复对同一格下单，
-    ///   既浪费又掩盖真实进展。
+    /// 用于优先挑没标记的格子，避免每轮对同一格重复下单。
     #[serde(default)]
     pub designations: Vec<CellDesignation>,
 }
@@ -52,11 +51,10 @@ pub struct CellBuilding {
     pub operational: Option<bool>,
 }
 
-/// 单格气体达到这个质量（kg/格）才判 CO2 致命。
+/// 单格气体达到这个质量（kg/格）才把 CO2 判为危险格。
 ///
-/// 校准：基地 Y=189~196 的 CO2 只有 ~1.15kg/格，
-///   复制人站在里面**呼吸仍是 100**。
-///   一刀切排除 CO2 会让发电选址全否 → 永远造不出发电机 → 基地永远没氧气 → 死锁。
+/// 校准：约 1.15kg/格 的 CO2 里复制人呼吸仍为 100。
+/// 约束：不能一刀切排除 CO2，否则发电选址全被否决、造不出发电机。
 pub const CO2_DANGER_KG_PER_CELL: f64 = 5.0;
 
 impl Cell {
@@ -90,33 +88,28 @@ impl Cell {
         false
     }
 
-    /// 该格是否是**适合人长时间待在里面的**格子（比 is_hazardous 严格得多）。
+    /// 该格是否适合人长时间待在里面（比 `is_hazardous` 严格得多）。
     ///
-    /// ：
-    ///   基地 Y=189 的 CO2 只有 0.86~1.42 kg/格 —— 远低于致命阈值，
-    ///   但**人待在里面呼吸会一路降到 77~93**（吉恩在发电机房里反复出现这个值），
-    ///   长期待着 -> 归零 -> 死亡。
-    ///   所以「人要待在里面」的落点（床/厕所/发电机/治疗设施）必须基本是纯氧区：
-    ///   CO2 即使只有 1 kg/格也不算数。
-    /// 而「路过/挖掘工作」的格子用宽松判据（is_hazardous）即可。
+    /// 约束：人要待在里面的落点（床/厕所/发电机/治疗设施）必须是纯氧区——
+    /// 约 1 kg/格 的 CO2 也会让呼吸持续下降，所以 CO2 即使浓度很低也不算数；
+    /// 「路过/挖掘工作」的格子用宽松判据（`is_hazardous`）即可。
     pub fn is_safer_for_occupied(&self) -> bool {
         if self.is_solid() {
             return false; // 实心岩住不了人
         }
-        // ★ 液体格一律不住人：mod 的元素字段在"有薄层污水"时仍报主导气体为 Oxygen，
-        //   旧判定于是把厕所/床建在污染水里（实测两座 Outhouse 泡在 DirtyWater 里，
-        //   入口被淹，复制人宁可膀胱 100% 也不用）。人要待的格子必须干燥。
+        // 液体格一律不住人：mod 的元素字段在"有薄层污水"时仍报主导气体为 Oxygen，
+        // 只看元素名会把厕所/床建在污染水里（入口被淹，复制人不使用）。人要待的格子必须干燥。
         if self.is_liquid() {
             return false;
         }
         let el = self.element.as_str();
-        // element 为空 = **读不到数据**（batch fetch 漏格），
+        // element 为空 = 读不到数据（batch fetch 漏格），
         //   不能当成"安全"—— AGENTS.md §9：读不到数据 ≠ 数据是极值。
         if el.is_empty() {
             return false;
         }
         if matches!(el, "Oxygen" | "氧气" | "OxygenGas" | "PureOxygen") {
-            // 氧气还要**够呼吸**（质量 ≥0.3kg）：近真空格元素名也是 Oxygen，人爬上去窒息。
+            // 氧气还要够呼吸（质量 ≥0.3kg）：近真空格元素名也是 Oxygen，人爬上去窒息。
             return self.has_breathable_mass();
         }
         if matches!(el, "CarbonDioxide" | "二氧化碳") {
@@ -125,10 +118,9 @@ impl Cell {
         false
     }
 
-    /// P0-69：氧气质量检查 —— 区分"元素名是氧气"与"氧气够呼吸"。
-    ///   竖井顶端 (127,215) 元素=Oxygen 但只有 0.046kg/格（近真空），
-    ///   is_safer_for_occupied 只看元素名会误判安全 → 人爬上去窒息。
-    ///   阈值 0.3kg：正常氧气格 1~3kg，低氧竖井 <0.1kg。读不到数据一律 false（保守）。
+    /// 氧气质量检查：区分"元素名是氧气"与"氧气够呼吸"。
+    /// 阈值 0.3kg：正常氧气格 1~3kg，近真空格 <0.1kg（元素名也是 Oxygen，人爬上去窒息）。
+    /// 读不到数据一律 false（保守）。
     pub fn has_breathable_mass(&self) -> bool {
         if self.element.is_empty() {
             return false;
@@ -201,9 +193,7 @@ mod tests {
         }
     }
 
-    /// 的校准：**CO₂ 主导的格子，哪怕只有 0.25 kg/格，
-    ///   人待在里面呼吸也会一路掉到 0** → 绝不能当"落脚点/居住落点"。
-    ///   旧的 is_hazardous 按 5 kg/格 才算致命 → 漏放 → 代理把人派进去
+    /// CO₂ 主导的格子哪怕只有 0.25 kg/格，人待在里面呼吸也会掉到 0 → 不能当"落脚点/居住落点"。
     #[test]
     fn co2_dominant_cell_is_never_safe_to_stand_in() {
         let c = cell("CarbonDioxide", 0.25);
@@ -229,9 +219,7 @@ mod tests {
         assert!(!cell("", 0.0).is_safer_for_occupied());
     }
 
-    /// ★ 回归：液体格不住人，哪怕主导气体是氧气。
-    ///   实测两座 Outhouse 建在 DirtyWater 里（mod 元素字段报 Oxygen），
-    ///   入口被淹，复制人膀胱 100% 也不用。
+    /// 液体格不住人，哪怕主导气体是氧气（mod 元素字段在薄层污水上仍报 Oxygen）。
     #[test]
     fn liquid_cell_is_never_safe_for_occupied_even_if_oxygen_dominant() {
         let mut c = cell("Oxygen", 1.6);

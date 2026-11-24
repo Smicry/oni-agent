@@ -1,6 +1,6 @@
 //! TREND —— 用**速率**换算"还能撑几周期"，并在耗尽前预警。
 //!
-//! 教训：只看瞬时值会"发现问题时已经晚了"。这里每轮落一个样本，
+//! 只看瞬时值会"发现问题时已经晚了"。这里每轮落一个样本，
 //! 用相邻快照的 Δ/Δcycle 算消耗速率，再算 runway。
 
 use std::fs;
@@ -24,7 +24,7 @@ pub struct Sample {
     /// 为什么必须有：
     ///   暂停期的样本不能用于趋势/异常判定 —— 世界没动 → 氧气纹丝不动
     ///   → 会被误判成"人已经不再呼吸"。
-    ///   旧样本没有这个字段 → serde 默认 false → 自动被排除（也顺带排除了旧存档的样本）。
+    ///   没有这个字段的样本 → serde 默认 false → 自动被排除。
     #[serde(default)]
     pub running: bool,
 }
@@ -40,13 +40,11 @@ pub struct Trend {
     pub food_cycles_left: Option<f64>,
     /// **stress 是否在上升**（窒息的早期预警）。
     ///
-    /// 为什么需要：死亡前 stress 从 0 飙到 3.3 → 5.1，
-    ///   比"呼吸值掉到 0"早好几分钟 —— 那是唯一来得及救人的信号。
+    /// 为什么需要：窒息时 stress 的上升比"呼吸值掉到 0"早好几分钟 —— 那是唯一来得及救人的信号。
     pub stress_rising: bool,
     /// **氧气消耗是否归零**（人不动了）。
     ///
-    /// 复盘证据：死亡前氧气从 t+191min 起**完全冻结**——
-    /// 人已经不再呼吸。趋势模块以前只做线性外推，从不报这种异常。
+    /// 世界在跑而氧气总量不变 = 人已经不再呼吸；线性外推（"还够几周期"）报不出这种异常。
     pub oxygen_frozen: bool,
 }
 
@@ -117,7 +115,7 @@ pub const STRESS_RISE_DELTA: f64 = 2.0;
 ///        按 cycle 排除会把基线清空 → 预警永远不触发（瞎）。
 ///   2. **只看最近 15 分钟**：旧存档的样本（几小时前）不能当基线 ——
 ///      否则新存档开局会拿旧存档的 stress=0.0 当基线，
-///      把正常的 4.4 误判成"飙升 4.4" → 每轮抢占正常计划 → 开局卡死（）。
+///      把正常的 4.4 误判成"飙升 4.4" → 每轮抢占正常计划 → 开局卡死。
 pub const BASELINE_WINDOW_SECS: i64 = 900;
 
 pub fn stress_baseline(samples: &[Sample], current: &Snapshot) -> Option<f64> {
@@ -161,17 +159,13 @@ pub fn compute(samples: &[Sample], current: &Snapshot) -> Trend {
         }
     }
     // ---- 异常检测----
-    // 趋势模块以前只做线性外推（"还够几周期"），从不说"氧气不消耗了"。
-    // 死亡复盘显示：氧气完全冻结 + stress 飙升 是最早、最准的预警。
-    // stress 上升：**相对基线**判定（固定阈值会被常态基线骗）
-    //   旧逻辑：最近 3 个样本均值 > 更早 3 个均值 + 0.5 → 开局 4.4 vs 4.7 就算"飙升"
-    //   → 每轮判 Urgent → 抢占正常计划 → 卡死开局（）。
+    // 氧气完全冻结 + stress 飙升 是最早、最准的预警（线性外推"还够几周期"报不出来）。
+    // stress 上升：**相对基线**判定（固定阈值会被常态基线骗：开局基线 4.4~4.7 属正常）。
     if let Some(base) = stress_baseline(samples, current) {
         let cur = current.max_stress();
         t.stress_rising = cur - base >= STRESS_RISE_DELTA && cur >= 2.0;
     }
-    // 氧气冻结：只在**世界真的跑过**的样本里判断。
-    //   旧逻辑没看 running → 暂停期氧气当然不变 → 误报"人不再呼吸"（）。
+    // 氧气冻结：只在**世界真的跑过**的样本里判断（暂停期氧气不变，会误报"人不再呼吸"）。
     let running: Vec<&Sample> = samples.iter().filter(|s| s.running).rev().take(6).collect();
     if running.len() >= 3 {
         let o2s: Vec<f64> = running.iter().map(|s| s.oxygen).collect();
